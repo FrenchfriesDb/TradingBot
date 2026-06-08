@@ -1,0 +1,1009 @@
+[
+    {
+        "label": "pandas",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "pandas",
+        "description": "pandas",
+        "detail": "pandas",
+        "documentation": {}
+    },
+    {
+        "label": "numpy",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "numpy",
+        "description": "numpy",
+        "detail": "numpy",
+        "documentation": {}
+    },
+    {
+        "label": "Strategy",
+        "importPath": "lumibot.strategies",
+        "description": "lumibot.strategies",
+        "isExtraImport": true,
+        "detail": "lumibot.strategies",
+        "documentation": {}
+    },
+    {
+        "label": "Strategy",
+        "importPath": "lumibot.strategies",
+        "description": "lumibot.strategies",
+        "isExtraImport": true,
+        "detail": "lumibot.strategies",
+        "documentation": {}
+    },
+    {
+        "label": "Asset",
+        "importPath": "lumibot.entities",
+        "description": "lumibot.entities",
+        "isExtraImport": true,
+        "detail": "lumibot.entities",
+        "documentation": {}
+    },
+    {
+        "label": "Order",
+        "importPath": "lumibot.entities",
+        "description": "lumibot.entities",
+        "isExtraImport": true,
+        "detail": "lumibot.entities",
+        "documentation": {}
+    },
+    {
+        "label": "Asset",
+        "importPath": "lumibot.entities",
+        "description": "lumibot.entities",
+        "isExtraImport": true,
+        "detail": "lumibot.entities",
+        "documentation": {}
+    },
+    {
+        "label": "Order",
+        "importPath": "lumibot.entities",
+        "description": "lumibot.entities",
+        "isExtraImport": true,
+        "detail": "lumibot.entities",
+        "documentation": {}
+    },
+    {
+        "label": "indicators",
+        "importPath": "bot",
+        "description": "bot",
+        "isExtraImport": true,
+        "detail": "bot",
+        "documentation": {}
+    },
+    {
+        "label": "indicators",
+        "importPath": "bot",
+        "description": "bot",
+        "isExtraImport": true,
+        "detail": "bot",
+        "documentation": {}
+    },
+    {
+        "label": "estimate_sentiment",
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "isExtraImport": true,
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "estimate_sentiment",
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "isExtraImport": true,
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "estimate_sentiment",
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "isExtraImport": true,
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "logging",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "logging",
+        "description": "logging",
+        "detail": "logging",
+        "documentation": {}
+    },
+    {
+        "label": "os",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "os",
+        "description": "os",
+        "detail": "os",
+        "documentation": {}
+    },
+    {
+        "label": "datetime",
+        "importPath": "datetime",
+        "description": "datetime",
+        "isExtraImport": true,
+        "detail": "datetime",
+        "documentation": {}
+    },
+    {
+        "label": "datetime",
+        "importPath": "datetime",
+        "description": "datetime",
+        "isExtraImport": true,
+        "detail": "datetime",
+        "documentation": {}
+    },
+    {
+        "label": "datetime",
+        "importPath": "datetime",
+        "description": "datetime",
+        "isExtraImport": true,
+        "detail": "datetime",
+        "documentation": {}
+    },
+    {
+        "label": "datetime",
+        "importPath": "datetime",
+        "description": "datetime",
+        "isExtraImport": true,
+        "detail": "datetime",
+        "documentation": {}
+    },
+    {
+        "label": "timedelta",
+        "importPath": "datetime",
+        "description": "datetime",
+        "isExtraImport": true,
+        "detail": "datetime",
+        "documentation": {}
+    },
+    {
+        "label": "time",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "time",
+        "description": "time",
+        "detail": "time",
+        "documentation": {}
+    },
+    {
+        "label": "math",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "math",
+        "description": "math",
+        "detail": "math",
+        "documentation": {}
+    },
+    {
+        "label": "ccxt",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "ccxt",
+        "description": "ccxt",
+        "detail": "ccxt",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_API_KEY",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_SECRET",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_TESTNET",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_SYMBOL",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_CASH_AT_RISK",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "TIMEFRAME_LTF",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "SLEEP_TIME",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "API_KEY",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "API_SECRET",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BASE_URL",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "SYMBOL",
+        "importPath": "config",
+        "description": "config",
+        "isExtraImport": true,
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "AutoTokenizer",
+        "importPath": "transformers",
+        "description": "transformers",
+        "isExtraImport": true,
+        "detail": "transformers",
+        "documentation": {}
+    },
+    {
+        "label": "AutoModelForSequenceClassification",
+        "importPath": "transformers",
+        "description": "transformers",
+        "isExtraImport": true,
+        "detail": "transformers",
+        "documentation": {}
+    },
+    {
+        "label": "torch",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "torch",
+        "description": "torch",
+        "detail": "torch",
+        "documentation": {}
+    },
+    {
+        "label": "Tuple",
+        "importPath": "typing",
+        "description": "typing",
+        "isExtraImport": true,
+        "detail": "typing",
+        "documentation": {}
+    },
+    {
+        "label": "sys",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "sys",
+        "description": "sys",
+        "detail": "sys",
+        "documentation": {}
+    },
+    {
+        "label": "subprocess",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "subprocess",
+        "description": "subprocess",
+        "detail": "subprocess",
+        "documentation": {}
+    },
+    {
+        "label": "Path",
+        "importPath": "pathlib",
+        "description": "pathlib",
+        "isExtraImport": true,
+        "detail": "pathlib",
+        "documentation": {}
+    },
+    {
+        "label": "json",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "json",
+        "description": "json",
+        "detail": "json",
+        "documentation": {}
+    },
+    {
+        "label": "REST",
+        "importPath": "alpaca_trade_api",
+        "description": "alpaca_trade_api",
+        "isExtraImport": true,
+        "detail": "alpaca_trade_api",
+        "documentation": {}
+    },
+    {
+        "label": "REST",
+        "importPath": "alpaca_trade_api",
+        "description": "alpaca_trade_api",
+        "isExtraImport": true,
+        "detail": "alpaca_trade_api",
+        "documentation": {}
+    },
+    {
+        "label": "Alpaca",
+        "importPath": "lumibot.brokers",
+        "description": "lumibot.brokers",
+        "isExtraImport": true,
+        "detail": "lumibot.brokers",
+        "documentation": {}
+    },
+    {
+        "label": "Trader",
+        "importPath": "lumibot.traders",
+        "description": "lumibot.traders",
+        "isExtraImport": true,
+        "detail": "lumibot.traders",
+        "documentation": {}
+    },
+    {
+        "label": "YahooDataBacktesting",
+        "importPath": "lumibot.backtesting",
+        "description": "lumibot.backtesting",
+        "isExtraImport": true,
+        "detail": "lumibot.backtesting",
+        "documentation": {}
+    },
+    {
+        "label": "DebbieLaSMC",
+        "importPath": "bot.strategy",
+        "description": "bot.strategy",
+        "isExtraImport": true,
+        "detail": "bot.strategy",
+        "documentation": {}
+    },
+    {
+        "label": "find_swing_points",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def find_swing_points(df, lookback=10):\n    \"\"\"\n    Identifies the most recent swing high and swing low over a lookback period.\n    Useful for finding key resistance (swing high) and support (swing low).\n    \"\"\"\n    if len(df) < lookback:\n        return None, None, None, None\n    recent = df.tail(lookback)\n    swing_high = recent['high'].max()\n    swing_high_idx = recent['high'].idxmax()",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "find_support_resistance",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def find_support_resistance(df, lookback=50):\n    \"\"\"\n    Identifies key support and resistance levels using recent swing points.\n    Returns the two most recent significant levels.\n    \"\"\"\n    if len(df) < lookback:\n        return [], []\n    recent = df.tail(lookback)\n    highs = recent[recent['high'] == recent['high'].rolling(5, center=True).max()]['high'].unique()\n    lows = recent[recent['low'] == recent['low'].rolling(5, center=True).min()]['low'].unique()",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "detect_consolidation",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def detect_consolidation(df, lookback=20):\n    \"\"\"\n    Detects if the market is in a consolidation (ranging) phase.\n    Returns True if price is bouncing between two levels with low volatility.\n    \"\"\"\n    if len(df) < lookback:\n        return False\n    recent = df.tail(lookback)\n    range_high = recent['high'].max()\n    range_low = recent['low'].min()",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "detect_displacement_bos",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def detect_displacement_bos(df, lookback=10):\n    \"\"\"\n    Detects Displacement and Break of Structure (BOS).\n    Looks for aggressive candles with large bodies breaking swing points.\n    Returns True if recent candles show institutional buying/selling pressure.\n    \"\"\"\n    if len(df) < lookback:\n        return False, None\n    recent = df.tail(lookback)\n    latest = recent.iloc[-1]",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "detect_order_block",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def detect_order_block(df, lookback=15):\n    \"\"\"\n    Detects Order Blocks - zones where institutional money absorbed volume.\n    These are identified as areas where price rejected and reversed.\n    \"\"\"\n    if len(df) < lookback:\n        return None, None\n    recent = df.tail(lookback)\n    # Find the zone of the last significant reversal\n    # Order block is typically the candle that rejected price",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "check_liquidity_sweep",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def check_liquidity_sweep(df):\n    \"\"\"\n    Step 2 Math: Checks if the lowest point of the current candle \n    flushed out the minimum support level of the last 20 candles, \n    but managed to recover and close back above that support.\n    This is the \"Wick\" that hunts retail stop losses.\n    \"\"\"\n    if len(df) < 22:\n        return False, None, None\n    latest_candle = df.iloc[-1]",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "check_market_structure_shift",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def check_market_structure_shift(df):\n    \"\"\"\n    Step 3 Math: Checks if the latest momentum candle broke cleanly \n    above the highest swing high. This is the \"Rocket\" - institutional buying\n    that breaks through the recent lower high with aggressive close.\n    \"\"\"\n    if len(df) < 11:\n        return False, None\n    latest_candle = df.iloc[-1]\n    recent_candles = df.iloc[-10:-1]",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "find_bullish_fvg",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def find_bullish_fvg(df):\n    \"\"\"\n    Step 3 (Imbalance): Scans the last 3 completed candles to see \n    if a high-momentum gap was left behind by institutional buying.\n    The FVG is the \"Discount Box\" where price will retrace to.\n    \"\"\"\n    if len(df) < 3:\n        return False, None, None\n    c1 = df.iloc[-3]  # First candle in the sequence\n    c2 = df.iloc[-2]  # The big momentum candle",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "find_bearish_fvg",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def find_bearish_fvg(df):\n    \"\"\"\n    Bearish version: Scans for downside institutional imbalance.\n    \"\"\"\n    if len(df) < 3:\n        return False, None, None\n    c1 = df.iloc[-3]\n    c2 = df.iloc[-2]\n    c3 = df.iloc[-1]\n    # Bearish FVG: High of candle 1 is lower than low of candle 3",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "calculate_fib_levels",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def calculate_fib_levels(swing_low, swing_high):\n    \"\"\"\n    Calculates Fibonacci retracement levels from swing low to swing high.\n    Returns key levels: 0%, 23.6%, 38.2%, 50%, 61.8%, 78.6%, 100%\n    The OTE (Optimal Trade Entry) zone is typically 38.2% to 61.8%.\n    \"\"\"\n    difference = swing_high - swing_low\n    fib_levels = {\n        \"0%\": swing_high,\n        \"23.6%\": swing_high - (difference * 0.236),",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "is_price_in_fib_ote",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def is_price_in_fib_ote(current_price, ote_zone):\n    \"\"\"\n    Checks if current price is in the Fibonacci Optimal Trade Entry zone.\n    This is where you wait for the retracement before entering.\n    \"\"\"\n    return ote_zone[\"lower\"] <= current_price <= ote_zone[\"upper\"]\n# ============================================================================\n# CHOCH / MARKET STRUCTURE SHIFT - Lower Timeframe Confirmation\n# ============================================================================\ndef detect_choch(df, lookback=5):",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "detect_choch",
+        "kind": 2,
+        "importPath": "bot.indicators",
+        "description": "bot.indicators",
+        "peekOfCode": "def detect_choch(df, lookback=5):\n    \"\"\"\n    Detects Change of Character (CHoCH) on lower timeframe.\n    A break of the recent swing low/high confirms the structure shift.\n    \"\"\"\n    if len(df) < lookback:\n        return False, None\n    recent = df.tail(lookback)\n    latest = recent.iloc[-1]\n    # Find recent swing high and low",
+        "detail": "bot.indicators",
+        "documentation": {}
+    },
+    {
+        "label": "DebbieLaSMC",
+        "kind": 6,
+        "importPath": "bot.strategy",
+        "description": "bot.strategy",
+        "peekOfCode": "class DebbieLaSMC(Strategy):\n    \"\"\"\n    The \"Debbie-La\" Institutional Setup Bot\n    Multi-timeframe trading using:\n    - 4H (HTF): Macro bias, consolidation zones, displacement, support/resistance\n    - 15m (LTF): Execution, sweep detection, FVG entry, CHoCH confirmation\n    - Fibonacci: Optimal Trade Entry (OTE) zone refinement\n    - AI Sentiment: Confluence confirmation filter\n    The 4-Step Setup:\n    Step 1: The Bleed - Identify downtrend with lower highs/lows",
+        "detail": "bot.strategy",
+        "documentation": {}
+    },
+    {
+        "label": "log_file",
+        "kind": 5,
+        "importPath": "bot.strategy",
+        "description": "bot.strategy",
+        "peekOfCode": "log_file = f\"./logs/bot_activity.log\"\nlogging.basicConfig(\n    level=logging.INFO,\n    format='%(asctime)s - %(levelname)s - %(message)s',\n    handlers=[\n        logging.FileHandler(log_file),\n        logging.StreamHandler()\n    ]\n)\nlogger = logging.getLogger(__name__)",
+        "detail": "bot.strategy",
+        "documentation": {}
+    },
+    {
+        "label": "logger",
+        "kind": 5,
+        "importPath": "bot.strategy",
+        "description": "bot.strategy",
+        "peekOfCode": "logger = logging.getLogger(__name__)\nclass DebbieLaSMC(Strategy):\n    \"\"\"\n    The \"Debbie-La\" Institutional Setup Bot\n    Multi-timeframe trading using:\n    - 4H (HTF): Macro bias, consolidation zones, displacement, support/resistance\n    - 15m (LTF): Execution, sweep detection, FVG entry, CHoCH confirmation\n    - Fibonacci: Optimal Trade Entry (OTE) zone refinement\n    - AI Sentiment: Confluence confirmation filter\n    The 4-Step Setup:",
+        "detail": "bot.strategy",
+        "documentation": {}
+    },
+    {
+        "label": "connect_binance",
+        "kind": 2,
+        "importPath": "binance_bot",
+        "description": "binance_bot",
+        "peekOfCode": "def connect_binance(api_key, secret, testnet=True):\n    exchange = ccxt.binance({\n        'apiKey': api_key,\n        'secret': secret,\n        'enableRateLimit': True,\n        'options': {'defaultType': 'spot'},\n    })\n    if testnet:\n        exchange.set_sandbox_mode(True)\n    return exchange",
+        "detail": "binance_bot",
+        "documentation": {}
+    },
+    {
+        "label": "ohlcv_to_df",
+        "kind": 2,
+        "importPath": "binance_bot",
+        "description": "binance_bot",
+        "peekOfCode": "def ohlcv_to_df(ohlcv):\n    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])\n    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')\n    df.set_index('timestamp', inplace=True)\n    return df\ndef position_sizing(balance_quote, last_price, risk_fraction):\n    # risk in quote currency (e.g., USDT)\n    risk_amount = balance_quote * risk_fraction\n    if last_price <= 0:\n        return 0",
+        "detail": "binance_bot",
+        "documentation": {}
+    },
+    {
+        "label": "position_sizing",
+        "kind": 2,
+        "importPath": "binance_bot",
+        "description": "binance_bot",
+        "peekOfCode": "def position_sizing(balance_quote, last_price, risk_fraction):\n    # risk in quote currency (e.g., USDT)\n    risk_amount = balance_quote * risk_fraction\n    if last_price <= 0:\n        return 0\n    qty = risk_amount / last_price\n    # round down to sensible precision\n    return qty\ndef fetch_balance_quote(exchange, quote_currency='USDT'):\n    bal = exchange.fetch_balance()",
+        "detail": "binance_bot",
+        "documentation": {}
+    },
+    {
+        "label": "fetch_balance_quote",
+        "kind": 2,
+        "importPath": "binance_bot",
+        "description": "binance_bot",
+        "peekOfCode": "def fetch_balance_quote(exchange, quote_currency='USDT'):\n    bal = exchange.fetch_balance()\n    free = bal.get('free', {})\n    return float(free.get(quote_currency, 0.0))\ndef run_once():\n    exchange = connect_binance(BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET)\n    symbol = BINANCE_SYMBOL\n    timeframe = TIMEFRAME_LTF\n    # fetch 100 candles\n    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)",
+        "detail": "binance_bot",
+        "documentation": {}
+    },
+    {
+        "label": "run_once",
+        "kind": 2,
+        "importPath": "binance_bot",
+        "description": "binance_bot",
+        "peekOfCode": "def run_once():\n    exchange = connect_binance(BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET)\n    symbol = BINANCE_SYMBOL\n    timeframe = TIMEFRAME_LTF\n    # fetch 100 candles\n    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)\n    df = ohlcv_to_df(ohlcv)\n    # indicators expect numeric columns\n    # 1) Sweep detection\n    sweep, support_level, sweep_wick_low = indicators.check_liquidity_sweep(df)",
+        "detail": "binance_bot",
+        "documentation": {}
+    },
+    {
+        "label": "API_KEY",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "API_KEY = \"PKUUMTTFXCJD6LVDLXIVSHZOP4\"\nAPI_SECRET = \"GnNnkoXtxRkWTp9fNe4VfEWsXtQ2nSpzV1edCVGtkXei\"\nBASE_URL = \"https://paper-api.alpaca.markets\"\nPAPER_TRADING = True  # Set to False for REAL MONEY (DANGEROUS!)\n# TRADING PARAMETERS\nSYMBOL = \"SPY\"  # Stock to trade\nCASH_AT_RISK = 0.03  # 3% per trade (conservative for testing)\nTIMEFRAME_HTF = \"4H\"  # Higher timeframe for macro bias\nTIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "API_SECRET",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "API_SECRET = \"GnNnkoXtxRkWTp9fNe4VfEWsXtQ2nSpzV1edCVGtkXei\"\nBASE_URL = \"https://paper-api.alpaca.markets\"\nPAPER_TRADING = True  # Set to False for REAL MONEY (DANGEROUS!)\n# TRADING PARAMETERS\nSYMBOL = \"SPY\"  # Stock to trade\nCASH_AT_RISK = 0.03  # 3% per trade (conservative for testing)\nTIMEFRAME_HTF = \"4H\"  # Higher timeframe for macro bias\nTIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION\nSLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BASE_URL",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BASE_URL = \"https://paper-api.alpaca.markets\"\nPAPER_TRADING = True  # Set to False for REAL MONEY (DANGEROUS!)\n# TRADING PARAMETERS\nSYMBOL = \"SPY\"  # Stock to trade\nCASH_AT_RISK = 0.03  # 3% per trade (conservative for testing)\nTIMEFRAME_HTF = \"4H\"  # Higher timeframe for macro bias\nTIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION\nSLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup\nMAX_OPEN_POSITIONS = 1  # Only 1 trade at a time",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "PAPER_TRADING",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "PAPER_TRADING = True  # Set to False for REAL MONEY (DANGEROUS!)\n# TRADING PARAMETERS\nSYMBOL = \"SPY\"  # Stock to trade\nCASH_AT_RISK = 0.03  # 3% per trade (conservative for testing)\nTIMEFRAME_HTF = \"4H\"  # Higher timeframe for macro bias\nTIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION\nSLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup\nMAX_OPEN_POSITIONS = 1  # Only 1 trade at a time\n# LOGGING",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "SYMBOL",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "SYMBOL = \"SPY\"  # Stock to trade\nCASH_AT_RISK = 0.03  # 3% per trade (conservative for testing)\nTIMEFRAME_HTF = \"4H\"  # Higher timeframe for macro bias\nTIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION\nSLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup\nMAX_OPEN_POSITIONS = 1  # Only 1 trade at a time\n# LOGGING\nLOG_LEVEL = \"INFO\"  # DEBUG, INFO, WARNING, ERROR\nLOG_TO_FILE = True",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "CASH_AT_RISK",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "CASH_AT_RISK = 0.03  # 3% per trade (conservative for testing)\nTIMEFRAME_HTF = \"4H\"  # Higher timeframe for macro bias\nTIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION\nSLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup\nMAX_OPEN_POSITIONS = 1  # Only 1 trade at a time\n# LOGGING\nLOG_LEVEL = \"INFO\"  # DEBUG, INFO, WARNING, ERROR\nLOG_TO_FILE = True\nLOG_DIR = \"./logs\"",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "TIMEFRAME_HTF",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "TIMEFRAME_HTF = \"4H\"  # Higher timeframe for macro bias\nTIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION\nSLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup\nMAX_OPEN_POSITIONS = 1  # Only 1 trade at a time\n# LOGGING\nLOG_LEVEL = \"INFO\"  # DEBUG, INFO, WARNING, ERROR\nLOG_TO_FILE = True\nLOG_DIR = \"./logs\"\n# STRATEGY PARAMETERS",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "TIMEFRAME_LTF",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "TIMEFRAME_LTF = \"15m\"  # Lower timeframe for execution\n# BOT EXECUTION\nSLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup\nMAX_OPEN_POSITIONS = 1  # Only 1 trade at a time\n# LOGGING\nLOG_LEVEL = \"INFO\"  # DEBUG, INFO, WARNING, ERROR\nLOG_TO_FILE = True\nLOG_DIR = \"./logs\"\n# STRATEGY PARAMETERS\nMIN_SENTIMENT_CONFIDENCE = 0.60  # AI needs 60% confidence minimum",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "SLEEP_TIME",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "SLEEP_TIME = \"15m\"  # Wake up every 15 minutes to check setup\nMAX_OPEN_POSITIONS = 1  # Only 1 trade at a time\n# LOGGING\nLOG_LEVEL = \"INFO\"  # DEBUG, INFO, WARNING, ERROR\nLOG_TO_FILE = True\nLOG_DIR = \"./logs\"\n# STRATEGY PARAMETERS\nMIN_SENTIMENT_CONFIDENCE = 0.60  # AI needs 60% confidence minimum\nMIN_RISK_REWARD_RATIO = 1.5  # Minimum 1:1.5 R:R before entry\nSTOP_LOSS_BUFFER = 0.98  # 2% below sweep wick",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "MAX_OPEN_POSITIONS",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "MAX_OPEN_POSITIONS = 1  # Only 1 trade at a time\n# LOGGING\nLOG_LEVEL = \"INFO\"  # DEBUG, INFO, WARNING, ERROR\nLOG_TO_FILE = True\nLOG_DIR = \"./logs\"\n# STRATEGY PARAMETERS\nMIN_SENTIMENT_CONFIDENCE = 0.60  # AI needs 60% confidence minimum\nMIN_RISK_REWARD_RATIO = 1.5  # Minimum 1:1.5 R:R before entry\nSTOP_LOSS_BUFFER = 0.98  # 2% below sweep wick\nTAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "LOG_LEVEL",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "LOG_LEVEL = \"INFO\"  # DEBUG, INFO, WARNING, ERROR\nLOG_TO_FILE = True\nLOG_DIR = \"./logs\"\n# STRATEGY PARAMETERS\nMIN_SENTIMENT_CONFIDENCE = 0.60  # AI needs 60% confidence minimum\nMIN_RISK_REWARD_RATIO = 1.5  # Minimum 1:1.5 R:R before entry\nSTOP_LOSS_BUFFER = 0.98  # 2% below sweep wick\nTAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward\n# MARKET HOURS (Eastern Time)\nMARKET_OPEN = \"09:30\"  # 9:30 AM ET",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "LOG_TO_FILE",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "LOG_TO_FILE = True\nLOG_DIR = \"./logs\"\n# STRATEGY PARAMETERS\nMIN_SENTIMENT_CONFIDENCE = 0.60  # AI needs 60% confidence minimum\nMIN_RISK_REWARD_RATIO = 1.5  # Minimum 1:1.5 R:R before entry\nSTOP_LOSS_BUFFER = 0.98  # 2% below sweep wick\nTAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward\n# MARKET HOURS (Eastern Time)\nMARKET_OPEN = \"09:30\"  # 9:30 AM ET\nMARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "LOG_DIR",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "LOG_DIR = \"./logs\"\n# STRATEGY PARAMETERS\nMIN_SENTIMENT_CONFIDENCE = 0.60  # AI needs 60% confidence minimum\nMIN_RISK_REWARD_RATIO = 1.5  # Minimum 1:1.5 R:R before entry\nSTOP_LOSS_BUFFER = 0.98  # 2% below sweep wick\nTAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward\n# MARKET HOURS (Eastern Time)\nMARKET_OPEN = \"09:30\"  # 9:30 AM ET\nMARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)\nTRADING_ENABLED = True  # Disable for maintenance/testing",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "MIN_SENTIMENT_CONFIDENCE",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "MIN_SENTIMENT_CONFIDENCE = 0.60  # AI needs 60% confidence minimum\nMIN_RISK_REWARD_RATIO = 1.5  # Minimum 1:1.5 R:R before entry\nSTOP_LOSS_BUFFER = 0.98  # 2% below sweep wick\nTAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward\n# MARKET HOURS (Eastern Time)\nMARKET_OPEN = \"09:30\"  # 9:30 AM ET\nMARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)\nTRADING_ENABLED = True  # Disable for maintenance/testing\n# BACKTEST PARAMETERS\nBACKTEST_START = \"2026-06-01\"",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "MIN_RISK_REWARD_RATIO",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "MIN_RISK_REWARD_RATIO = 1.5  # Minimum 1:1.5 R:R before entry\nSTOP_LOSS_BUFFER = 0.98  # 2% below sweep wick\nTAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward\n# MARKET HOURS (Eastern Time)\nMARKET_OPEN = \"09:30\"  # 9:30 AM ET\nMARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)\nTRADING_ENABLED = True  # Disable for maintenance/testing\n# BACKTEST PARAMETERS\nBACKTEST_START = \"2026-06-01\"\nBACKTEST_END = \"2026-06-07\"",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "STOP_LOSS_BUFFER",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "STOP_LOSS_BUFFER = 0.98  # 2% below sweep wick\nTAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward\n# MARKET HOURS (Eastern Time)\nMARKET_OPEN = \"09:30\"  # 9:30 AM ET\nMARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)\nTRADING_ENABLED = True  # Disable for maintenance/testing\n# BACKTEST PARAMETERS\nBACKTEST_START = \"2026-06-01\"\nBACKTEST_END = \"2026-06-07\"\nBACKTEST_CASH = 100000  # Starting capital for backtest",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "TAKE_PROFIT_MULTIPLIER",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "TAKE_PROFIT_MULTIPLIER = 2.0  # 2x risk:reward\n# MARKET HOURS (Eastern Time)\nMARKET_OPEN = \"09:30\"  # 9:30 AM ET\nMARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)\nTRADING_ENABLED = True  # Disable for maintenance/testing\n# BACKTEST PARAMETERS\nBACKTEST_START = \"2026-06-01\"\nBACKTEST_END = \"2026-06-07\"\nBACKTEST_CASH = 100000  # Starting capital for backtest\n# ============================================================================",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "MARKET_OPEN",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "MARKET_OPEN = \"09:30\"  # 9:30 AM ET\nMARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)\nTRADING_ENABLED = True  # Disable for maintenance/testing\n# BACKTEST PARAMETERS\nBACKTEST_START = \"2026-06-01\"\nBACKTEST_END = \"2026-06-07\"\nBACKTEST_CASH = 100000  # Starting capital for backtest\n# ============================================================================\n# BINANCE (CCXT) CONFIG - for crypto paper trading on testnet\n# ============================================================================",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "MARKET_CLOSE",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "MARKET_CLOSE = \"15:45\"  # 3:45 PM ET (exit all 15 min before close)\nTRADING_ENABLED = True  # Disable for maintenance/testing\n# BACKTEST PARAMETERS\nBACKTEST_START = \"2026-06-01\"\nBACKTEST_END = \"2026-06-07\"\nBACKTEST_CASH = 100000  # Starting capital for backtest\n# ============================================================================\n# BINANCE (CCXT) CONFIG - for crypto paper trading on testnet\n# ============================================================================\n# Replace with your Binance testnet keys if you want to use testnet",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "TRADING_ENABLED",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "TRADING_ENABLED = True  # Disable for maintenance/testing\n# BACKTEST PARAMETERS\nBACKTEST_START = \"2026-06-01\"\nBACKTEST_END = \"2026-06-07\"\nBACKTEST_CASH = 100000  # Starting capital for backtest\n# ============================================================================\n# BINANCE (CCXT) CONFIG - for crypto paper trading on testnet\n# ============================================================================\n# Replace with your Binance testnet keys if you want to use testnet\nBINANCE_API_KEY = \"\"  # your binance testnet api key",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BACKTEST_START",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BACKTEST_START = \"2026-06-01\"\nBACKTEST_END = \"2026-06-07\"\nBACKTEST_CASH = 100000  # Starting capital for backtest\n# ============================================================================\n# BINANCE (CCXT) CONFIG - for crypto paper trading on testnet\n# ============================================================================\n# Replace with your Binance testnet keys if you want to use testnet\nBINANCE_API_KEY = \"\"  # your binance testnet api key\nBINANCE_SECRET = \"\"  # your binance testnet secret\nBINANCE_TESTNET = True  # Use Binance testnet sandbox when True",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BACKTEST_END",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BACKTEST_END = \"2026-06-07\"\nBACKTEST_CASH = 100000  # Starting capital for backtest\n# ============================================================================\n# BINANCE (CCXT) CONFIG - for crypto paper trading on testnet\n# ============================================================================\n# Replace with your Binance testnet keys if you want to use testnet\nBINANCE_API_KEY = \"\"  # your binance testnet api key\nBINANCE_SECRET = \"\"  # your binance testnet secret\nBINANCE_TESTNET = True  # Use Binance testnet sandbox when True\nBINANCE_SYMBOL = \"BTC/USDT\"",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BACKTEST_CASH",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BACKTEST_CASH = 100000  # Starting capital for backtest\n# ============================================================================\n# BINANCE (CCXT) CONFIG - for crypto paper trading on testnet\n# ============================================================================\n# Replace with your Binance testnet keys if you want to use testnet\nBINANCE_API_KEY = \"\"  # your binance testnet api key\nBINANCE_SECRET = \"\"  # your binance testnet secret\nBINANCE_TESTNET = True  # Use Binance testnet sandbox when True\nBINANCE_SYMBOL = \"BTC/USDT\"\nBINANCE_CASH_AT_RISK = 0.02  # 2% per trade (crypto volatile)",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_API_KEY",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BINANCE_API_KEY = \"\"  # your binance testnet api key\nBINANCE_SECRET = \"\"  # your binance testnet secret\nBINANCE_TESTNET = True  # Use Binance testnet sandbox when True\nBINANCE_SYMBOL = \"BTC/USDT\"\nBINANCE_CASH_AT_RISK = 0.02  # 2% per trade (crypto volatile)",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_SECRET",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BINANCE_SECRET = \"\"  # your binance testnet secret\nBINANCE_TESTNET = True  # Use Binance testnet sandbox when True\nBINANCE_SYMBOL = \"BTC/USDT\"\nBINANCE_CASH_AT_RISK = 0.02  # 2% per trade (crypto volatile)",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_TESTNET",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BINANCE_TESTNET = True  # Use Binance testnet sandbox when True\nBINANCE_SYMBOL = \"BTC/USDT\"\nBINANCE_CASH_AT_RISK = 0.02  # 2% per trade (crypto volatile)",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_SYMBOL",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BINANCE_SYMBOL = \"BTC/USDT\"\nBINANCE_CASH_AT_RISK = 0.02  # 2% per trade (crypto volatile)",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "BINANCE_CASH_AT_RISK",
+        "kind": 5,
+        "importPath": "config",
+        "description": "config",
+        "peekOfCode": "BINANCE_CASH_AT_RISK = 0.02  # 2% per trade (crypto volatile)",
+        "detail": "config",
+        "documentation": {}
+    },
+    {
+        "label": "estimate_sentiment",
+        "kind": 2,
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "peekOfCode": "def estimate_sentiment(news):\n    if news:\n        tokens = tokenizer(news, return_tensors=\"pt\", padding=True).to(device)\n        result = model(tokens[\"input_ids\"], attention_mask=tokens[\"attention_mask\"])[\"logits\"]\n        result = torch.nn.functional.softmax(torch.sum(result, 0), dim=-1)\n        # .item() pulls the clean number out of the PyTorch tensor\n        probability = result[torch.argmax(result)].item()\n        sentiment = labels[torch.argmax(result).item()]\n        return probability, sentiment\n    else:",
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "device",
+        "kind": 5,
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "peekOfCode": "device = \"cuda:0\" if torch.cuda.is_available() else \"cpu\"\ntokenizer = AutoTokenizer.from_pretrained(\"ProsusAI/finbert\")\nmodel = AutoModelForSequenceClassification.from_pretrained(\"ProsusAI/finbert\").to(device)\nlabels = [\"positive\", \"negative\", \"neutral\"]\ndef estimate_sentiment(news):\n    if news:\n        tokens = tokenizer(news, return_tensors=\"pt\", padding=True).to(device)\n        result = model(tokens[\"input_ids\"], attention_mask=tokens[\"attention_mask\"])[\"logits\"]\n        result = torch.nn.functional.softmax(torch.sum(result, 0), dim=-1)\n        # .item() pulls the clean number out of the PyTorch tensor",
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "tokenizer",
+        "kind": 5,
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "peekOfCode": "tokenizer = AutoTokenizer.from_pretrained(\"ProsusAI/finbert\")\nmodel = AutoModelForSequenceClassification.from_pretrained(\"ProsusAI/finbert\").to(device)\nlabels = [\"positive\", \"negative\", \"neutral\"]\ndef estimate_sentiment(news):\n    if news:\n        tokens = tokenizer(news, return_tensors=\"pt\", padding=True).to(device)\n        result = model(tokens[\"input_ids\"], attention_mask=tokens[\"attention_mask\"])[\"logits\"]\n        result = torch.nn.functional.softmax(torch.sum(result, 0), dim=-1)\n        # .item() pulls the clean number out of the PyTorch tensor\n        probability = result[torch.argmax(result)].item()",
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "model",
+        "kind": 5,
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "peekOfCode": "model = AutoModelForSequenceClassification.from_pretrained(\"ProsusAI/finbert\").to(device)\nlabels = [\"positive\", \"negative\", \"neutral\"]\ndef estimate_sentiment(news):\n    if news:\n        tokens = tokenizer(news, return_tensors=\"pt\", padding=True).to(device)\n        result = model(tokens[\"input_ids\"], attention_mask=tokens[\"attention_mask\"])[\"logits\"]\n        result = torch.nn.functional.softmax(torch.sum(result, 0), dim=-1)\n        # .item() pulls the clean number out of the PyTorch tensor\n        probability = result[torch.argmax(result)].item()\n        sentiment = labels[torch.argmax(result).item()]",
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "labels",
+        "kind": 5,
+        "importPath": "finbert_utils",
+        "description": "finbert_utils",
+        "peekOfCode": "labels = [\"positive\", \"negative\", \"neutral\"]\ndef estimate_sentiment(news):\n    if news:\n        tokens = tokenizer(news, return_tensors=\"pt\", padding=True).to(device)\n        result = model(tokens[\"input_ids\"], attention_mask=tokens[\"attention_mask\"])[\"logits\"]\n        result = torch.nn.functional.softmax(torch.sum(result, 0), dim=-1)\n        # .item() pulls the clean number out of the PyTorch tensor\n        probability = result[torch.argmax(result)].item()\n        sentiment = labels[torch.argmax(result).item()]\n        return probability, sentiment",
+        "detail": "finbert_utils",
+        "documentation": {}
+    },
+    {
+        "label": "checks_passed",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "checks_passed = 0\nchecks_failed = 0\n# ============================================================================\n# Check 1: Python Version\n# ============================================================================\nprint(\"1️⃣  Checking Python version...\")\nversion = sys.version_info\nif version.major >= 3 and version.minor >= 8:\n    print(f\"   ✅ Python {version.major}.{version.minor}.{version.micro} - OK\")\n    checks_passed += 1",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "checks_failed",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "checks_failed = 0\n# ============================================================================\n# Check 1: Python Version\n# ============================================================================\nprint(\"1️⃣  Checking Python version...\")\nversion = sys.version_info\nif version.major >= 3 and version.minor >= 8:\n    print(f\"   ✅ Python {version.major}.{version.minor}.{version.micro} - OK\")\n    checks_passed += 1\nelse:",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "version",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "version = sys.version_info\nif version.major >= 3 and version.minor >= 8:\n    print(f\"   ✅ Python {version.major}.{version.minor}.{version.micro} - OK\")\n    checks_passed += 1\nelse:\n    print(f\"   ❌ Python {version.major}.{version.minor} - REQUIRES 3.8+\")\n    checks_failed += 1\n# ============================================================================\n# Check 2: Required Packages\n# ============================================================================",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "required_packages",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "required_packages = [\n    \"lumibot\",\n    \"alpaca_trade_api\",\n    \"pandas\",\n    \"numpy\",\n    \"transformers\",\n    \"torch\",\n    \"flask\"\n]\nmissing_packages = []",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "missing_packages",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "missing_packages = []\nfor pkg in required_packages:\n    try:\n        __import__(pkg.replace(\"-\", \"_\"))\n        print(f\"   ✅ {pkg}\")\n        checks_passed += 1\n    except ImportError:\n        print(f\"   ❌ {pkg} - NOT INSTALLED\")\n        missing_packages.append(pkg)\n        checks_failed += 1",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "config_path",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "config_path = Path(\"config.py\")\nif config_path.exists():\n    print(\"   ✅ config.py found\")\n    checks_passed += 1\n    # Try to import it\n    try:\n        import config\n        print(\"   ✅ config.py imports successfully\")\n        print(f\"      - Symbol: {config.SYMBOL}\")\n        print(f\"      - Risk per trade: {config.CASH_AT_RISK*100:.1f}%\")",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "files_to_check",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "files_to_check = [\n    (\"bot/strategy.py\", \"Strategy\"),\n    (\"bot/indicators.py\", \"Indicators\"),\n    (\"finbert_utils.py\", \"AI Sentiment\"),\n    (\"tradingbot.py\", \"Bot launcher\"),\n]\nfor filepath, name in files_to_check:\n    if Path(filepath).exists():\n        print(f\"   ✅ {filepath}\")\n        checks_passed += 1",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "logs_path",
+        "kind": 5,
+        "importPath": "healthcheck",
+        "description": "healthcheck",
+        "peekOfCode": "logs_path = Path(\"logs\")\nif logs_path.exists():\n    print(\"   ✅ logs/ directory exists\")\n    checks_passed += 1\nelse:\n    print(\"   ℹ️  Creating logs/ directory...\")\n    logs_path.mkdir(exist_ok=True)\n    print(\"   ✅ logs/ directory created\")\n    checks_passed += 1\n# ============================================================================",
+        "detail": "healthcheck",
+        "documentation": {}
+    },
+    {
+        "label": "get_portfolio_status",
+        "kind": 2,
+        "importPath": "monitor",
+        "description": "monitor",
+        "peekOfCode": "def get_portfolio_status():\n    \"\"\"Fetch current portfolio status from Alpaca\"\"\"\n    try:\n        api = REST(base_url=BASE_URL, key_id=API_KEY, secret_key=API_SECRET)\n        # Get account\n        account = api.get_account()\n        # Get positions\n        positions = api.list_positions()\n        # Get today's trades\n        today_date = datetime.now().strftime(\"%Y-%m-%d\")",
+        "detail": "monitor",
+        "documentation": {}
+    },
+    {
+        "label": "display_status",
+        "kind": 2,
+        "importPath": "monitor",
+        "description": "monitor",
+        "peekOfCode": "def display_status():\n    \"\"\"Display formatted status\"\"\"\n    print(\"\\n\" + \"=\"*80)\n    print(\"🤖 DEBBIE-LA BOT - REAL-TIME MONITOR\")\n    print(f\"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\")\n    print(\"=\"*80)\n    status = get_portfolio_status()\n    if status is None:\n        print(\"❌ Could not connect to Alpaca API\")\n        return",
+        "detail": "monitor",
+        "documentation": {}
+    },
+    {
+        "label": "run_backtest",
+        "kind": 2,
+        "importPath": "tradingbot",
+        "description": "tradingbot",
+        "peekOfCode": "def run_backtest():\n    \"\"\"\n    Backtest the Debbie-La Institutional Setup Strategy over historical data.\n    Tests the multi-timeframe logic (4H bias + 15m execution) on recent market data.\n    \"\"\"\n    # Define backtest window\n    start_date = datetime(2026, 6, 1)\n    end_date = datetime(2026, 6, 7)\n    print(\"=\" * 80)\n    print(\"🤖 DEBBIE-LA INSTITUTIONAL SMC STRATEGY - BACKTEST\")",
+        "detail": "tradingbot",
+        "documentation": {}
+    },
+    {
+        "label": "run_live_trading",
+        "kind": 2,
+        "importPath": "tradingbot",
+        "description": "tradingbot",
+        "peekOfCode": "def run_live_trading():\n    \"\"\"\n    Run the strategy live on paper trading account (Alpaca).\n    Connects to Alpaca API and executes real-time trades with institutional setup logic.\n    \"\"\"\n    print(\"=\" * 80)\n    print(\"🔴 DEBBIE-LA INSTITUTIONAL SMC - LIVE PAPER TRADING\")\n    print(\"=\" * 80)\n    print(f\"🔗 Connected to: {BASE_URL}\")\n    print(f\"📈 Symbol: SPY\")",
+        "detail": "tradingbot",
+        "documentation": {}
+    },
+    {
+        "label": "API_KEY",
+        "kind": 5,
+        "importPath": "tradingbot",
+        "description": "tradingbot",
+        "peekOfCode": "API_KEY = \"PKUUMTTFXCJD6LVDLXIVSHZOP4\"\nAPI_SECRET = \"GnNnkoXtxRkWTp9fNe4VfEWsXtQ2nSpzV1edCVGtkXei\"\nBASE_URL = \"https://paper-api.alpaca.markets\"\n# ============================================================================\n# BACKTEST CONFIGURATION\n# ============================================================================\ndef run_backtest():\n    \"\"\"\n    Backtest the Debbie-La Institutional Setup Strategy over historical data.\n    Tests the multi-timeframe logic (4H bias + 15m execution) on recent market data.",
+        "detail": "tradingbot",
+        "documentation": {}
+    },
+    {
+        "label": "API_SECRET",
+        "kind": 5,
+        "importPath": "tradingbot",
+        "description": "tradingbot",
+        "peekOfCode": "API_SECRET = \"GnNnkoXtxRkWTp9fNe4VfEWsXtQ2nSpzV1edCVGtkXei\"\nBASE_URL = \"https://paper-api.alpaca.markets\"\n# ============================================================================\n# BACKTEST CONFIGURATION\n# ============================================================================\ndef run_backtest():\n    \"\"\"\n    Backtest the Debbie-La Institutional Setup Strategy over historical data.\n    Tests the multi-timeframe logic (4H bias + 15m execution) on recent market data.\n    \"\"\"",
+        "detail": "tradingbot",
+        "documentation": {}
+    },
+    {
+        "label": "BASE_URL",
+        "kind": 5,
+        "importPath": "tradingbot",
+        "description": "tradingbot",
+        "peekOfCode": "BASE_URL = \"https://paper-api.alpaca.markets\"\n# ============================================================================\n# BACKTEST CONFIGURATION\n# ============================================================================\ndef run_backtest():\n    \"\"\"\n    Backtest the Debbie-La Institutional Setup Strategy over historical data.\n    Tests the multi-timeframe logic (4H bias + 15m execution) on recent market data.\n    \"\"\"\n    # Define backtest window",
+        "detail": "tradingbot",
+        "documentation": {}
+    }
+]
