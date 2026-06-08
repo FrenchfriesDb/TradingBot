@@ -3,10 +3,16 @@
 # ============================================================================
 
 # ALPACA BROKER CREDENTIALS (Paper Trading)
-API_KEY = "PKUUMTTFXCJD6LVDLXIVSHZOP4"
-API_SECRET = "GnNnkoXtxRkWTp9fNe4VfEWsXtQ2nSpzV1edCVGtkXei"
-BASE_URL = "https://paper-api.alpaca.markets"
-PAPER_TRADING = True  # Set to False for REAL MONEY (DANGEROUS!)
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env (do NOT commit .env)
+load_dotenv()
+
+API_KEY = os.getenv("ALPACA_API_KEY", "")
+API_SECRET = os.getenv("ALPACA_API_SECRET", "")
+BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+PAPER_TRADING = os.getenv("ALPACA_PAPER", "True").lower() in ("1", "true", "yes")
 
 # TRADING PARAMETERS
 SYMBOL = "SPY"  # Stock to trade
@@ -43,9 +49,9 @@ BACKTEST_CASH = 100000  # Starting capital for backtest
 # BINANCE (CCXT) CONFIG - for crypto paper trading on testnet
 # ============================================================================
 # Replace with your Binance testnet keys if you want to use testnet
-BINANCE_API_KEY = ""  # your binance testnet api key
-BINANCE_SECRET = ""  # your binance testnet secret
-BINANCE_TESTNET = True  # Use Binance testnet sandbox when True
-BINANCE_SYMBOL = "BTC/USDT"
-BINANCE_CASH_AT_RISK = 0.02  # 2% per trade (crypto volatile)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")  # your binance testnet api key
+BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")  # your binance testnet secret
+BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "True").lower() in ("1", "true", "yes")
+BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTC/USDT")
+BINANCE_CASH_AT_RISK = float(os.getenv("BINANCE_CASH_AT_RISK", 0.02))  # 2% per trade (crypto volatile)
 
