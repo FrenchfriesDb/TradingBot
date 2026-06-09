@@ -19,6 +19,7 @@ class DebbieLaCrypto(DebbieLaSMC):
             timeframe_htf=timeframe_htf,
             timeframe_ltf=timeframe_ltf,
         )
+        self.set_market("24/7")  # crypto never sleeps
 
     def _make_asset(self, symbol):
         return Asset(symbol, asset_type=Asset.AssetType.CRYPTO)
