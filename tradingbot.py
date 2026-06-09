@@ -4,14 +4,11 @@ from lumibot.strategies import Strategy
 from lumibot.traders import Trader
 from lumibot.entities import Asset, Order
 from lumibot.backtesting import YahooDataBacktesting
-from alpaca_trade_api import REST
 from finbert_utils import estimate_sentiment
+from config import API_KEY, API_SECRET, BASE_URL, PAPER_TRADING
 
 from bot.strategy import DebbieLaSMC
-
-API_KEY = "PKUUMTTFXCJD6LVDLXIVSHZOP4"
-API_SECRET = "GnNnkoXtxRkWTp9fNe4VfEWsXtQ2nSpzV1edCVGtkXei"
-BASE_URL = "https://paper-api.alpaca.markets"
+from bot.crypto_strategy import DebbieLaCrypto
 
 # ============================================================================
 # BACKTEST CONFIGURATION
@@ -40,10 +37,10 @@ def run_backtest():
         start_date,
         end_date,
         parameters={
-            "symbol": "SPY",
+            "symbols": ["SPY"],
             "cash_at_risk": 0.03,
-            "timeframe_htf": "4H",
-            "timeframe_ltf": "15m"
+            "timeframe_htf": "4 hours",
+            "timeframe_ltf": "15 minutes"
         }
     )
 
@@ -56,27 +53,26 @@ def run_live_trading():
     print("🔴 DEBBIE-LA INSTITUTIONAL SMC - LIVE PAPER TRADING")
     print("=" * 80)
     print(f"🔗 Connected to: {BASE_URL}")
-    print(f"📈 Symbol: SPY")
+    watchlist = ["AAPL", "QQQ", "SPY", "NVDA", "TSLA", "GOOGL"]
+    print(f"📈 Watchlist: {', '.join(watchlist)}")
     print(f"⏱️  HTF: 4H | LTF: 15m | Execution Interval: 15 minutes")
-    print(f"💰 Risk per trade: 3%")
+    print(f"💰 Risk per trade: 3% total (~0.5% per symbol)")
     print("=" * 80)
-    
-    # Connect to broker with paper trading config
+
     ALPACA_CREDS = {
-    "API_KEY": "PKUUMTTFXCJD6LVDLXIVSHZOP4",
-    "API_SECRET": "GnNnkoXtxRkWTp9fNe4VfEWsXtQ2nSpzV1edCVGtkXei",
-    "PAPER": True
-}
+        "API_KEY": API_KEY,
+        "API_SECRET": API_SECRET,
+        "PAPER": PAPER_TRADING
+    }
     broker = Alpaca(ALPACA_CREDS)
-    
-    # Initialize strategy
+
     strategy = DebbieLaSMC(
         broker=broker,
         parameters={
-            "symbol": "SPY",
+            "symbols": watchlist,
             "cash_at_risk": 0.03,
-            "timeframe_htf": "4H",
-            "timeframe_ltf": "15m"
+            "timeframe_htf": "4 hours",
+            "timeframe_ltf": "15 minutes"
         }
     )
     
@@ -87,23 +83,53 @@ def run_live_trading():
     # Start trading
     trader.run_all()
 
+def run_crypto_live():
+    """Run the Debbie-La strategy on Alpaca crypto (BTC, ETH, SOL, etc.) 24/7."""
+    crypto_watchlist = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK"]
+    print("=" * 80)
+    print("🟡 DEBBIE-LA CRYPTO — ALPACA PAPER TRADING (24/7)")
+    print("=" * 80)
+    print(f"🔗 Connected to: {BASE_URL}")
+    print(f"₿  Watchlist: {', '.join(crypto_watchlist)}")
+    print(f"⏱️  HTF: 4H | LTF: 15m | Risk: 2% total (~0.33% per symbol)")
+    print("=" * 80)
+
+    ALPACA_CREDS = {
+        "API_KEY": API_KEY,
+        "API_SECRET": API_SECRET,
+        "PAPER": PAPER_TRADING
+    }
+    broker = Alpaca(ALPACA_CREDS)
+
+    strategy = DebbieLaCrypto(
+        broker=broker,
+        parameters={
+            "symbols": crypto_watchlist,
+            "cash_at_risk": 0.02,
+            "timeframe_htf": "4 hours",
+            "timeframe_ltf": "15 minutes"
+        }
+    )
+
+    trader = Trader()
+    trader.add_strategy(strategy)
+    trader.run_all()
+
+
 if __name__ == "__main__":
     import sys
-    
-    # Check command line argument
-    if len(sys.argv) > 1:
-        mode = sys.argv[1].lower()
-        
-        if mode == "live":
-            run_live_trading()
-        elif mode == "backtest":
-            run_backtest()
-        else:
-            print("Usage: python tradingbot.py [live|backtest]")
-            print("\n  live     - Run strategy on paper trading")
-            print("  backtest - Run strategy backtest on historical data")
+
+    modes = {
+        "live":    run_live_trading,
+        "crypto":  run_crypto_live,
+        "backtest": run_backtest,
+    }
+
+    if len(sys.argv) > 1 and sys.argv[1].lower() in modes:
+        modes[sys.argv[1].lower()]()
     else:
-        # Default to backtest
-        print("No mode specified. Running backtest by default...")
-        print("Usage: python tradingbot.py [live|backtest]\n")
-        run_backtest()
+        print("Usage: python tradingbot.py [live|crypto|backtest]")
+        print("  live      — Stocks on Alpaca paper (AAPL, QQQ, SPY, NVDA, TSLA, GOOGL)")
+        print("  crypto    — Crypto on Alpaca paper (BTC, ETH, SOL, DOGE, AVAX, LINK)")
+        print("  backtest  — Backtest on historical data")
+        print("\nBinance: python binance_bot.py")

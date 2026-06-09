@@ -6,7 +6,6 @@ Verifies all dependencies and connections before launching the bot
 """
 
 import sys
-import subprocess
 from pathlib import Path
 
 print("\n" + "="*80)
@@ -34,7 +33,7 @@ else:
 print("\n2️⃣  Checking Python packages...")
 required_packages = [
     "lumibot",
-    "alpaca_trade_api",
+    "alpaca",
     "pandas",
     "numpy",
     "transformers",
@@ -104,10 +103,10 @@ for filepath, name in files_to_check:
 # ============================================================================
 print("\n5️⃣  Checking Alpaca connection...")
 try:
-    from alpaca_trade_api import REST
-    from config import API_KEY, API_SECRET, BASE_URL
-    
-    api = REST(base_url=BASE_URL, key_id=API_KEY, secret_key=API_SECRET)
+    from alpaca.trading.client import TradingClient
+    from config import API_KEY, API_SECRET, PAPER_TRADING
+
+    api = TradingClient(api_key=API_KEY, secret_key=API_SECRET, paper=PAPER_TRADING)
     account = api.get_account()
     
     print("   ✅ Connected to Alpaca!")

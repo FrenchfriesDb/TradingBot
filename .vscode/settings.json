@@ -56,4 +56,15 @@
   "C_Cpp_Runner.showCompilationTime": false,
   "C_Cpp_Runner.useLinkTimeOptimization": false,
   "C_Cpp_Runner.msvcSecureNoWarnings": false
+  ,
+  "python.defaultInterpreterPath": "/Users/usahealthlife/Desktop/TradingBot/.venv311/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python.venvPath": "/Users/usahealthlife/Desktop/TradingBot",
+  "python.pythonPath": ".venv311/bin/python",
+  "python.analysis.extraPaths": [
+    "/Users/usahealthlife/Desktop/TradingBot"
+  ],
+  "python.analysis.ignore": [
+    "**/lumibot/**"
+  ]
 }

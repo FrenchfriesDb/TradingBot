@@ -6,19 +6,19 @@ Shows live status of bot trades, portfolio, and strategy performance
 import os
 import json
 from datetime import datetime
-from alpaca_trade_api import REST
-from config import API_KEY, API_SECRET, BASE_URL, SYMBOL
+from alpaca.trading.client import TradingClient
+from config import API_KEY, API_SECRET, PAPER_TRADING, SYMBOL
 
 def get_portfolio_status():
     """Fetch current portfolio status from Alpaca"""
     try:
-        api = REST(base_url=BASE_URL, key_id=API_KEY, secret_key=API_SECRET)
-        
+        api = TradingClient(api_key=API_KEY, secret_key=API_SECRET, paper=PAPER_TRADING)
+
         # Get account
         account = api.get_account()
-        
+
         # Get positions
-        positions = api.list_positions()
+        positions = api.get_all_positions()
         
         # Get today's trades
         today_date = datetime.now().strftime("%Y-%m-%d")
@@ -35,7 +35,7 @@ def get_portfolio_status():
                 {
                     "symbol": p.symbol,
                     "qty": float(p.qty),
-                    "avg_fill_price": float(p.avg_fill_price),
+                    "avg_fill_price": float(p.avg_entry_price),
                     "current_price": float(p.current_price),
                     "market_value": float(p.market_value),
                     "unrealized_pl": float(p.unrealized_pl),
