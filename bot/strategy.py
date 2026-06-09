@@ -154,11 +154,13 @@ class DebbieLaSMC(Strategy):
             return True, "no_news", 0.0
 
         probability, sentiment = estimate_sentiment(news_items)
-        confirm = sentiment == "positive" and probability >= 0.60
+        confirm = not (sentiment == "negative" and probability >= 0.60)
         return confirm, sentiment, probability
 
     def _process_symbol(self, symbol):
         current_price = self.get_last_price(symbol)
+        if not current_price:
+            return
         asset = self._make_asset(symbol)
         position = self.get_position(asset)
 

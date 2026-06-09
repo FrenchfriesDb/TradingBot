@@ -70,7 +70,7 @@ python3 binance_bot.py          # Binance testnet (needs BINANCE_* keys in .env)
 
 ### Crypto Bot — `python3 tradingbot.py crypto`
 
-- **Watchlist:** BTC, ETH, SOL, DOGE, AVAX, LINK
+- **Watchlist:** BTC, ETH, SOL, LINK, LTC, BCH
 - **Risk:** 2% total ÷ 6 symbols = ~0.33% per trade
 - **Hours:** 24/7 — never sleeps, no market close
 - **Interval:** Scans every 15 minutes

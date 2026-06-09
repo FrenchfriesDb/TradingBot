@@ -85,7 +85,7 @@ def run_live_trading():
 
 def run_crypto_live():
     """Run the Debbie-La strategy on Alpaca crypto (BTC, ETH, SOL, etc.) 24/7."""
-    crypto_watchlist = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK"]
+    crypto_watchlist = ["BTC", "ETH", "SOL", "LINK", "LTC", "BCH"]
     print("=" * 80)
     print("🟡 DEBBIE-LA CRYPTO — ALPACA PAPER TRADING (24/7)")
     print("=" * 80)

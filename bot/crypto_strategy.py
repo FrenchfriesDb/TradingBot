@@ -1,7 +1,7 @@
 from lumibot.entities import Asset
 from bot.strategy import DebbieLaSMC
 
-CRYPTO_WATCHLIST = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK"]
+CRYPTO_WATCHLIST = ["BTC", "ETH", "SOL", "LINK", "LTC", "BCH"]
 
 
 class DebbieLaCrypto(DebbieLaSMC):
