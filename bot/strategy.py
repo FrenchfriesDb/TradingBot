@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-STALE_TRADE_HOURS = 4  # Close any position open longer than this
+STALE_TRADE_HOURS = 12  # Close any position open longer than this
 
 
 class DebbieLaSMC(Strategy):
@@ -54,18 +54,21 @@ class DebbieLaSMC(Strategy):
     def before_starting_trading(self):
         """
         Re-sync state from live positions on startup.
-        Prevents the bot getting stuck in POSITION_OPEN after a crash or reconnect.
+        Wrapped in try/except so a slow broker connection can't block strategy startup.
         """
-        for symbol in self.symbols:
-            asset = self._make_asset(symbol)
-            position = self.get_position(asset)
-            if position is not None:
-                self.state[symbol] = "POSITION_OPEN"
-                self.entry_time[symbol] = datetime.now(timezone.utc)
-                self.log_message(
-                    f"[{symbol}] Startup sync: live position found → resuming POSITION_OPEN",
-                    color="yellow"
-                )
+        try:
+            for symbol in self.symbols:
+                asset = self._make_asset(symbol)
+                position = self.get_position(asset)
+                if position is not None:
+                    self.state[symbol] = "POSITION_OPEN"
+                    self.entry_time[symbol] = datetime.now(timezone.utc)
+                    self.log_message(
+                        f"[{symbol}] Startup sync: live position found → resuming POSITION_OPEN",
+                        color="yellow"
+                    )
+        except Exception as e:
+            self.log_message(f"Startup sync skipped (broker not ready): {e}", color="red")
 
     def _reset(self, symbol):
         self.state[symbol]       = "IDLE"
@@ -181,11 +184,14 @@ class DebbieLaSMC(Strategy):
                     entry = entry.replace(tzinfo=timezone.utc)
                 elapsed_hours = (now - entry).total_seconds() / 3600
                 if elapsed_hours >= STALE_TRADE_HOURS:
-                    order = self.create_order(asset, position.quantity, Order.OrderSide.SELL)
+                    close_qty = abs(position.quantity)
+                    close_side = (Order.OrderSide.BUY if position.quantity < 0
+                                  else Order.OrderSide.SELL)
+                    order = self.create_order(asset, close_qty, close_side)
                     self.submit_order(order)
                     self.log_message(
                         f"[{symbol}] ⏰ Stale exit after {elapsed_hours:.1f}h — closing position.",
-                        color="orange"
+                        color="red"
                     )
                     self._reset(symbol)
             return
@@ -198,49 +204,68 @@ class DebbieLaSMC(Strategy):
         if ltf is None:
             return
 
-        # ── STATE 1: IDLE ──────────────────────────────────────────────────────
-        if self.state[symbol] == "IDLE" and position is None:
-            if htf["bos"] and ltf["sweep"]:
-                if ltf["fvg_bull"]:
-                    self.bias[symbol] = "BULLISH"
-                    self.sweep_low[symbol] = ltf["sweep_wick_low"]
-                    self.state[symbol] = "SWEEP_HUNT"
-                    self.log_message(
-                        f"[{symbol}] STEP 1-2: BLEED+SWEEP → BULLISH | Wick: {self.sweep_low[symbol]:.2f}",
-                        color="yellow"
-                    )
-                elif ltf["fvg_bear"]:
-                    self.bias[symbol] = "BEARISH"
-                    self.sweep_high[symbol] = ltf["sweep_wick_low"]
-                    self.state[symbol] = "SWEEP_HUNT"
-                    self.log_message(
-                        f"[{symbol}] STEP 1-2: BLEED+SWEEP → BEARISH | Wick: {self.sweep_high[symbol]:.2f}",
-                        color="orange"
-                    )
+        self.log_message(
+            f"[{symbol}] state={self.state[symbol]} price={current_price:.4f} "
+            f"bos={htf['bos']} sweep={ltf['sweep']} mss={ltf['mss']} "
+            f"fvg_bull={ltf['fvg_bull']} choch={ltf['choch']}({ltf['choch_direction']})"
+        )
 
-        # ── STATE 2: SWEEP_HUNT ────────────────────────────────────────────────
+        # ── STATE 1: IDLE — HTF bias sets direction, no LTF required yet ──────
+        # BOS on 4H establishes the macro bias. LTF sweep is hunted in STATE 2.
+        if self.state[symbol] == "IDLE" and position is None:
+            if htf["bos"] and htf["direction"] == "bullish":
+                self.bias[symbol] = "BULLISH"
+                self.state[symbol] = "SWEEP_HUNT"
+                self.log_message(
+                    f"[{symbol}] STEP 1: HTF BOS → BULLISH bias set. Hunting LTF sweep.",
+                    color="yellow"
+                )
+            elif htf["bos"] and htf["direction"] == "bearish":
+                self.bias[symbol] = "BEARISH"
+                self.state[symbol] = "SWEEP_HUNT"
+                self.log_message(
+                    f"[{symbol}] STEP 1: HTF BOS → BEARISH bias set. Hunting LTF sweep.",
+                    color="red"
+                )
+
+        # ── STATE 2: SWEEP_HUNT — wait for a FVG in the bias direction ──────────
+        # sweep/MSS are logged as context but not required — the MSS function only
+        # detects bullish breaks, so gating on it blocks every bearish setup.
         if self.state[symbol] == "SWEEP_HUNT" and position is None:
-            if ltf["mss"] and ltf["choch"]:
-                if self.bias[symbol] == "BULLISH" and ltf["choch_direction"] == "bullish":
-                    self.fvg_low[symbol] = ltf["fvg_bottom"]
-                    self.fvg_high[symbol] = ltf["fvg_top"]
-                    _, self.ote_zone[symbol] = indicators.calculate_fib_levels(
-                        self.sweep_low[symbol], ltf["swing_high"]
-                    )
-                    self.state[symbol] = "ENTRY_WAIT"
-                    self.log_message(
-                        f"[{symbol}] STEP 3: MSS+FVG | "
-                        f"FVG: {self.fvg_low[symbol]:.2f}-{self.fvg_high[symbol]:.2f} | "
-                        f"OTE: {self.ote_zone[symbol]['lower']:.2f}-{self.ote_zone[symbol]['upper']:.2f}",
-                        color="green"
-                    )
+            if ltf["sweep"] and ltf["sweep_wick_low"]:
+                self.sweep_low[symbol] = ltf["sweep_wick_low"]
+
+            if self.bias[symbol] == "BULLISH" and ltf["fvg_bull"]:
+                self.fvg_low[symbol]  = ltf["fvg_bottom"]
+                self.fvg_high[symbol] = ltf["fvg_top"]
+                self.state[symbol]    = "ENTRY_WAIT"
+                self.log_message(
+                    f"[{symbol}] STEP 2: Bullish FVG locked | "
+                    f"{self.fvg_low[symbol]:.4f}-{self.fvg_high[symbol]:.4f} | "
+                    f"sweep={'yes' if self.sweep_low[symbol] else 'no'} "
+                    f"mss={ltf['mss']}",
+                    color="green"
+                )
+
+            elif self.bias[symbol] == "BEARISH" and ltf["fvg_bear"]:
+                self.fvg_low[symbol]  = ltf["fvg_bear_bottom"]
+                self.fvg_high[symbol] = ltf["fvg_bear_top"]
+                self.state[symbol]    = "ENTRY_WAIT"
+                self.log_message(
+                    f"[{symbol}] STEP 2: Bearish FVG locked | "
+                    f"{self.fvg_low[symbol]:.4f}-{self.fvg_high[symbol]:.4f} | "
+                    f"sweep={'yes' if self.sweep_low[symbol] else 'no'} "
+                    f"mss={ltf['mss']}",
+                    color="red"
+                )
 
         # ── STATE 3: ENTRY_WAIT ────────────────────────────────────────────────
         if self.state[symbol] == "ENTRY_WAIT" and position is None:
-            in_fvg = self.fvg_low[symbol] <= current_price <= self.fvg_high[symbol]
-            in_ote = indicators.is_price_in_fib_ote(current_price, self.ote_zone[symbol])
+            in_fvg = (self.fvg_low[symbol] is not None and
+                      self.fvg_high[symbol] is not None and
+                      self.fvg_low[symbol] <= current_price <= self.fvg_high[symbol])
 
-            if in_fvg and in_ote:
+            if in_fvg:
                 confirm, sentiment, prob = self._get_sentiment(symbol)
                 if prob > 0:
                     self.log_message(
@@ -253,11 +278,19 @@ class DebbieLaSMC(Strategy):
                 if confirm:
                     cash, last_price, quantity = self.position_sizing(symbol)
                     if quantity > 0 and cash > last_price:
-                        self.stop_loss[symbol] = self.sweep_low[symbol] * 0.98
-                        risk = current_price - self.stop_loss[symbol]
-                        self.take_profit[symbol] = current_price + (risk * 2)
+                        is_long = self.bias[symbol] == "BULLISH"
+                        side = Order.OrderSide.BUY if is_long else Order.OrderSide.SELL
+                        sweep_ref = self.sweep_low[symbol] or current_price * 0.98
+                        if is_long:
+                            self.stop_loss[symbol] = sweep_ref * 0.98
+                            risk = current_price - self.stop_loss[symbol]
+                            self.take_profit[symbol] = current_price + (risk * 3)
+                        else:
+                            self.stop_loss[symbol] = current_price * 1.02
+                            risk = self.stop_loss[symbol] - current_price
+                            self.take_profit[symbol] = current_price - (risk * 3)
                         order = self.create_order(
-                            asset, quantity, Order.OrderSide.BUY,
+                            asset, quantity, side,
                             order_type="bracket",
                             take_profit_price=self.take_profit[symbol],
                             stop_loss_price=self.stop_loss[symbol],
@@ -267,8 +300,9 @@ class DebbieLaSMC(Strategy):
                         self.entry_price[symbol] = current_price
                         self.entry_time[symbol] = datetime.now(timezone.utc)
                         self.log_message(
-                            f"[{symbol}] ✅ ENTRY | Price: {current_price:.2f} | "
-                            f"SL: {self.stop_loss[symbol]:.2f} | TP: {self.take_profit[symbol]:.2f} | "
+                            f"[{symbol}] ✅ {'LONG' if is_long else 'SHORT'} ENTRY | "
+                            f"Price: {current_price:.4f} | "
+                            f"SL: {self.stop_loss[symbol]:.4f} | TP: {self.take_profit[symbol]:.4f} | "
                             f"Qty: {quantity}",
                             color="blue"
                         )
@@ -280,8 +314,12 @@ class DebbieLaSMC(Strategy):
     def before_closing_bell(self):
         for symbol in self.symbols:
             asset = self._make_asset(symbol)
-            if self.get_position(asset) is not None:
-                order = self.create_order(asset, self.get_position(asset).quantity, Order.OrderSide.SELL)
+            position = self.get_position(asset)
+            if position is not None:
+                close_qty  = abs(position.quantity)
+                close_side = (Order.OrderSide.BUY if position.quantity < 0
+                              else Order.OrderSide.SELL)
+                order = self.create_order(asset, close_qty, close_side)
                 self.submit_order(order)
                 self.log_message(f"[{symbol}] EOD: closed position.", color="cyan")
                 self._reset(symbol)

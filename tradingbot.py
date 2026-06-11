@@ -20,8 +20,8 @@ def run_backtest():
     Tests the multi-timeframe logic (4H bias + 15m execution) on recent market data.
     """
     # Define backtest window
-    start_date = datetime(2026, 6, 1)
-    end_date = datetime(2026, 6, 7)
+    start_date = datetime(2025, 1, 1)
+    end_date = datetime(2025, 12, 31)
     
     print("=" * 80)
     print("🤖 DEBBIE-LA INSTITUTIONAL SMC STRATEGY - BACKTEST")
@@ -70,7 +70,7 @@ def run_live_trading():
         broker=broker,
         parameters={
             "symbols": watchlist,
-            "cash_at_risk": 0.03,
+            "cash_at_risk": 0.02,
             "timeframe_htf": "4 hours",
             "timeframe_ltf": "15 minutes"
         }

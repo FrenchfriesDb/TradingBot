@@ -59,31 +59,39 @@ def detect_consolidation(df, lookback=20):
     is_consolidating = consolidation_ratio < 0.02 and volatility < 0.01
     return is_consolidating
 
-def detect_displacement_bos(df, lookback=10):
+def detect_displacement_bos(df, lookback=15, bos_window=10):
     """
-    Detects Displacement and Break of Structure (BOS).
-    Looks for aggressive candles with large bodies breaking swing points.
-    Returns True if recent candles show institutional buying/selling pressure.
+    Detects a Break of Structure (bullish OR bearish) in the last bos_window candles.
+    Bullish: any recent candle closed above the prior swing high with a strong body.
+    Bearish: any recent candle closed below the prior swing low with a strong body.
     """
     if len(df) < lookback:
         return False, None
-    
+
     recent = df.tail(lookback)
-    latest = recent.iloc[-1]
-    
-    # Measure candle body size
-    body_size = abs(latest['close'] - latest['open'])
-    total_range = latest['high'] - latest['low']
-    
-    # Strong body = institutional move
-    body_ratio = body_size / total_range if total_range > 0 else 0
-    
-    # Check if close is beyond recent swing high
-    swing_high = recent['high'].iloc[:-1].max()
-    is_bos = latest['close'] > swing_high and body_ratio > 0.6
-    
-    direction = "bullish" if is_bos and latest['close'] > latest['open'] else "bearish"
-    return is_bos, direction
+
+    for i in range(-bos_window, 0):
+        candle = recent.iloc[i]
+        prior = recent.iloc[:i] if i < -1 else recent.iloc[:-1]
+        if len(prior) == 0:
+            continue
+
+        body_size = abs(candle['close'] - candle['open'])
+        total_range = candle['high'] - candle['low']
+        body_ratio = body_size / total_range if total_range > 0 else 0
+
+        if body_ratio < 0.30:
+            continue
+
+        swing_high = prior['high'].max()
+        swing_low = prior['low'].min()
+
+        if candle['close'] > swing_high:
+            return True, "bullish"
+        if candle['close'] < swing_low:
+            return True, "bearish"
+
+    return False, None
 
 def detect_order_block(df, lookback=15):
     """
@@ -110,25 +118,27 @@ def detect_order_block(df, lookback=15):
 # LOWER TIMEFRAME (LTF) EXECUTION - 15m/5m Entry & Exit
 # ============================================================================
 
-def check_liquidity_sweep(df):
+def check_liquidity_sweep(df, sweep_window=3):
     """
-    Step 2 Math: Checks if the lowest point of the current candle 
-    flushed out the minimum support level of the last 20 candles, 
-    but managed to recover and close back above that support.
-    This is the "Wick" that hunts retail stop losses.
+    Checks the last sweep_window candles for a liquidity sweep:
+    wick pierced the prior 20-candle support but closed back above it.
+    Checking recent candles (not just the latest) prevents missing a sweep
+    that occurred one or two iterations ago.
     """
     if len(df) < 22:
         return False, None, None
-        
-    latest_candle = df.iloc[-1]
-    previous_candles = df.iloc[-21:-1]
-    local_support = previous_candles['low'].min()
-    
-    # The Trap: Wick pierces support, but the body closes safely above it
-    is_sweep = latest_candle['low'] < local_support and latest_candle['close'] > local_support
-    sweep_wick_low = latest_candle['low']
-    
-    return is_sweep, local_support, sweep_wick_low
+
+    for i in range(-sweep_window, 0):
+        candle = df.iloc[i]
+        lookback_start = i - 20 if i - 20 >= -len(df) else -len(df)
+        prior = df.iloc[lookback_start:i]
+        if len(prior) == 0:
+            continue
+        local_support = prior['low'].min()
+        if candle['low'] < local_support and candle['close'] > local_support:
+            return True, local_support, candle['low']
+
+    return False, None, None
 
 def check_market_structure_shift(df):
     """
@@ -171,21 +181,22 @@ def find_bullish_fvg(df):
 
 def find_bearish_fvg(df):
     """
-    Bearish version: Scans for downside institutional imbalance.
+    Bearish FVG: same gap structure as bullish but with a bearish displacement candle.
+    c1 low > c3 high — gap down, c2 is bearish (the displacement).
+    Price retracing UP into [c3 high, c1 low] is the short entry zone.
     """
     if len(df) < 3:
         return False, None, None
-        
+
     c1 = df.iloc[-3]
     c2 = df.iloc[-2]
     c3 = df.iloc[-1]
-    
-    # Bearish FVG: High of candle 1 is lower than low of candle 3
-    if c1['high'] < c3['low'] and c2['close'] < c2['open']:
-        fvg_top = c3['low']
-        fvg_bottom = c1['high']
+
+    if c1['low'] > c3['high'] and c2['close'] < c2['open']:
+        fvg_top    = c1['low']
+        fvg_bottom = c3['high']
         return True, fvg_bottom, fvg_top
-    
+
     return False, None, None
 
 # ============================================================================

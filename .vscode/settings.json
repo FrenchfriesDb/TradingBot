@@ -62,9 +62,15 @@
   "python.venvPath": "/Users/usahealthlife/Desktop/TradingBot",
   "python.pythonPath": ".venv311/bin/python",
   "python.analysis.extraPaths": [
-    "/Users/usahealthlife/Desktop/TradingBot"
+    "/Users/usahealthlife/Desktop/TradingBot",
+    "/Users/usahealthlife/Desktop/TradingBot/.venv311/lib/python3.11/site-packages"
   ],
   "python.analysis.ignore": [
     "**/lumibot/**"
-  ]
+  ],
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "none",
+    "reportMissingModuleSource": "none",
+    "reportAttributeAccessIssue": "none"
+  }
 }
