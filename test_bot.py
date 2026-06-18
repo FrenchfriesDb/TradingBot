@@ -1,7 +1,7 @@
 """
 EMA Crossover Test Bot — stocks + crypto.
-Stocks : SPY via Alpaca paper (NYSE hours, EMA 9/21 on 1m)
-Crypto : BTC/ETH/SOL via Kraken public (24/7, EMA 9/21 on 5m, paper)
+Stocks : IWM via Alpaca paper (NYSE hours, EMA 9/21 on 1m)
+Crypto : BTC only via Kraken public (24/7, EMA 9/21 on 5m, paper)
 Purpose: confirm execution works on both pipelines before trusting the SMC bot.
 """
 
@@ -21,11 +21,16 @@ PAPER      = os.getenv("ALPACA_PAPER", "True").lower() in ("1", "true", "yes")
 
 FAST           = 9
 SLOW           = 21
-STOCK_SYMBOL   = "SPY"
-CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
+STOCK_SYMBOL   = "IWM"  # kept off DebbieLaSMC's watchlist on purpose — avoids both bots trading the same ticker
+STOCK_SL_PCT   = 0.005   # SL = 0.5% from entry
+STOCK_RR       = 3       # 1:3 R:R → TP = 1.5% from entry
+CRYPTO_SYMBOLS = ["BTC/USD"]
 CRYPTO_BALANCE = 5_000.0
-CRYPTO_RISK    = 0.05    # 5% per trade — generous for frequent test signals
+CRYPTO_RISK    = 0.05    # 5% of balance per trade
+CRYPTO_SL_PCT  = 0.015   # SL = 1.5% from entry
+CRYPTO_RR      = 6       # 1:6 R:R  →  TP = 9% from entry
 CRYPTO_SLEEP   = 5 * 60  # 5 minutes
+TEST_STATE_FILE = "test_state.json"
 
 
 # ── Paper trader (crypto side) ─────────────────────────────────────────────────
@@ -105,6 +110,43 @@ def _patch_ccxt():
         pass
 
 
+def save_test_state(paper, sl_levels, tp_levels, prices):
+    import json
+    try:
+        positions = {}
+        for sym, qty in paper.positions.items():
+            if abs(qty) < 1e-9:
+                continue
+            entry = paper.entry_prices.get(sym, 0.0)
+            cur   = prices.get(sym, 0.0)
+            sl    = sl_levels.get(sym)
+            tp    = tp_levels.get(sym)
+            is_long = qty > 0
+            upnl  = (cur - entry) * qty if is_long else (entry - cur) * abs(qty)
+            risk  = abs(entry - sl) * abs(qty) if sl else None
+            reward = abs(tp - entry) * abs(qty) if tp else None
+            positions[sym] = {
+                "qty": qty, "side": "LONG" if is_long else "SHORT",
+                "entry_price": entry, "current_price": cur,
+                "stop_loss": sl, "take_profit": tp,
+                "unrealized_pnl": upnl,
+                "risk_dollars": risk, "reward_dollars": reward,
+            }
+        data = {
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "bot": "EMATestBot",
+            "balance": paper.balance,
+            "start_balance": CRYPTO_BALANCE,
+            "trade_count": paper.trade_count,
+            "positions": positions,
+            "live_prices": {s: prices.get(s, 0) for s in CRYPTO_SYMBOLS},
+        }
+        with open(TEST_STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[STATE] save failed: {e}")
+
+
 def ohlcv_to_df(ohlcv):
     df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
@@ -117,12 +159,18 @@ def run_crypto_ema():
     _patch_ccxt()
     import ccxt
 
-    exchange = ccxt.kraken({"enableRateLimit": True})
+    exchange = ccxt.coinbase({"enableRateLimit": True})
     paper    = PaperTrader(CRYPTO_BALANCE)
+
+    # SL/TP tracked per symbol — crossover opens the trade, price closes it
+    sl_levels: dict  = {s: None for s in CRYPTO_SYMBOLS}
+    tp_levels: dict  = {s: None for s in CRYPTO_SYMBOLS}
+    live_prices: dict = {s: 0.0  for s in CRYPTO_SYMBOLS}
 
     print(f"[CRYPTO] EMA{FAST}/{SLOW} on "
           f"{', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} | 5m | "
-          f"${CRYPTO_BALANCE:,.0f} paper balance")
+          f"${CRYPTO_BALANCE:,.0f} paper  |  SL={CRYPTO_SL_PCT*100:.1f}%  "
+          f"TP={CRYPTO_SL_PCT*CRYPTO_RR*100:.1f}%  (1:{CRYPTO_RR} R:R)")
 
     while True:
         ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
@@ -138,35 +186,59 @@ def run_crypto_ema():
                 bull_cross = fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]
                 bear_cross = fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]
                 held       = paper.get_position(symbol)
+                live_prices[symbol] = price
                 side_label = "LONG" if held > 0 else "SHORT" if held < 0 else "flat"
 
+                sl = sl_levels[symbol]
+                tp = tp_levels[symbol]
+                sl_str = f"  SL=${sl:,.2f}  TP=${tp:,.2f}" if sl else ""
                 print(f"[{base}] {ts}  ${price:,.2f}  "
                       f"EMA{FAST}={fast.iloc[-1]:,.3f}  EMA{SLOW}={slow.iloc[-1]:,.3f}  "
-                      f"pos={side_label}  bull={bull_cross}  bear={bear_cross}")
+                      f"pos={side_label}{sl_str}  bull={bull_cross}  bear={bear_cross}")
 
-                if bull_cross:
-                    if held < 0:
-                        entry = paper.entry_prices.get(symbol, price)
-                        paper.buy(symbol, abs(held), price)
-                        pnl = (entry - price) * abs(held)
-                        print(f"[{base}] ↩ Covered SHORT @ ${price:,.2f}  P&L: ${pnl:+.2f}")
-                    if paper.get_position(symbol) <= 0:
-                        qty = math.floor((paper.balance * CRYPTO_RISK / price) * 1e6) / 1e6
-                        if qty > 0 and paper.buy(symbol, qty, price):
-                            print(f"[{base}] ✅ PAPER LONG  ${price:,.2f}  "
-                                  f"qty={qty:.6f}  Balance: ${paper.balance:,.2f}")
+                # ── Check SL/TP first — price-based exits only ─────────────────
+                if held != 0 and sl and tp:
+                    is_long = held > 0
+                    entry   = paper.entry_prices.get(symbol, price)
+                    hit     = None
+                    if is_long  and price <= sl: hit = ("SL", "red")
+                    elif is_long  and price >= tp: hit = ("TP", "green")
+                    elif not is_long and price >= sl: hit = ("SL", "red")
+                    elif not is_long and price <= tp: hit = ("TP", "green")
 
-                elif bear_cross:
-                    if held > 0:
-                        entry = paper.entry_prices.get(symbol, price)
-                        paper.sell(symbol, held, price)
-                        pnl = (price - entry) * held
-                        print(f"[{base}] ↩ Closed LONG @ ${price:,.2f}  P&L: ${pnl:+.2f}")
-                    if paper.get_position(symbol) >= 0:
-                        qty = math.floor((paper.balance * CRYPTO_RISK / price) * 1e6) / 1e6
-                        if qty > 0 and paper.sell(symbol, qty, price):
-                            print(f"[{base}] 🔴 PAPER SHORT ${price:,.2f}  "
-                                  f"qty={qty:.6f}  Balance: ${paper.balance:,.2f}")
+                    if hit:
+                        label, _ = hit
+                        if is_long:
+                            paper.sell(symbol, abs(held), price)
+                            pnl = (price - entry) * abs(held)
+                        else:
+                            paper.buy(symbol, abs(held), price)
+                            pnl = (entry - price) * abs(held)
+                        icon = "🟢" if label == "TP" else "🔴"
+                        print(f"[{base}] {icon} {label} hit @ ${price:,.2f}  "
+                              f"P&L: ${pnl:+.2f}  Balance: ${paper.balance:,.2f}")
+                        sl_levels[symbol] = None
+                        tp_levels[symbol] = None
+                    continue  # don't look for new entries mid-trade
+
+                # ── EMA crossover opens new position (only when flat) ──────────
+                if bull_cross and held <= 0:
+                    qty = math.floor((paper.balance * CRYPTO_RISK / price) * 1e6) / 1e6
+                    if qty > 0 and paper.buy(symbol, qty, price):
+                        sl_levels[symbol] = round(price * (1 - CRYPTO_SL_PCT), 4)
+                        tp_levels[symbol] = round(price * (1 + CRYPTO_SL_PCT * CRYPTO_RR), 4)
+                        print(f"[{base}] ✅ PAPER LONG  ${price:,.2f}  qty={qty:.6f}  "
+                              f"SL=${sl_levels[symbol]:,.2f}  TP=${tp_levels[symbol]:,.2f}  "
+                              f"Balance: ${paper.balance:,.2f}")
+
+                elif bear_cross and held >= 0:
+                    qty = math.floor((paper.balance * CRYPTO_RISK / price) * 1e6) / 1e6
+                    if qty > 0 and paper.sell(symbol, qty, price):
+                        sl_levels[symbol] = round(price * (1 + CRYPTO_SL_PCT), 4)
+                        tp_levels[symbol] = round(price * (1 - CRYPTO_SL_PCT * CRYPTO_RR), 4)
+                        print(f"[{base}] 🔴 PAPER SHORT ${price:,.2f}  qty={qty:.6f}  "
+                              f"SL=${sl_levels[symbol]:,.2f}  TP=${tp_levels[symbol]:,.2f}  "
+                              f"Balance: ${paper.balance:,.2f}")
 
             except Exception as e:
                 print(f"[{base}] Error: {e}")
@@ -176,6 +248,7 @@ def run_crypto_ema():
             for k, v in paper.positions.items()
         ) or "flat"
         print(f"  [CRYPTO] Balance: ${paper.balance:,.2f}  |  {pos_str}\n")
+        save_test_state(paper, sl_levels, tp_levels, live_prices)
         time.sleep(CRYPTO_SLEEP)
 
 
@@ -190,7 +263,56 @@ def run_stock_ema():
 
         class EMATestBot(Strategy):
             def initialize(self):
-                self.sleeptime = "1M"
+                self.sleeptime    = "1M"
+                self.entry_order  = None
+                self.sl_order     = None
+                self.tp_order     = None
+                self.stop_loss    = None
+                self.take_profit  = None
+
+            def _cancel_resting_orders(self):
+                for attr in ("sl_order", "tp_order"):
+                    order = getattr(self, attr)
+                    if order is not None:
+                        try:
+                            self.cancel_order(order)
+                        except Exception:
+                            pass
+                        setattr(self, attr, None)
+                self.stop_loss   = None
+                self.take_profit = None
+
+            def on_filled_order(self, position, order, price, quantity, multiplier):
+                # Single OCO order, not two separate stop + limit orders — submitting
+                # them separately makes Alpaca hold the full share count against the
+                # first one, so the second always gets rejected with "insufficient
+                # qty available" (fails async, after we've already logged success).
+                if order is not self.entry_order:
+                    return
+                self.entry_order = None
+                asset = order.asset
+
+                sl = round(price * (1 - STOCK_SL_PCT), 2)
+                tp = round(price * (1 + STOCK_SL_PCT * STOCK_RR), 2)
+                self.stop_loss   = sl
+                self.take_profit = tp
+
+                try:
+                    oco_order = self.create_order(
+                        asset, abs(quantity), Order.OrderSide.SELL,
+                        order_class=Order.OrderClass.OCO,
+                        limit_price=tp,
+                        stop_price=sl,
+                    )
+                    self.submit_order(oco_order)
+                    self.sl_order = oco_order
+                    self.tp_order = oco_order
+                    self.log_message(
+                        f"[{STOCK_SYMBOL}] 🛑🎯 OCO order placed — SL @ ${sl:.2f}  TP @ ${tp:.2f}",
+                        color="yellow"
+                    )
+                except Exception as e:
+                    self.log_message(f"[{STOCK_SYMBOL}] OCO order failed: {e}", color="red")
 
             def on_trading_iteration(self):
                 asset    = Asset(STOCK_SYMBOL, asset_type=Asset.AssetType.STOCK)
@@ -210,22 +332,38 @@ def run_stock_ema():
                 bull_cross = fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]
                 bear_cross = fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]
 
+                sl_str = f"  SL=${self.stop_loss:.2f}  TP=${self.take_profit:.2f}" if self.stop_loss else ""
                 self.log_message(
                     f"[{STOCK_SYMBOL}] ${price:.2f}  "
                     f"EMA{FAST}={fast.iloc[-1]:.3f}  EMA{SLOW}={slow.iloc[-1]:.3f}  "
-                    f"bull={bull_cross}  bear={bear_cross}"
+                    f"bull={bull_cross}  bear={bear_cross}{sl_str}"
                 )
+
+                # Manual SL/TP check — closes the position if the resting broker order
+                # hasn't filled yet by the time we poll (keeps this in sync either way).
+                if position and position.quantity > 0 and self.stop_loss and self.take_profit:
+                    if price <= self.stop_loss or price >= self.take_profit:
+                        label = "SL" if price <= self.stop_loss else "TP"
+                        self._cancel_resting_orders()
+                        self.submit_order(
+                            self.create_order(asset, position.quantity, Order.OrderSide.SELL))
+                        self.log_message(f"[{STOCK_SYMBOL}] {'🔴' if label=='SL' else '🟢'} {label} hit @ ${price:.2f}",
+                                         color="red" if label == "SL" else "green")
+                        return
 
                 if bull_cross:
                     if position and position.quantity < 0:
                         self.submit_order(
                             self.create_order(asset, abs(position.quantity), Order.OrderSide.BUY))
                     if not position or position.quantity <= 0:
-                        self.submit_order(self.create_order(asset, 1, Order.OrderSide.BUY))
+                        order = self.create_order(asset, 1, Order.OrderSide.BUY)
+                        self.entry_order = order
+                        self.submit_order(order)
                         self.log_message(f"[{STOCK_SYMBOL}] ✅ BUY @ ${price:.2f}", color="green")
 
                 elif bear_cross:
                     if position and position.quantity > 0:
+                        self._cancel_resting_orders()
                         self.submit_order(
                             self.create_order(asset, position.quantity, Order.OrderSide.SELL))
                         self.log_message(f"[{STOCK_SYMBOL}] 🔴 SELL @ ${price:.2f}", color="red")
@@ -248,7 +386,7 @@ if __name__ == "__main__":
     print("=" * 65)
     print("EMA CROSSOVER TEST BOT — STOCKS + CRYPTO")
     print(f"  Stocks : {STOCK_SYMBOL} via Alpaca paper  (fires at NYSE open)")
-    print(f"  Crypto : {', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} via Kraken  (24/7)")
+    print(f"  Crypto : {', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} via Coinbase  (24/7)")
     print(f"  EMAs   : {FAST} / {SLOW}  |  Stock: 1m bars  |  Crypto: 5m bars")
     print("=" * 65)
 

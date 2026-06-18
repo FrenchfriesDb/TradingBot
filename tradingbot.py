@@ -1,14 +1,39 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from lumibot.brokers import Alpaca
-from lumibot.strategies import Strategy
 from lumibot.traders import Trader
-from lumibot.entities import Asset, Order
 from lumibot.backtesting import YahooDataBacktesting
-from finbert_utils import estimate_sentiment
 from config import API_KEY, API_SECRET, BASE_URL, PAPER_TRADING
 
 from bot.strategy import DebbieLaSMC
 from bot.crypto_strategy import DebbieLaCrypto
+
+# ── Lumibot compatibility patch ───────────────────────────────────────────────
+# Alpaca keeps old bracket/OTO order history that lumibot can't parse (they have
+# no child order prices). Instead of crashing every sync cycle, skip them silently.
+try:
+    from lumibot.brokers.alpaca import Alpaca as _AlpacaBroker
+    _orig_parse = _AlpacaBroker._parse_broker_order
+
+    def _safe_parse_broker_order(self, response, strategy_name, strategy_object=None):
+        try:
+            return _orig_parse(self, response, strategy_name, strategy_object)
+        except (ValueError, TypeError) as e:
+            order_id = (response.get("id", "?") if isinstance(response, dict)
+                        else getattr(response, "id", "?"))
+            print(f"[patch] Skipping malformed order {order_id}: {e}")
+            return None
+
+    _AlpacaBroker._parse_broker_order = _safe_parse_broker_order
+
+    # Lumibot v4.5.x calls process_pending_orders during crash recovery but the
+    # method was removed from the Alpaca broker in the current SDK version.
+    # Add a no-op so a transient network drop doesn't permanently kill the bot.
+    if not hasattr(_AlpacaBroker, "process_pending_orders"):
+        _AlpacaBroker.process_pending_orders = lambda self, *a, **kw: None
+
+except Exception as _patch_err:
+    print(f"[patch] Warning: Could not apply order parser patch: {_patch_err}")
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ============================================================================
 # BACKTEST CONFIGURATION
@@ -53,7 +78,7 @@ def run_live_trading():
     print("🔴 DEBBIE-LA INSTITUTIONAL SMC - LIVE PAPER TRADING")
     print("=" * 80)
     print(f"🔗 Connected to: {BASE_URL}")
-    watchlist = ["AAPL", "QQQ", "SPY", "NVDA", "TSLA", "GOOGL"]
+    watchlist = ["AAPL", "QQQ", "SPY", "NVDA", "TSLA", "GOOGL", "META", "MSFT"]
     print(f"📈 Watchlist: {', '.join(watchlist)}")
     print(f"⏱️  HTF: 4H | LTF: 15m | Execution Interval: 15 minutes")
     print(f"💰 Risk per trade: 3% total (~0.5% per symbol)")

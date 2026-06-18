@@ -1,10 +1,38 @@
 # bot/indicators.py
 import pandas as pd
-import numpy as np
 
 # ============================================================================
 # HIGHER TIMEFRAME (HTF) ANALYSIS - 4H Institutional Intent
 # ============================================================================
+
+def find_next_liquidity_target(df, price, bias, swing_bars=2):
+    """
+    Scans the 4H chart for the nearest swing high (bullish) or swing low (bearish)
+    beyond current price. These are liquidity pools — where stops are clustered and
+    where smart money drives price to collect them.
+    A swing point requires its high/low to be the extreme in a ±swing_bars window.
+    Returns the target price, or None if no clear pool exists beyond current price.
+    """
+    best = None
+    for i in range(swing_bars, len(df) - swing_bars):
+        if bias == "bullish":
+            level = float(df.iloc[i]['high'])
+            if level <= price:
+                continue
+            window_max = float(df.iloc[i - swing_bars: i + swing_bars + 1]['high'].max())
+            if level == window_max:
+                if best is None or level < best:   # nearest swing high above price
+                    best = level
+        else:
+            level = float(df.iloc[i]['low'])
+            if level >= price:
+                continue
+            window_min = float(df.iloc[i - swing_bars: i + swing_bars + 1]['low'].min())
+            if level == window_min:
+                if best is None or level > best:   # nearest swing low below price
+                    best = level
+    return best
+
 
 def find_swing_points(df, lookback=10):
     """
@@ -59,36 +87,58 @@ def detect_consolidation(df, lookback=20):
     is_consolidating = consolidation_ratio < 0.02 and volatility < 0.01
     return is_consolidating
 
-def detect_displacement_bos(df, lookback=15, bos_window=10):
+def get_daily_trend(df_daily):
     """
-    Detects a Break of Structure (bullish OR bearish) in the last bos_window candles.
-    Bullish: any recent candle closed above the prior swing high with a strong body.
-    Bearish: any recent candle closed below the prior swing low with a strong body.
+    Returns 'bullish', 'bearish', or None (choppy/unclear).
+    Requires BOTH conditions to agree before calling a trend:
+      - Price is above/below the daily EMA50
+      - Daily EMA20 is above/below the daily EMA50
+    A 4H BOS against the daily trend is just a pullback — skip it.
+    """
+    if len(df_daily) < 52:
+        return None
+    close   = df_daily['close']
+    ema20   = close.ewm(span=20, adjust=False).mean()
+    ema50   = close.ewm(span=50, adjust=False).mean()
+    price   = float(close.iloc[-1])
+    e20_now = float(ema20.iloc[-1])
+    e50_now = float(ema50.iloc[-1])
+
+    if price > e50_now and e20_now > e50_now:
+        return "bullish"
+    if price < e50_now and e20_now < e50_now:
+        return "bearish"
+    return None   # mixed / choppy — no trade
+
+
+def detect_displacement_bos(df, lookback=15):
+    """
+    Detects a FRESH institutional Break of Structure.
+    Requirements (all three must pass):
+      1. One of the last 3 bars closed above/below the prior structure level
+      2. That candle body is >50% of its range (real momentum, not a doji)
+      3. The close cleared the structure level by at least 0.15% (filters false breaks)
     """
     if len(df) < lookback:
         return False, None
 
-    recent = df.tail(lookback)
+    recent    = df.tail(lookback)
+    structure = recent.iloc[:-3]
+    if len(structure) < 5:
+        return False, None
 
-    for i in range(-bos_window, 0):
+    swing_high = structure['high'].max()
+    swing_low  = structure['low'].min()
+
+    for i in range(-3, 0):
         candle = recent.iloc[i]
-        prior = recent.iloc[:i] if i < -1 else recent.iloc[:-1]
-        if len(prior) == 0:
+        body   = abs(candle['close'] - candle['open'])
+        rng    = candle['high'] - candle['low']
+        if rng == 0 or body / rng < 0.40:   # 40% body — real conviction without over-filtering
             continue
-
-        body_size = abs(candle['close'] - candle['open'])
-        total_range = candle['high'] - candle['low']
-        body_ratio = body_size / total_range if total_range > 0 else 0
-
-        if body_ratio < 0.30:
-            continue
-
-        swing_high = prior['high'].max()
-        swing_low = prior['low'].min()
-
-        if candle['close'] > swing_high:
+        if candle['close'] > swing_high * 1.0015:   # 0.15% clearance filters 1-tick false breaks
             return True, "bullish"
-        if candle['close'] < swing_low:
+        if candle['close'] < swing_low  * 0.9985:
             return True, "bearish"
 
     return False, None
@@ -158,46 +208,269 @@ def check_market_structure_shift(df):
     
     return is_mss, recent_swing_high
 
-def find_bullish_fvg(df):
+def find_bullish_fvg(df, lookback=15):
     """
-    Step 3 (Imbalance): Scans the last 3 completed candles to see 
-    if a high-momentum gap was left behind by institutional buying.
-    The FVG is the "Discount Box" where price will retrace to.
-    """
-    if len(df) < 3:
-        return False, None, None
-        
-    c1 = df.iloc[-3]  # First candle in the sequence
-    c2 = df.iloc[-2]  # The big momentum candle
-    c3 = df.iloc[-1]  # Third candle in the sequence
-    
-    # Core FVG Condition: The low of Candle 1 is higher than the high of Candle 3
-    if c1['low'] > c3['high'] and c2['close'] > c2['open']:
-        fvg_bottom = c3['high']
-        fvg_top = c1['low']
-        return True, fvg_bottom, fvg_top
-        
-    return False, None, None
-
-def find_bearish_fvg(df):
-    """
-    Bearish FVG: same gap structure as bullish but with a bearish displacement candle.
-    c1 low > c3 high — gap down, c2 is bearish (the displacement).
-    Price retracing UP into [c3 high, c1 low] is the short entry zone.
+    Scans the last `lookback` bars for a bullish imbalance zone.
+    Primary: true FVG (c1.low > c3.high — literal gap between wicks).
+    Fallback: bullish order block (last bearish candle before a strong up move)
+              which is the zone pros actually trade on intraday stock charts.
+    Returns (found, bottom, top) where bottom < top is the entry zone.
     """
     if len(df) < 3:
         return False, None, None
 
-    c1 = df.iloc[-3]
-    c2 = df.iloc[-2]
-    c3 = df.iloc[-1]
+    end   = len(df) - 1
+    start = max(2, end - lookback)
 
-    if c1['low'] > c3['high'] and c2['close'] < c2['open']:
-        fvg_top    = c1['low']
-        fvg_bottom = c3['high']
-        return True, fvg_bottom, fvg_top
+    # 1. True FVG (most precise — common on crypto/overnight gaps)
+    for i in range(end, start - 1, -1):
+        c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
+        if c1['low'] > c3['high'] and c2['close'] > c2['open']:
+            return True, float(c3['high']), float(c1['low'])
+
+    # 2. Order block fallback — last bearish candle before a confirmed breakout above its high.
+    # OB candle body must be >40% of range (real institutional bearish move, not a doji).
+    # Breakout move above the OB high must exceed half the OB body (conviction required).
+    for i in range(end - 1, start - 1, -1):
+        candle = df.iloc[i]
+        if candle['close'] >= candle['open']:
+            continue
+        body = abs(candle['close'] - candle['open'])
+        rng  = candle['high'] - candle['low']
+        if rng == 0 or body / rng < 0.40:
+            continue
+        later  = df.iloc[i + 1: end + 1]
+        breaks = later[later['close'] > candle['high']]
+        if not breaks.empty:
+            breakout_move = float(breaks.iloc[0]['close']) - float(candle['high'])
+            if breakout_move >= body * 0.5:
+                return True, float(candle['low']), float(candle['high'])
 
     return False, None, None
+
+def find_bearish_fvg(df, lookback=15):
+    """
+    Scans the last `lookback` bars for a bearish imbalance zone.
+    Primary: true FVG (gap down). Fallback: bearish order block.
+    """
+    if len(df) < 3:
+        return False, None, None
+
+    end   = len(df) - 1
+    start = max(2, end - lookback)
+
+    # 1. True FVG
+    for i in range(end, start - 1, -1):
+        c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
+        if c1['low'] > c3['high'] and c2['close'] < c2['open']:
+            return True, float(c3['high']), float(c1['low'])
+
+    # 2. Order block fallback — last bullish candle before a breakdown below its low.
+    # OB candle body must be >40% of range, breakdown must have conviction.
+    for i in range(end - 1, start - 1, -1):
+        candle = df.iloc[i]
+        if candle['close'] <= candle['open']:
+            continue
+        body = abs(candle['close'] - candle['open'])
+        rng  = candle['high'] - candle['low']
+        if rng == 0 or body / rng < 0.40:
+            continue
+        later  = df.iloc[i + 1: end + 1]
+        breaks = later[later['close'] < candle['low']]
+        if not breaks.empty:
+            breakdown_move = float(candle['low']) - float(breaks.iloc[0]['close'])
+            if breakdown_move >= body * 0.5:
+                return True, float(candle['low']), float(candle['high'])
+
+    return False, None, None
+
+
+# ============================================================================
+# AMD CYCLE INTELLIGENCE — Accumulation / Manipulation / Distribution
+# ============================================================================
+
+def detect_amd_phase(df_htf, structure_bars=25, recent_bars=5):
+    """
+    Detects which AMD phase the 4H chart is in by looking for liquidity sweeps.
+
+    'manipulation_up'  : a recent wick swept BELOW the prior structural swing low
+                         but the close is now BACK ABOVE it → stop hunt complete,
+                         price is bleeding up. Real play may be SHORT from supply.
+    'manipulation_down': symmetric — recent wick swept ABOVE prior swing high,
+                         now rejected below → real play may be LONG from demand.
+    'unknown'          : no clear sweep-and-recover pattern detected.
+
+    Returns: (phase: str, info: dict)
+      info keys: swept_level, sweep_wick, manipulation_target
+    """
+    if df_htf is None or len(df_htf) < structure_bars + recent_bars:
+        return 'unknown', {}
+
+    bars    = df_htf.tail(structure_bars + recent_bars).reset_index(drop=True)
+    struct  = bars.iloc[:structure_bars]
+    recent  = bars.iloc[structure_bars:]
+
+    struct_swing_low  = float(struct['low'].min())
+    struct_swing_high = float(struct['high'].max())
+    current_close     = float(bars.iloc[-1]['close'])
+    recent_low_wick   = float(recent['low'].min())
+    recent_high_wick  = float(recent['high'].max())
+    swing_range       = struct_swing_high - struct_swing_low
+
+    # Manipulation UP: wick pierced below structure low, close recovered above it
+    if (recent_low_wick < struct_swing_low
+            and current_close > struct_swing_low
+            and swing_range > 0
+            and (current_close - struct_swing_low) / swing_range < 0.75):
+        return 'manipulation_up', {
+            'swept_level':         struct_swing_low,
+            'sweep_wick':          recent_low_wick,
+            'manipulation_target': struct_swing_high,
+        }
+
+    # Manipulation DOWN: wick pierced above structure high, close rejected below it
+    if (recent_high_wick > struct_swing_high
+            and current_close < struct_swing_high
+            and swing_range > 0
+            and (struct_swing_high - current_close) / swing_range < 0.75):
+        return 'manipulation_down', {
+            'swept_level':         struct_swing_high,
+            'sweep_wick':          recent_high_wick,
+            'manipulation_target': struct_swing_low,
+        }
+
+    return 'unknown', {}
+
+
+def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12):
+    """
+    Scans the full 4H chart for supply zones (bearish imbalances) ABOVE current price.
+
+    Checks in order of reliability:
+    1. Unmitigated bearish FVG — genuine gap-down imbalance that hasn't been refilled
+    2. Bearish OB — bullish candle before a confirmed breakdown (institutional selling)
+    3. IFVG (Inverse FVG) — old bullish FVG that price has since filled; it flips to
+       resistance on the next retest from below
+
+    max_distance_pct: ignore zones more than this % above price (default 12%)
+                      prevents locking a supply zone $20k above BTC current price.
+
+    Returns: (found: bool, zone_low: float, zone_high: float, zone_type: str)
+    """
+    if df_htf is None or len(df_htf) < 5:
+        return False, 0.0, 0.0, ''
+
+    bars = df_htf.reset_index(drop=True)
+    n    = len(bars)
+    min_price = current_price * (1 + min_distance_pct)
+    max_price = current_price * (1 + max_distance_pct)
+    candidates = []   # (zone_low, zone_high, zone_type)
+
+    for i in range(2, n - 1):
+        c1 = bars.iloc[i - 2]
+        c2 = bars.iloc[i - 1]
+        c3 = bars.iloc[i]
+        sub = bars.iloc[i + 1:]   # bars that come after this pattern
+
+        # 1. Bearish FVG: c1.low > c3.high  (price gaped DOWN, imbalance above)
+        if c1['low'] > c3['high']:
+            z_lo, z_hi = float(c3['high']), float(c1['low'])
+            if min_price <= z_lo <= max_price:
+                already_filled = len(sub) > 0 and float(sub['high'].max()) >= z_lo
+                if not already_filled:
+                    candidates.append((z_lo, z_hi, 'bearish_fvg'))
+
+        # 2. Bearish OB: bullish c1 immediately before a breakdown
+        if c1['close'] > c1['open']:
+            body = abs(c1['close'] - c1['open'])
+            rng  = c1['high'] - c1['low']
+            if rng > 0 and body / rng >= 0.40:
+                broke_down = (len(sub) > 0
+                              and float(sub['low'].min()) < float(c1['open']))
+                if broke_down:
+                    z_lo, z_hi = float(c1['open']), float(c1['high'])
+                    if min_price <= z_lo <= max_price:
+                        candidates.append((z_lo, z_hi, 'bearish_ob'))
+
+        # 3. IFVG: old bullish FVG (c1.high < c3.low) that price has since filled
+        #    After being filled it becomes resistance — the "inverse" zone
+        if c1['high'] < c3['low']:
+            z_lo, z_hi = float(c1['high']), float(c3['low'])
+            was_filled = len(sub) > 0 and float(sub['low'].min()) <= z_lo
+            if was_filled and min_price <= z_lo <= max_price:
+                candidates.append((z_lo, z_hi, 'ifvg'))
+
+    if not candidates:
+        return False, 0.0, 0.0, ''
+
+    # Nearest zone above price (lowest zone_low)
+    candidates.sort(key=lambda x: x[0])
+    z_lo, z_hi, z_type = candidates[0]
+    return True, z_lo, z_hi, z_type
+
+
+def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12):
+    """
+    Scans the full 4H chart for demand zones (bullish imbalances) BELOW current price.
+    Mirror of find_supply_zone for LONG setups.
+
+    1. Unmitigated bullish FVG below price
+    2. Bullish OB — bearish candle before a strong breakout up
+    3. IFVG support — old bearish FVG that price filled; flips to support
+
+    max_distance_pct: ignore zones more than this % below price (default 12%).
+
+    Returns: (found: bool, zone_low: float, zone_high: float, zone_type: str)
+    """
+    if df_htf is None or len(df_htf) < 5:
+        return False, 0.0, 0.0, ''
+
+    bars = df_htf.reset_index(drop=True)
+    n    = len(bars)
+    max_price = current_price * (1 - min_distance_pct)
+    min_price = current_price * (1 - max_distance_pct)
+    candidates = []
+
+    for i in range(2, n - 1):
+        c1 = bars.iloc[i - 2]
+        c2 = bars.iloc[i - 1]
+        c3 = bars.iloc[i]
+        sub = bars.iloc[i + 1:]
+
+        # 1. Bullish FVG: c1.high < c3.low (price gaped UP)
+        if c1['high'] < c3['low']:
+            z_lo, z_hi = float(c1['high']), float(c3['low'])
+            if min_price <= z_hi <= max_price:
+                already_filled = len(sub) > 0 and float(sub['low'].min()) <= z_lo
+                if not already_filled:
+                    candidates.append((z_lo, z_hi, 'bullish_fvg'))
+
+        # 2. Bullish OB: bearish c1 before breakout up
+        if c1['close'] < c1['open']:
+            body = abs(c1['close'] - c1['open'])
+            rng  = c1['high'] - c1['low']
+            if rng > 0 and body / rng >= 0.40:
+                broke_up = (len(sub) > 0
+                            and float(sub['high'].max()) > float(c1['open']))
+                if broke_up:
+                    z_lo, z_hi = float(c1['low']), float(c1['open'])
+                    if min_price <= z_hi <= max_price:
+                        candidates.append((z_lo, z_hi, 'bullish_ob'))
+
+        # 3. IFVG support: old bearish FVG (c1.low > c3.high) price later filled
+        if c1['low'] > c3['high']:
+            z_lo, z_hi = float(c3['high']), float(c1['low'])
+            was_filled = len(sub) > 0 and float(sub['high'].max()) >= z_hi
+            if was_filled and min_price <= z_hi <= max_price:
+                candidates.append((z_lo, z_hi, 'ifvg_support'))
+
+    if not candidates:
+        return False, 0.0, 0.0, ''
+
+    # Nearest zone below price (highest zone_high)
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    z_lo, z_hi, z_type = candidates[0]
+    return True, z_lo, z_hi, z_type
 
 # ============================================================================
 # FIBONACCI RETRACEMENT - Optimal Trade Entry (OTE) Zone
