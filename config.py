@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 import os
 
 # Load environment variables from .env (do NOT commit .env)
-load_dotenv()
+# override=False + explicit path avoids the slow filesystem walk load_dotenv() does by default
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=False)
 
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
@@ -53,6 +54,6 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")  # your binance testnet api k
 BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")  # your binance testnet secret
 BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "True").lower() in ("1", "true", "yes")
 BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTC/USDT")
-BINANCE_CASH_AT_RISK = float(os.getenv("BINANCE_CASH_AT_RISK", 0.15))  # 15% risk budget — cap dominates
+BINANCE_CASH_AT_RISK = float(os.getenv("BINANCE_CASH_AT_RISK", 0.02))  # 2% risk per trade
 NVIDIA_API_KEY       = os.getenv("NVIDIA_API_KEY", "")               # build.nvidia.com
 

@@ -1,3 +1,45 @@
+import logging
+
+# ── Quiet the self-healing network churn so the console stays readable ──────────
+# Lumibot auto-reconnects the Alpaca order-stream websocket; the giant tracebacks and
+# "restarting connection" lines are noise, not failures. NOTE: a filter on the root
+# *logger* does NOT catch records propagated up from child loggers (which is why the
+# old telemetry filter never actually worked) — filters must go on the *handlers*.
+_NOISE = (
+    "LUMIBOT_TELEMETRY",
+    "LUMIWEALTH_API_KEY not set",
+    "trading stream websocket error",
+    "starting trading websocket connection",
+    "connected to: BaseURL.TRADING_STREAM",
+    "keepalive ping timeout",
+    "ConnectionClosedError",
+    "Error getting broker balances",
+)
+
+class _QuietFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            return not any(s in record.getMessage() for s in _NOISE)
+        except Exception:
+            return True
+
+_QUIET = _QuietFilter()
+
+def quiet_logging():
+    """(Re)apply noise suppression. Safe to call repeatedly — call again after Lumibot
+    has set up its own log handlers so the handler-level filter actually takes effect."""
+    root = logging.getLogger()
+    if _QUIET not in root.filters:
+        root.addFilter(_QUIET)
+    for h in root.handlers:
+        if _QUIET not in h.filters:
+            h.addFilter(_QUIET)
+    # The big tracebacks come from these two loggers — mute them; auto-reconnect handles it.
+    logging.getLogger("websockets").setLevel(logging.CRITICAL)
+    logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+quiet_logging()
+
 from datetime import datetime
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
@@ -106,6 +148,7 @@ def run_live_trading():
     trader.add_strategy(strategy)
     
     # Start trading
+    quiet_logging()   # re-apply now that Lumibot has configured its log handlers
     trader.run_all()
 
 def run_crypto_live():
@@ -138,6 +181,7 @@ def run_crypto_live():
 
     trader = Trader()
     trader.add_strategy(strategy)
+    quiet_logging()   # re-apply now that Lumibot has configured its log handlers
     trader.run_all()
 
 

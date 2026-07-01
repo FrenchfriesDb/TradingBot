@@ -57,20 +57,23 @@
   "C_Cpp_Runner.useLinkTimeOptimization": false,
   "C_Cpp_Runner.msvcSecureNoWarnings": false
   ,
-  "python.defaultInterpreterPath": "/Users/usahealthlife/Desktop/TradingBot/.venv311/bin/python",
-  "python.terminal.activateEnvironment": true,
-  "python.venvPath": "/Users/usahealthlife/Desktop/TradingBot",
-  "python.pythonPath": ".venv311/bin/python",
+  "python.defaultInterpreterPath": "/Users/usahealthlife/miniforge3/envs/trading/bin/python3",
+  "python.terminal.activateEnvironment": false,
+  "python.venvPath": "/Users/usahealthlife/miniforge3/envs",
+  "python.pythonPath": "/Users/usahealthlife/miniforge3/envs/trading/bin/python3",
   "python.analysis.extraPaths": [
     "/Users/usahealthlife/Desktop/TradingBot",
-    "/Users/usahealthlife/Desktop/TradingBot/.venv311/lib/python3.11/site-packages"
+    "/Users/usahealthlife/miniforge3/envs/trading/lib/python3.11/site-packages"
   ],
   "python.analysis.ignore": [
     "**/lumibot/**"
   ],
+  "python.analysis.typeCheckingMode": "off",
   "python.analysis.diagnosticSeverityOverrides": {
     "reportMissingImports": "none",
     "reportMissingModuleSource": "none",
-    "reportAttributeAccessIssue": "none"
-  }
+    "reportAttributeAccessIssue": "none",
+    "reportUndefinedVariable": "none"
+  },
+  "git.ignoreLimitWarning": true
 }

@@ -50,22 +50,184 @@ def find_swing_points(df, lookback=10):
     
     return swing_high, swing_high_idx, swing_low, swing_low_idx
 
-def find_support_resistance(df, lookback=50):
+def find_support_resistance(df, lookback=50, tolerance_pct=0.004, min_touches=2):
     """
-    Identifies key support and resistance levels using recent swing points.
-    Returns the two most recent significant levels.
+    Finds significant S/R levels by clustering swing-point touches.
+    Only levels hit at least min_touches times are returned — those are the ones
+    institutions are actually watching. Lists are ordered most-tested first.
+    Falls back to top single-touch swings if no cluster qualifies.
     """
     if len(df) < lookback:
         return [], []
-    
+
     recent = df.tail(lookback)
-    highs = recent[recent['high'] == recent['high'].rolling(5, center=True).max()]['high'].unique()
-    lows = recent[recent['low'] == recent['low'].rolling(5, center=True).min()]['low'].unique()
-    
-    resistance_levels = sorted(highs, reverse=True)[:3]
-    support_levels = sorted(lows)[:3]
-    
-    return list(resistance_levels), list(support_levels)
+    highs, lows = [], []
+    for i in range(1, len(recent) - 1):
+        h = float(recent.iloc[i]['high'])
+        l = float(recent.iloc[i]['low'])
+        if h >= float(recent.iloc[i-1]['high']) and h >= float(recent.iloc[i+1]['high']):
+            highs.append(h)
+        if l <= float(recent.iloc[i-1]['low']) and l <= float(recent.iloc[i+1]['low']):
+            lows.append(l)
+
+    def cluster(prices, mt):
+        if not prices:
+            return []
+        prices = sorted(prices)
+        groups = [[prices[0]]]
+        for p in prices[1:]:
+            if (p - groups[-1][-1]) / groups[-1][-1] <= tolerance_pct:
+                groups[-1].append(p)
+            else:
+                groups.append([p])
+        result = [(sum(g) / len(g), len(g)) for g in groups if len(g) >= mt]
+        result.sort(key=lambda x: x[1], reverse=True)
+        return [r[0] for r in result[:5]]
+
+    res = cluster(highs, min_touches)
+    sup = cluster(lows,  min_touches)
+    # Fallback: if no multi-touch clusters, use top raw swing points
+    if not res:
+        res = sorted(highs, reverse=True)[:3]
+    if not sup:
+        sup = sorted(lows)[:3]
+    return res, sup
+
+
+def is_near_sr_level(price, levels, tolerance_pct=0.005):
+    """
+    Returns (True, nearest_level) if price is within tolerance_pct of any S/R level.
+    Used to check confluence between an FVG/OB entry zone and a known multi-touch level.
+    """
+    for lvl in levels:
+        if lvl and abs(price - lvl) / lvl <= tolerance_pct:
+            return True, float(lvl)
+    return False, None
+
+
+def _detect_equal_wicks(df, side, lookback=40, tolerance_pct=0.0015,
+                        min_touches=2, swing_window=2):
+    """
+    Core for equal-lows/equal-highs. Finds swing pivots on the given side and clusters
+    those wicks within tolerance_pct. 'side' = 'low' or 'high'.
+    Returns (found, level, touches) for the strongest pool (most touches; ties broken
+    toward the nearest liquidity — lowest level for EQL, highest for EQH).
+    """
+    if df is None or len(df) < (2 * swing_window + 1):
+        return False, None, 0
+    recent = df.tail(lookback).reset_index(drop=True)
+    n = len(recent)
+    # Strict pivots only — a wick that genuinely sticks OUT below (above) its neighbours.
+    # Strict '<' / '>' excludes flat consolidation bases (which aren't the equal-wick
+    # liquidity shelves we're after) and keeps prominent swing wicks. We also record the
+    # bar index so we can require clustered touches to be separated in time (real EQL/EQH,
+    # not two adjacent candles of the same base).
+    pivots = []   # (value, index)
+    for i in range(swing_window, n - swing_window):
+        val   = float(recent.iloc[i][side])
+        others = [float(recent.iloc[j][side])
+                  for j in range(i - swing_window, i + swing_window + 1) if j != i]
+        is_pivot = all(val < o for o in others) if side == "low" else all(val > o for o in others)
+        if is_pivot:
+            pivots.append((val, i))
+    if len(pivots) < min_touches:
+        return False, None, 0
+
+    best_level, best_touches = None, 0
+    for base, _bi in pivots:
+        if base <= 0:
+            continue
+        group = [(p, gi) for (p, gi) in pivots if abs(p - base) / base <= tolerance_pct]
+        # require touches separated by ≥ swing_window bars (distinct, not adjacent)
+        idxs = sorted(gi for _p, gi in group)
+        distinct = 1
+        last = idxs[0]
+        for gi in idxs[1:]:
+            if gi - last >= swing_window:
+                distinct += 1
+                last = gi
+        cnt = distinct
+        if cnt < min_touches:
+            continue
+        lvl = sum(p for p, _gi in group) / len(group)
+
+        # Respected-level filter: a real EQH/EQL is liquidity price WICKED to but rarely
+        # CLOSED beyond. If price has decisively closed THROUGH it more than once, the level
+        # was swept/consumed (or it's just mid-range chop) — not a resting pool. This drops
+        # the "lines that got blown clean through" that shouldn't have counted.
+        if side == "high":
+            breaks = int((recent['close'] > lvl * (1 + tolerance_pct)).sum())
+        else:
+            breaks = int((recent['close'] < lvl * (1 - tolerance_pct)).sum())
+        if breaks > 1:
+            continue
+
+        better = cnt > best_touches
+        tie    = cnt == best_touches and best_level is not None and (
+            lvl < best_level if side == "low" else lvl > best_level
+        )
+        if better or tie:
+            best_level, best_touches = lvl, cnt
+    if best_level is not None:
+        return True, float(best_level), best_touches
+    return False, None, 0
+
+
+def detect_equal_lows(df, lookback=40, tolerance_pct=0.0015, min_touches=2):
+    """
+    Equal Lows (EQL): two+ swing-low wicks at ~the same price. In SMC this is a
+    SELL-SIDE liquidity pool — stops rest just below it, making it both a support
+    shelf and a prime sweep target. Returns (found, level, touches).
+    """
+    return _detect_equal_wicks(df, "low", lookback, tolerance_pct, min_touches)
+
+
+def detect_equal_highs(df, lookback=40, tolerance_pct=0.0015, min_touches=2):
+    """
+    Equal Highs (EQH): two+ swing-high wicks at ~the same price — a BUY-SIDE liquidity
+    pool. Stops rest just above it; it's resistance and a prime sweep target.
+    Returns (found, level, touches).
+    """
+    return _detect_equal_wicks(df, "high", lookback, tolerance_pct, min_touches)
+
+
+def detect_trendline(df, lookback=50, swing_window=2, min_points=3):
+    """
+    Detects the dominant DIAGONAL trendline so it can be drawn on the chart:
+      • ascending  — ≥3 strictly higher swing LOWS  → rising support under price
+      • descending — ≥3 strictly lower  swing HIGHS → falling resistance over price
+    Diagonal structure the horizontal EQH/EQL detector can't see.
+
+    Returns (found, kind, (t1, p1), (t2, p2)) — anchors as (unix_seconds, price) for the
+    first and last swing on the line. (False, None, None, None) if no clean trendline.
+    """
+    if df is None or len(df) < (2 * swing_window + 1):
+        return False, None, None, None
+    recent = df.tail(lookback)
+    idx = recent.index
+    n = len(recent)
+    lows, highs = [], []   # (unix_seconds, price)
+    for i in range(swing_window, n - swing_window):
+        lo = float(recent['low'].iloc[i]);  hi = float(recent['high'].iloc[i])
+        others_lo = [float(recent['low'].iloc[j])  for j in range(i - swing_window, i + swing_window + 1) if j != i]
+        others_hi = [float(recent['high'].iloc[j]) for j in range(i - swing_window, i + swing_window + 1) if j != i]
+        t = int(idx[i].timestamp())
+        if lo < min(others_lo):
+            lows.append((t, lo))
+        if hi > max(others_hi):
+            highs.append((t, hi))
+
+    # Ascending support: the last min_points swing lows are strictly rising
+    if len(lows) >= min_points:
+        tail = lows[-min_points:]
+        if all(tail[k][1] > tail[k - 1][1] for k in range(1, len(tail))):
+            return True, 'ascending', tail[0], tail[-1]
+    # Descending resistance: the last min_points swing highs are strictly falling
+    if len(highs) >= min_points:
+        tail = highs[-min_points:]
+        if all(tail[k][1] < tail[k - 1][1] for k in range(1, len(tail))):
+            return True, 'descending', tail[0], tail[-1]
+    return False, None, None, None
 
 def detect_consolidation(df, lookback=20):
     """
@@ -120,12 +282,12 @@ def detect_displacement_bos(df, lookback=15):
       3. The close cleared the structure level by at least 0.15% (filters false breaks)
     """
     if len(df) < lookback:
-        return False, None
+        return False, None, None
 
     recent    = df.tail(lookback)
     structure = recent.iloc[:-3]
     if len(structure) < 5:
-        return False, None
+        return False, None, None
 
     swing_high = structure['high'].max()
     swing_low  = structure['low'].min()
@@ -137,11 +299,66 @@ def detect_displacement_bos(df, lookback=15):
         if rng == 0 or body / rng < 0.40:   # 40% body — real conviction without over-filtering
             continue
         if candle['close'] > swing_high * 1.0015:   # 0.15% clearance filters 1-tick false breaks
-            return True, "bullish"
+            return True, "bullish", float(swing_high)
         if candle['close'] < swing_low  * 0.9985:
-            return True, "bearish"
+            return True, "bearish", float(swing_low)
 
-    return False, None
+    return False, None, None
+
+
+def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40, clearance=0.0015):
+    """
+    Finds the FVG left behind by the displacement that broke structure — the
+    'CHoCH FVG'. This is the heart of the sweep → displacement → retest model:
+    after a sweep, price reverses hard and breaks structure; that aggressive move
+    leaves a 3-candle imbalance. The retest of THAT gap is the entry, and the gap
+    itself IS the change of character — no separate CHoCH signal needed.
+
+    A displacement candle (the middle of the 3) must:
+      • have a body >= min_body_pct of its range (real momentum)
+      • close beyond the prior swing by `clearance` (genuine structure break)
+      • leave a gap: prior.high < next.low (bullish) / prior.low > next.high (bearish)
+
+    Scans the most recent `window` candles (newest first) and needs at least one
+    candle AFTER the displacement so the gap is fully formed and retest-ready.
+
+    Returns (found, direction, fvg_low, fvg_high, broken_level).
+    """
+    if len(df) < lookback:
+        return False, None, None, None, None
+
+    recent = df.tail(lookback).reset_index(drop=True)
+    n = len(recent)
+    oldest = max(2, n - window)
+
+    for i in range(n - 2, oldest - 1, -1):          # newest displacement first, needs i+1
+        disp  = recent.iloc[i]
+        body  = abs(disp['close'] - disp['open'])
+        rng   = disp['high'] - disp['low']
+        if rng == 0 or body / rng < min_body_pct:
+            continue
+
+        prior  = recent.iloc[i - 1]
+        nxt    = recent.iloc[i + 1]
+        struct = recent.iloc[:i]
+        if len(struct) < 3:
+            continue
+        swing_high = float(struct['high'].max())
+        swing_low  = float(struct['low'].min())
+
+        # Bullish displacement: strong up-close above structure that gapped up
+        if (disp['close'] > disp['open']
+                and disp['close'] > swing_high * (1 + clearance)
+                and float(prior['high']) < float(nxt['low'])):
+            return True, 'bullish', float(prior['high']), float(nxt['low']), swing_high
+
+        # Bearish displacement: strong down-close below structure that gapped down
+        if (disp['close'] < disp['open']
+                and disp['close'] < swing_low * (1 - clearance)
+                and float(prior['low']) > float(nxt['high'])):
+            return True, 'bearish', float(nxt['high']), float(prior['low']), swing_low
+
+    return False, None, None, None, None
 
 def detect_order_block(df, lookback=15):
     """
@@ -190,6 +407,30 @@ def check_liquidity_sweep(df, sweep_window=3):
 
     return False, None, None
 
+
+def check_liquidity_sweep_high(df, sweep_window=3):
+    """
+    Sell-side mirror of check_liquidity_sweep: wick pierced the prior 20-candle
+    resistance (high) but closed back BELOW it. This is a sweep of BUY-side
+    liquidity above — the classic stop-hunt before a move DOWN (short setup),
+    or the manipulation_down leg before a LONG from demand when daily is bullish.
+    Returns (found, local_resistance, sweep_high_wick).
+    """
+    if len(df) < 22:
+        return False, None, None
+
+    for i in range(-sweep_window, 0):
+        candle = df.iloc[i]
+        lookback_start = i - 20 if i - 20 >= -len(df) else -len(df)
+        prior = df.iloc[lookback_start:i]
+        if len(prior) == 0:
+            continue
+        local_resistance = prior['high'].max()
+        if candle['high'] > local_resistance and candle['close'] < local_resistance:
+            return True, local_resistance, candle['high']
+
+    return False, None, None
+
 def check_market_structure_shift(df):
     """
     Step 3 Math: Checks if the latest momentum candle broke cleanly 
@@ -223,10 +464,12 @@ def find_bullish_fvg(df, lookback=15):
     start = max(2, end - lookback)
 
     # 1. True FVG (most precise — common on crypto/overnight gaps)
+    #    Bullish FVG = price gapped UP: c1.high < c3.low, middle candle bullish.
+    #    Zone is c1.high (bottom) → c3.low (top), the unfilled imbalance below price.
     for i in range(end, start - 1, -1):
         c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
-        if c1['low'] > c3['high'] and c2['close'] > c2['open']:
-            return True, float(c3['high']), float(c1['low'])
+        if c1['high'] < c3['low'] and c2['close'] > c2['open']:
+            return True, float(c1['high']), float(c3['low'])
 
     # 2. Order block fallback — last bearish candle before a confirmed breakout above its high.
     # OB candle body must be >40% of range (real institutional bearish move, not a doji).
@@ -316,6 +559,20 @@ def detect_amd_phase(df_htf, structure_bars=25, recent_bars=5):
     recent_low_wick   = float(recent['low'].min())
     recent_high_wick  = float(recent['high'].max())
     swing_range       = struct_swing_high - struct_swing_low
+    swing_mid         = (struct_swing_high + struct_swing_low) / 2
+
+    # Accumulation: structure bars coiling in a tight box, no sweep yet
+    range_pct = swing_range / swing_mid if swing_mid > 0 else 1.0
+    if (range_pct < 0.05                                      # tight box < 5% wide
+            and struct_swing_low <= current_close <= struct_swing_high   # price still inside
+            and recent_low_wick  >= struct_swing_low  * 0.995            # no sweep below yet
+            and recent_high_wick <= struct_swing_high * 1.005):          # no sweep above yet
+        return 'accumulation', {
+            'range_high': struct_swing_high,
+            'range_low':  struct_swing_low,
+            'range_pct':  range_pct,
+            'mid':        swing_mid,
+        }
 
     # Manipulation UP: wick pierced below structure low, close recovered above it
     if (recent_low_wick < struct_swing_low
@@ -351,6 +608,8 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     2. Bearish OB — bullish candle before a confirmed breakdown (institutional selling)
     3. IFVG (Inverse FVG) — old bullish FVG that price has since filled; it flips to
        resistance on the next retest from below
+    4. Bearish BREAKER — a bullish (demand) candle that price later CLOSED below, so the
+       demand failed and the block flips polarity into resistance.
 
     max_distance_pct: ignore zones more than this % above price (default 12%)
                       prevents locking a supply zone $20k above BTC current price.
@@ -400,11 +659,25 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
             if was_filled and min_price <= z_lo <= max_price:
                 candidates.append((z_lo, z_hi, 'ifvg'))
 
+        # 4. Bearish BREAKER: a bullish (demand) candle that price LATER CLOSED below —
+        #    the demand was violated, so the block flips polarity into resistance.
+        if c1['close'] > c1['open']:
+            body = abs(c1['close'] - c1['open'])
+            rng  = c1['high'] - c1['low']
+            if rng > 0 and body / rng >= 0.40:
+                broke_below = len(sub) > 0 and float(sub['close'].min()) < float(c1['low'])
+                if broke_below:
+                    z_lo, z_hi = float(c1['low']), float(c1['high'])
+                    if min_price <= z_lo <= max_price:
+                        candidates.append((z_lo, z_hi, 'bearish_breaker'))
+
     if not candidates:
         return False, 0.0, 0.0, ''
 
-    # Nearest zone above price (lowest zone_low)
-    candidates.sort(key=lambda x: x[0])
+    # Nearest zone above price (lowest zone_low); tie-break by conviction
+    # (a breaker = confirmed structural flip, higher conviction than a plain OB).
+    _prio = {'bearish_breaker': 3, 'bearish_fvg': 2, 'ifvg': 1, 'bearish_ob': 0}
+    candidates.sort(key=lambda x: (x[0], -_prio.get(x[2], 0)))
     z_lo, z_hi, z_type = candidates[0]
     return True, z_lo, z_hi, z_type
 
@@ -417,6 +690,8 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     1. Unmitigated bullish FVG below price
     2. Bullish OB — bearish candle before a strong breakout up
     3. IFVG support — old bearish FVG that price filled; flips to support
+    4. Bullish BREAKER — a bearish (supply) candle that price later CLOSED above, so the
+       supply failed and the block flips polarity into support.
 
     max_distance_pct: ignore zones more than this % below price (default 12%).
 
@@ -464,13 +739,210 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
             if was_filled and min_price <= z_hi <= max_price:
                 candidates.append((z_lo, z_hi, 'ifvg_support'))
 
+        # 4. Bullish BREAKER: a bearish (supply) candle that price LATER CLOSED above —
+        #    the supply was violated, so the block flips polarity into support.
+        if c1['close'] < c1['open']:
+            body = abs(c1['close'] - c1['open'])
+            rng  = c1['high'] - c1['low']
+            if rng > 0 and body / rng >= 0.40:
+                broke_above = len(sub) > 0 and float(sub['close'].max()) > float(c1['high'])
+                if broke_above:
+                    z_lo, z_hi = float(c1['low']), float(c1['high'])
+                    if min_price <= z_hi <= max_price:
+                        candidates.append((z_lo, z_hi, 'bullish_breaker'))
+
     if not candidates:
         return False, 0.0, 0.0, ''
 
-    # Nearest zone below price (highest zone_high)
-    candidates.sort(key=lambda x: x[2], reverse=True)
+    # Nearest zone below price = highest zone_high; tie-break by conviction (breaker first).
+    _prio = {'bullish_breaker': 3, 'bullish_fvg': 2, 'ifvg_support': 1, 'bullish_ob': 0}
+    candidates.sort(key=lambda x: (-x[1], -_prio.get(x[2], 0)))
     z_lo, z_hi, z_type = candidates[0]
     return True, z_lo, z_hi, z_type
+
+# ============================================================================
+# CHART STRUCTURE — Flags, Channels
+# ============================================================================
+
+def detect_bull_flag(df, pole_bars=10, flag_bars=8, min_pole_pct=0.04):
+    """
+    Bull flag: sharp upward pole (≥ min_pole_pct move) followed by a tight
+    downward/sideways flag. Flag must not retrace > 50% of the pole or exceed
+    the pole high. Returns (found, pole_low, pole_high, flag_low, flag_high, measured_target).
+    """
+    if len(df) < pole_bars + flag_bars:
+        return False, None, None, None, None, None
+
+    pole_df = df.iloc[-(pole_bars + flag_bars):-flag_bars]
+    flag_df = df.iloc[-flag_bars:]
+
+    pole_low  = float(pole_df['low'].min())
+    pole_high = float(pole_df['high'].max())
+    pole_move = (pole_high - pole_low) / pole_low if pole_low > 0 else 0
+
+    if pole_move < min_pole_pct:
+        return False, None, None, None, None, None
+
+    flag_high = float(flag_df['high'].max())
+    flag_low  = float(flag_df['low'].min())
+    pole_body = pole_high - pole_low
+    retrace   = (pole_high - flag_low) / pole_body if pole_body > 0 else 1.0
+
+    if retrace > 0.50 or flag_high >= pole_high:
+        return False, None, None, None, None, None
+
+    return True, pole_low, pole_high, flag_low, flag_high, flag_high + pole_body
+
+
+def detect_bear_flag(df, pole_bars=10, flag_bars=8, min_pole_pct=0.04):
+    """
+    Bear flag: sharp downward pole (≥ min_pole_pct move) followed by a tight
+    upward/sideways flag. Flag must not recover > 50% of the pole or break the
+    pole low. Returns (found, pole_high, pole_low, flag_low, flag_high, measured_target).
+    """
+    if len(df) < pole_bars + flag_bars:
+        return False, None, None, None, None, None
+
+    pole_df = df.iloc[-(pole_bars + flag_bars):-flag_bars]
+    flag_df = df.iloc[-flag_bars:]
+
+    pole_high = float(pole_df['high'].max())
+    pole_low  = float(pole_df['low'].min())
+    pole_move = (pole_high - pole_low) / pole_high if pole_high > 0 else 0
+
+    if pole_move < min_pole_pct:
+        return False, None, None, None, None, None
+
+    flag_high = float(flag_df['high'].max())
+    flag_low  = float(flag_df['low'].min())
+    pole_body = pole_high - pole_low
+    retrace   = (flag_high - pole_low) / pole_body if pole_body > 0 else 1.0
+
+    if retrace > 0.50 or flag_low <= pole_low:
+        return False, None, None, None, None, None
+
+    return True, pole_high, pole_low, flag_low, flag_high, flag_low - pole_body
+
+
+def detect_channel(df, lookback=20):
+    """
+    Detects ascending or descending channel: ALL consecutive swing highs AND
+    swing lows must trend in the same direction.
+    Returns (channel_type, slope_pct) — channel_type is 'ascending', 'descending', or None.
+    """
+    if len(df) < lookback:
+        return None, 0.0
+
+    recent = df.tail(lookback).reset_index(drop=True)
+    swing_highs, swing_lows = [], []
+
+    for i in range(1, len(recent) - 1):
+        h = float(recent.iloc[i]['high'])
+        l = float(recent.iloc[i]['low'])
+        if h >= float(recent.iloc[i-1]['high']) and h >= float(recent.iloc[i+1]['high']):
+            swing_highs.append((i, h))
+        if l <= float(recent.iloc[i-1]['low']) and l <= float(recent.iloc[i+1]['low']):
+            swing_lows.append((i, l))
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return None, 0.0
+
+    highs_up   = all(swing_highs[i][1] > swing_highs[i-1][1] for i in range(1, len(swing_highs)))
+    highs_down = all(swing_highs[i][1] < swing_highs[i-1][1] for i in range(1, len(swing_highs)))
+    lows_up    = all(swing_lows[i][1]  > swing_lows[i-1][1]  for i in range(1, len(swing_lows)))
+    lows_down  = all(swing_lows[i][1]  < swing_lows[i-1][1]  for i in range(1, len(swing_lows)))
+
+    if highs_up and lows_up:
+        slope = (swing_lows[-1][1] - swing_lows[0][1]) / swing_lows[0][1] if swing_lows[0][1] else 0
+        return 'ascending', slope
+    if highs_down and lows_down:
+        slope = (swing_highs[-1][1] - swing_highs[0][1]) / swing_highs[0][1] if swing_highs[0][1] else 0
+        return 'descending', slope
+
+    return None, 0.0
+
+
+# ============================================================================
+# CANDLE PATTERN CLASSIFIER
+# ============================================================================
+
+def classify_candle(candle, prev_candle=None):
+    """
+    Identifies the candle pattern for a single OHLC bar.
+    Returns a short label string — used in logs and as entry confirmation.
+
+    Patterns detected:
+      doji, gravestone_doji, dragonfly_doji   — indecision / reversal
+      hammer, hanging_man                     — long lower wick
+      shooting_star, inverted_hammer          — long upper wick
+      bullish_engulfing, bearish_engulfing    — two-candle reversal
+      marubozu_bull, marubozu_bear            — pure momentum, no wicks
+      normal                                  — no notable pattern
+    """
+    o = float(candle['open'])
+    h = float(candle['high'])
+    l = float(candle['low'])
+    c = float(candle['close'])
+
+    rng = h - l
+    if rng < 1e-10:
+        return 'doji'
+
+    body        = abs(c - o)
+    upper_wick  = h - max(o, c)
+    lower_wick  = min(o, c) - l
+    body_pct    = body / rng
+    is_bullish  = c >= o
+
+    # ── Doji family (body < 10% of range) ────────────────────────────────────
+    if body_pct < 0.10:
+        if upper_wick > rng * 0.65 and lower_wick < rng * 0.15:
+            return 'gravestone_doji'   # open≈close≈low, long upper wick → bearish
+        if lower_wick > rng * 0.65 and upper_wick < rng * 0.15:
+            return 'dragonfly_doji'   # open≈close≈high, long lower wick → bullish
+        return 'doji'
+
+    # ── Hammer / Hanging Man (small body near top, long lower wick ≥2× body) ─
+    if lower_wick >= body * 2.0 and upper_wick <= body * 0.6:
+        return 'hammer' if is_bullish else 'hanging_man'
+
+    # ── Shooting Star / Inverted Hammer (small body near bottom, long upper wick)
+    if upper_wick >= body * 2.0 and lower_wick <= body * 0.6:
+        return 'inverted_hammer' if is_bullish else 'shooting_star'
+
+    # ── Marubozu (≥85% body, almost no wicks — pure momentum) ───────────────
+    if body_pct >= 0.85:
+        return 'marubozu_bull' if is_bullish else 'marubozu_bear'
+
+    # ── Two-candle engulfing (requires previous candle) ───────────────────────
+    if prev_candle is not None:
+        po = float(prev_candle['open'])
+        pc = float(prev_candle['close'])
+        if is_bullish and pc < po:           # previous was bearish
+            if c > po and o < pc:            # current body fully engulfs previous
+                return 'bullish_engulfing'
+        if not is_bullish and pc > po:       # previous was bullish
+            if c < po and o > pc:            # current body fully engulfs previous
+                return 'bearish_engulfing'
+
+    return 'normal'
+
+
+def candle_confirms_bias(candle_type, bias):
+    """
+    Returns True if the candle pattern agrees with the intended trade direction.
+    Used at ENTRY_WAIT to add one more confirmation layer.
+    """
+    bullish_patterns = {'hammer', 'dragonfly_doji', 'bullish_engulfing',
+                        'inverted_hammer', 'marubozu_bull'}
+    bearish_patterns = {'shooting_star', 'gravestone_doji', 'bearish_engulfing',
+                        'hanging_man', 'marubozu_bear'}
+    if bias == 'BULLISH':
+        return candle_type in bullish_patterns
+    if bias == 'BEARISH':
+        return candle_type in bearish_patterns
+    return False
+
 
 # ============================================================================
 # FIBONACCI RETRACEMENT - Optimal Trade Entry (OTE) Zone
@@ -507,6 +979,68 @@ def is_price_in_fib_ote(current_price, ote_zone):
     This is where you wait for the retracement before entering.
     """
     return ote_zone["lower"] <= current_price <= ote_zone["upper"]
+
+# ============================================================================
+# FALLING WEDGE BREAKOUT
+# ============================================================================
+
+def detect_falling_wedge(df, lookback=60, swing_window=2, min_points=2):
+    """
+    Detect a falling wedge: descending swing highs converging with ascending
+    swing lows. Returns (True, last_asc_low, projected_resistance) when the
+    current close breaks above the projected descending-highs trendline.
+    last_asc_low  = SL reference for the long retest entry.
+    projected_resistance = the broken resistance level (now support).
+    Returns (False, None, None) if no wedge or no breakout yet.
+    """
+    if df is None or len(df) < lookback:
+        return False, None, None
+
+    recent = df.tail(lookback)
+    n      = len(recent)
+    lows, highs = [], []
+
+    for i in range(swing_window, n - swing_window):
+        lo = float(recent['low'].iloc[i])
+        hi = float(recent['high'].iloc[i])
+        lo_nb = [float(recent['low'].iloc[j])
+                 for j in range(i - swing_window, i + swing_window + 1) if j != i]
+        hi_nb = [float(recent['high'].iloc[j])
+                 for j in range(i - swing_window, i + swing_window + 1) if j != i]
+        if lo < min(lo_nb):
+            lows.append((i, lo))
+        if hi > max(hi_nb):
+            highs.append((i, hi))
+
+    # Strictly ascending swing lows (higher lows = bullish support building)
+    if len(lows) < min_points:
+        return False, None, None
+    asc = lows[-min_points:]
+    if not all(asc[k][1] > asc[k - 1][1] for k in range(1, len(asc))):
+        return False, None, None
+    last_asc_low = float(asc[-1][1])
+
+    # Strictly descending swing highs (lower highs = falling resistance)
+    if len(highs) < min_points:
+        return False, None, None
+    desc = highs[-min_points:]
+    if not all(desc[k][1] < desc[k - 1][1] for k in range(1, len(desc))):
+        return False, None, None
+
+    # Project the descending-highs line to the current bar
+    i1, p1 = float(desc[-2][0]), float(desc[-2][1])
+    i2, p2 = float(desc[-1][0]), float(desc[-1][1])
+    if i2 == i1:
+        return False, None, None
+    slope     = (p2 - p1) / (i2 - i1)
+    projected = p2 + slope * ((n - 1) - i2)
+
+    # Breakout confirmed when current close is above the projected resistance
+    if float(df['close'].iloc[-1]) <= projected:
+        return False, None, None
+
+    return True, last_asc_low, projected
+
 
 # ============================================================================
 # CHOCH / MARKET STRUCTURE SHIFT - Lower Timeframe Confirmation
