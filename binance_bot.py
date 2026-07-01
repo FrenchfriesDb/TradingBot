@@ -614,7 +614,7 @@ def manage_open_trade(paper, state, symbol, cur_price, base):
 
 # ── NVIDIA AI trade confirmation ───────────────────────────────────────────────
 
-MIN_AI_RR = 2.0   # hard floor — 1:2 minimum keeps TP reachable intraday on 5m entries
+MIN_AI_RR = 3.0   # hard floor — AI must find at least 1:3 R:R to approve entry
 MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
 
 def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
