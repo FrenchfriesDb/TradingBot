@@ -30,11 +30,6 @@ CRYPTO_BALANCE = 5_000.0
 POLL_SECONDS   = 60      # 1-minute poll — matches the 1M sniper timeframe
 TEST_STATE_FILE = "test_state.json"
 
-# ── Old constants (kept for stock bot, still in use) ───────────────────────────
-FAST           = 9
-SLOW           = 21
-STOCK_SL_PCT   = 0.005   # SL = 0.5% from entry
-STOCK_RR       = 3       # 1:3 R:R → TP = 1.5% from entry
 
 
 # ── Paper trader (crypto side) ─────────────────────────────────────────────────
@@ -324,16 +319,16 @@ def run_crypto_sweep():
         time.sleep(POLL_SECONDS)
 
 
-# ── Stock EMA bot (lumibot + Alpaca) ──────────────────────────────────────────
+# ── Stock sweep-reversal bot (lumibot + Alpaca) ───────────────────────────────
 
-def run_stock_ema():
+def run_stock_sweep():
     try:
         from lumibot.strategies import Strategy
         from lumibot.entities import Asset, Order
         from lumibot.brokers import Alpaca
         from lumibot.traders import Trader
 
-        class EMATestBot(Strategy):
+        class SweepTestBot(Strategy):
             def initialize(self):
                 self.sleeptime    = "1M"
                 self.entry_order  = None
@@ -341,6 +336,10 @@ def run_stock_ema():
                 self.tp_order     = None
                 self.stop_loss    = None
                 self.take_profit  = None
+                self.pool_high    = None
+                self.pool_low     = None
+                self.last_recalc  = None   # datetime of the last 1H pool recalculation
+                self.armed        = False
 
             def _cancel_resting_orders(self):
                 for attr in ("sl_order", "tp_order"):
@@ -364,11 +363,8 @@ def run_stock_ema():
                 self.entry_order = None
                 asset = order.asset
 
-                sl = round(price * (1 - STOCK_SL_PCT), 2)
-                tp = round(price * (1 + STOCK_SL_PCT * STOCK_RR), 2)
-                self.stop_loss   = sl
-                self.take_profit = tp
-
+                sl = self.stop_loss
+                tp = self.take_profit
                 try:
                     oco_order = self.create_order(
                         asset, abs(quantity), Order.OrderSide.SELL,
@@ -380,7 +376,7 @@ def run_stock_ema():
                     self.sl_order = oco_order
                     self.tp_order = oco_order
                     self.log_message(
-                        f"[{STOCK_SYMBOL}] 🛑🎯 OCO order placed — SL @ ${sl:.2f}  TP @ ${tp:.2f}",
+                        f"[{STOCK_SYMBOL}] \U0001F6D1\U0001F3AF OCO order placed — SL @ ${sl:.2f}  TP @ ${tp:.2f}",
                         color="yellow"
                     )
                 except Exception as e:
@@ -390,25 +386,27 @@ def run_stock_ema():
                 asset    = Asset(STOCK_SYMBOL, asset_type=Asset.AssetType.STOCK)
                 price    = self.get_last_price(STOCK_SYMBOL)
                 position = self.get_position(asset)
+                now      = self.get_datetime()
 
-                bars = self.get_historical_prices(asset, SLOW + 5, "1 minute")
-                if bars is None:
-                    return
-                close = bars.pandas_df["close"]
-                if len(close) < SLOW + 2:
-                    return
-
-                fast = close.ewm(span=FAST, adjust=False).mean()
-                slow = close.ewm(span=SLOW, adjust=False).mean()
-
-                bull_cross = fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]
-                bear_cross = fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]
+                if not (position and abs(position.quantity) > 0) and (
+                    self.last_recalc is None or (now - self.last_recalc).total_seconds() >= POOL_RECALC_SECONDS
+                ):
+                    bars_1h = self.get_historical_prices(asset, POOL_LOOKBACK_1H, "1 hour")
+                    if bars_1h is not None:
+                        df_1h = bars_1h.pandas_df
+                        if len(df_1h) >= POOL_LOOKBACK_1H:
+                            self.pool_high, self.pool_low = compute_pools(df_1h, POOL_LOOKBACK_1H)
+                            self.last_recalc = now
+                            self.armed = True
+                            self.log_message(
+                                f"[{STOCK_SYMBOL}] \U0001F553 1H recalc — "
+                                f"pool_high=${self.pool_high:.2f}  pool_low=${self.pool_low:.2f}"
+                            )
 
                 sl_str = f"  SL=${self.stop_loss:.2f}  TP=${self.take_profit:.2f}" if self.stop_loss else ""
                 self.log_message(
-                    f"[{STOCK_SYMBOL}] ${price:.2f}  "
-                    f"EMA{FAST}={fast.iloc[-1]:.3f}  EMA{SLOW}={slow.iloc[-1]:.3f}  "
-                    f"bull={bull_cross}  bear={bear_cross}{sl_str}"
+                    f"[{STOCK_SYMBOL}] ${price:.2f}  pool_high={self.pool_high}  "
+                    f"pool_low={self.pool_low}  armed={self.armed}{sl_str}"
                 )
 
                 # Manual SL/TP check — closes the position if the resting broker order
@@ -419,31 +417,59 @@ def run_stock_ema():
                         self._cancel_resting_orders()
                         self.submit_order(
                             self.create_order(asset, position.quantity, Order.OrderSide.SELL))
-                        self.log_message(f"[{STOCK_SYMBOL}] {'🔴' if label=='SL' else '🟢'} {label} hit @ ${price:.2f}",
-                                         color="red" if label == "SL" else "green")
+                        self.log_message(
+                            f"[{STOCK_SYMBOL}] {'🔴' if label=='SL' else '🟢'} {label} hit @ ${price:.2f}",
+                            color="red" if label == "SL" else "green")
+                        self.armed = False   # retired until the next 1H recalc
                         return
 
-                if bull_cross:
-                    if position and position.quantity < 0:
-                        self.submit_order(
-                            self.create_order(asset, abs(position.quantity), Order.OrderSide.BUY))
-                    if not position or position.quantity <= 0:
-                        order = self.create_order(asset, 1, Order.OrderSide.BUY)
-                        self.entry_order = order
-                        self.submit_order(order)
-                        self.log_message(f"[{STOCK_SYMBOL}] ✅ BUY @ ${price:.2f}", color="green")
+                if position and abs(position.quantity) > 0:
+                    return   # already in a trade — nothing else to do this tick
 
-                elif bear_cross:
-                    if position and position.quantity > 0:
-                        self._cancel_resting_orders()
-                        self.submit_order(
-                            self.create_order(asset, position.quantity, Order.OrderSide.SELL))
-                        self.log_message(f"[{STOCK_SYMBOL}] 🔴 SELL @ ${price:.2f}", color="red")
+                if not self.armed or self.pool_high is None:
+                    return
 
-        print(f"[STOCKS] EMA{FAST}/{SLOW} on {STOCK_SYMBOL} | 1m | Alpaca paper "
+                bars_1m = self.get_historical_prices(asset, 2, "1 minute")
+                if bars_1m is None:
+                    return
+                df_1m = bars_1m.pandas_df
+                if len(df_1m) < 1:
+                    return
+                candle = df_1m.iloc[-1]
+                direction = detect_sweep(float(candle["high"]), float(candle["low"]),
+                                          float(candle["close"]), self.pool_high, self.pool_low)
+                if direction is None:
+                    return
+                if direction == "SHORT":
+                    # Stock pipeline is long-only by design — see Global Constraints scope note.
+                    return
+
+                sl, tp = compute_stop_target(direction, float(candle["high"]), float(candle["low"]),
+                                              self.pool_high, self.pool_low, SL_BUFFER_PCT)
+                rr = compute_rr(price, sl, tp)
+                if rr < MIN_RR:
+                    self.log_message(f"[{STOCK_SYMBOL}] ⏭ Sweep {direction} skipped — "
+                                      f"R:R 1:{rr:.1f} < 1:{MIN_RR:.0f} min")
+                    return
+
+                qty = int(size_position(self.get_cash(), RISK_PCT, price, sl))
+                if qty < 1:
+                    self.log_message(f"[{STOCK_SYMBOL}] ⏭ Sweep {direction} skipped — qty rounds to zero")
+                    return
+
+                order = self.create_order(asset, qty, Order.OrderSide.BUY)
+                self.entry_order = order
+                self.stop_loss   = sl
+                self.take_profit = tp
+                self.armed       = False   # retire the pools until the next 1H recalc
+                self.submit_order(order)
+                self.log_message(f"[{STOCK_SYMBOL}] ⚡ SWEEP {direction} @ ${price:.2f}  "
+                                  f"SL=${sl:.2f}  TP=${tp:.2f}  R:R=1:{rr:.1f}  qty={qty}", color="green")
+
+        print(f"[STOCKS] 1H/1M Sweep-Reversal on {STOCK_SYMBOL} | Alpaca paper "
               f"(waits for NYSE open 9:30 AM ET)")
         broker   = Alpaca({"API_KEY": API_KEY, "API_SECRET": API_SECRET, "PAPER": PAPER})
-        strategy = EMATestBot(broker=broker)
+        strategy = SweepTestBot(broker=broker)
         trader   = Trader()
         trader.add_strategy(strategy)
         trader.run_all()
