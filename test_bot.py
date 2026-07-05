@@ -243,8 +243,8 @@ def run_crypto_sweep():
 
                 pool_high = pools[symbol]["high"]
                 pool_low  = pools[symbol]["low"]
-                df_1m  = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "1m", limit=2))
-                candle = df_1m.iloc[-1]
+                df_1m  = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "1m", limit=3))
+                candle = df_1m.iloc[-2]   # last CLOSED candle — iloc[-1] is still forming
                 price  = float(candle["close"])
                 live_prices[symbol] = price
                 held = paper.get_position(symbol)
@@ -277,6 +277,8 @@ def run_crypto_sweep():
                         sl_levels[symbol] = None
                         tp_levels[symbol] = None
                         trade_states[symbol] = "RETIRED"   # stays retired until the next 1H recalc
+                        last_recalc[symbol] = now   # restart the recalc countdown fresh from this close —
+                        # never let a recalc that was merely deferred by IN_TRADE fire immediately on exit
                     continue
 
                 # ── Look for a new sweep+reversal entry ─────────────────────────
@@ -424,6 +426,8 @@ def run_stock_sweep():
                             f"[{STOCK_SYMBOL}] {'🔴' if label=='SL' else '🟢'} {label} hit @ ${price:.2f}",
                             color="red" if label == "SL" else "green")
                         self.armed = False   # retired until the next 1H recalc
+                        self.last_recalc = now   # restart the recalc countdown fresh from this close —
+                        # never let a recalc that was merely deferred by an open position fire immediately on exit
                         return
 
                 if position and abs(position.quantity) > 0:
@@ -432,13 +436,14 @@ def run_stock_sweep():
                 if not self.armed or self.pool_high is None:
                     return
 
-                bars_1m = self.get_historical_prices(asset, 2, "1 minute")
+                bars_1m = self.get_historical_prices(asset, 3, "1 minute")
                 if bars_1m is None:
                     return
                 df_1m = bars_1m.pandas_df
-                if len(df_1m) < 1:
+                if len(df_1m) < 2:
                     return
-                candle = df_1m.iloc[-1]
+                candle = df_1m.iloc[-2]   # last CLOSED candle — iloc[-1] is still forming
+                entry_price = float(candle["close"])
                 direction = detect_sweep(float(candle["high"]), float(candle["low"]),
                                           float(candle["close"]), self.pool_high, self.pool_low)
                 if direction is None:
@@ -449,13 +454,13 @@ def run_stock_sweep():
 
                 sl, tp = compute_stop_target(direction, float(candle["high"]), float(candle["low"]),
                                               self.pool_high, self.pool_low, SL_BUFFER_PCT)
-                rr = compute_rr(price, sl, tp)
+                rr = compute_rr(entry_price, sl, tp)
                 if rr < MIN_RR:
                     self.log_message(f"[{STOCK_SYMBOL}] ⏭ Sweep {direction} skipped — "
                                       f"R:R 1:{rr:.1f} < 1:{MIN_RR:.0f} min")
                     return
 
-                qty = int(size_position(self.get_cash(), RISK_PCT, price, sl))
+                qty = int(size_position(self.get_cash(), RISK_PCT, entry_price, sl))
                 if qty < 1:
                     self.log_message(f"[{STOCK_SYMBOL}] ⏭ Sweep {direction} skipped — qty rounds to zero")
                     return
@@ -466,7 +471,7 @@ def run_stock_sweep():
                 self.take_profit = tp
                 self.armed       = False   # retire the pools until the next 1H recalc
                 self.submit_order(order)
-                self.log_message(f"[{STOCK_SYMBOL}] ⚡ SWEEP {direction} @ ${price:.2f}  "
+                self.log_message(f"[{STOCK_SYMBOL}] ⚡ SWEEP {direction} @ ${entry_price:.2f}  "
                                   f"SL=${sl:.2f}  TP=${tp:.2f}  R:R=1:{rr:.1f}  qty={qty}", color="green")
 
         print(f"[STOCKS] 1H/1M Sweep-Reversal on {STOCK_SYMBOL} | Alpaca paper "
