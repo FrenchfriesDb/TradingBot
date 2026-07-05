@@ -1,7 +1,10 @@
 """
-EMA Crossover Test Bot — stocks + crypto.
-Stocks : IWM via Alpaca paper (NYSE hours, EMA 9/21 on 1m)
-Crypto : BTC only via Kraken public (24/7, EMA 9/21 on 5m, paper)
+1H/1M SMC Sweep-Reversal Test Bot — stocks + crypto.
+Stocks : IWM via Alpaca paper (NYSE hours, long-only)
+Crypto : BTC only via Coinbase public (24/7, long + short)
+Both pipelines: 1H swing high/low = liquidity pools (recalculated hourly),
+1M candle wicks past a pool and closes back inside = sweep+reversal entry,
+opposite pool = target, min 1:3 R:R, 1% risk per trade.
 Purpose: confirm execution works on both pipelines before trusting the SMC bot.
 """
 
@@ -482,14 +485,15 @@ def run_stock_sweep():
 
 if __name__ == "__main__":
     print("=" * 65)
-    print("EMA CROSSOVER TEST BOT — STOCKS + CRYPTO")
-    print(f"  Stocks : {STOCK_SYMBOL} via Alpaca paper  (fires at NYSE open)")
-    print(f"  Crypto : {', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} via Coinbase  (24/7)")
-    print(f"  EMAs   : {FAST} / {SLOW}  |  Stock: 1m bars  |  Crypto: 5m bars")
+    print("1H/1M SWEEP-REVERSAL TEST BOT — STOCKS + CRYPTO")
+    print(f"  Stocks : {STOCK_SYMBOL} via Alpaca paper  (long-only, fires at NYSE open)")
+    print(f"  Crypto : {', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} via Coinbase  (24/7, long+short)")
+    print(f"  Pools  : 1H, {POOL_LOOKBACK_1H}-candle lookback  |  Entries: 1M sweep+reversal")
+    print(f"  Risk   : {RISK_PCT*100:.0f}% per trade  |  Min R:R: 1:{MIN_RR:.0f}")
     print("=" * 65)
 
     # Stock bot runs in a background thread (lumibot blocks internally)
-    threading.Thread(target=run_stock_ema, daemon=True).start()
+    threading.Thread(target=run_stock_sweep, daemon=True).start()
 
     # Crypto bot runs in the main thread
-    run_crypto_ema()
+    run_crypto_sweep()
