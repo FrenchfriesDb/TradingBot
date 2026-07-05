@@ -33,11 +33,11 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
     Asks Llama 3.3 70B (via NVIDIA API) whether this SMC setup is worth taking,
     and lets it pick the R:R target itself (we only enforce a 1:{MIN_AI_RR} floor).
     Returns (confirm: bool, rr: float, reason: str).
-    Defaults to (True, MIN_AI_RR, ...) on any failure — an API hiccup should
-    never block a trade, it just falls back to the minimum acceptable R:R.
+    Defaults to (False, 0.0, ...) on any failure — no signal means no trade,
+    never a blind entry.
     """
     if not NVIDIA_API_KEY:
-        return True, MIN_AI_RR, "no_nvidia_key — proceeding at minimum 1:3.5 R:R"
+        return False, 0.0, "no_nvidia_key — skipping trade for safety"
 
     side = "LONG" if bos_dir == "bullish" else "SHORT"
     pool_line = (f"Nearest structural target: ${pool_tp:,.4f}  "
@@ -118,12 +118,13 @@ REASON: one concise sentence"""
         reason  = reason_m.group(1).strip() if reason_m else text
 
         if decision_m is None:
-            reason = f"(unparsed AI response, defaulting approve) {text}"
-            confirm = True
+            reason = f"(unparsed AI response, skipping) {text}"
+            confirm = False
+            rr = 0.0
 
         return confirm, rr, reason
     except Exception as e:
-        return True, MIN_AI_RR, f"API error ({e}) — proceeding at minimum 1:4 R:R"
+        return False, 0.0, f"API error ({e}) — no signal, skipping for safety"
 
 if not os.path.exists("./logs"):
     os.makedirs("./logs")
@@ -310,29 +311,64 @@ class DebbieLaSMC(Strategy):
             self.log_message(f"Startup sync skipped (broker not ready): {e}", color="red")
 
     def _cancel_oco(self, symbol):
-        """Cancel the broker-side OCO legs we posted for this symbol so they never
-        linger as orphans (which would later trigger 'potential wash trade' rejections).
-        IDs are captured in on_filled_order from the raw Alpaca REST response."""
+        """Cancel ALL broker-side protective orders for this symbol (OCO/bracket legs).
+
+        Two-pass strategy so nothing slips through:
+        1. Cancel the stored leg IDs (fast path — known IDs from when the order was posted).
+        2. Fetch every open order for this symbol from Alpaca and cancel anything still
+           standing. This catches legs whose IDs weren't captured, orders in unexpected
+           states, and any race where one ID cancel failed silently.
+        """
+        import requests as _req
+        _headers = {
+            "APCA-API-KEY-ID":     ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+        }
+
         ids = self.oco_ids.get(symbol) or []
-        if not ids:
-            return
+        cancelled = 0
+
+        # Pass 1 — cancel stored IDs
+        for oid in ids:
+            try:
+                _req.delete(
+                    f"{ALPACA_BASE_URL}/v2/orders/{oid}",
+                    headers=_headers, timeout=10,
+                )
+                cancelled += 1
+            except Exception:
+                pass  # 404/422 = already filled or cancelled, that's fine
+
+        # Pass 2 — belt-and-suspenders: fetch all open orders for this symbol and
+        # cancel any that survived (handles wrong-state failures in pass 1).
         try:
-            import requests as _req
-            for oid in ids:
-                try:
-                    _req.delete(
-                        f"{ALPACA_BASE_URL}/v2/orders/{oid}",
-                        headers={
-                            "APCA-API-KEY-ID":     ALPACA_API_KEY,
-                            "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
-                        },
-                        timeout=10,
-                    )
-                except Exception:
-                    pass  # already filled/cancelled → 404/422, safe to ignore
-            self.log_message(f"[{symbol}] 🧹 Cancelled {len(ids)} broker OCO order(s).", color="cyan")
-        finally:
-            self.oco_ids[symbol] = []
+            resp = _req.get(
+                f"{ALPACA_BASE_URL}/v2/orders",
+                params={"status": "open", "symbols": symbol, "limit": 50},
+                headers=_headers, timeout=10,
+            )
+            if resp.ok:
+                for o in (resp.json() or []):
+                    oid = o.get("id")
+                    if not oid:
+                        continue
+                    try:
+                        _req.delete(
+                            f"{ALPACA_BASE_URL}/v2/orders/{oid}",
+                            headers=_headers, timeout=10,
+                        )
+                        cancelled += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if cancelled or ids:
+            self.log_message(
+                f"[{symbol}] 🧹 Cancelled {cancelled} broker order(s) "
+                f"(stored IDs: {len(ids)}).", color="cyan"
+            )
+        self.oco_ids[symbol] = []
 
     def _ensure_protection(self, symbol, position, is_long, sl, tp):
         """Guarantee a live position always has a broker-side stop. If none is found on the

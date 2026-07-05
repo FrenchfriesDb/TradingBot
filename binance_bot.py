@@ -142,6 +142,7 @@ REVERSAL_WINDOW      = 54      # ~4.5h on 5m — wide enough to hold a multi-hou
 # the HTF zone width dictate a swing-sized stop on an intraday trade.
 SL_ATR_MULT     = 1.5   # SL placed 1.5× ATR outside the FVG edge (dynamic breathing room)
 MAX_SL_ATR_MULT = 3.0   # hard cap: SL never more than 3× ATR from entry
+SWING_LOOKBACK  = 12    # candles to scan for structural swing high/low (wick-sweep guard)
 
 # ── Simulated leverage (paper perps mode) ──────────────────────────────────────
 # Set PAPER_LEVERAGE > 1 to simulate perpetual futures returns WITHOUT real
@@ -779,11 +780,11 @@ REASON: one concise sentence"""
         return result
     except concurrent.futures.TimeoutError:
         _executor.shutdown(wait=False)
-        print(f"  ⚠️  AI call timed out (25s) — approving at minimum R:R", flush=True)
-        return True, MIN_AI_RR, "AI timeout (25s) — proceeding at minimum R:R"
+        print(f"  ⚠️  AI call timed out (25s) — no confirmation, skipping trade", flush=True)
+        return False, 0.0, "AI timeout (25s) — no signal, skipping for safety"
     except Exception as e:
         _executor.shutdown(wait=False)
-        return True, MIN_AI_RR, f"API error ({e}) — proceeding at minimum 1:4 R:R"
+        return False, 0.0, f"API error ({e}) — no signal, skipping for safety"
 
 
 # ── Core strategy loop per symbol ─────────────────────────────────────────────
@@ -1235,12 +1236,23 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             _atr_s      = float(_ltf_rng_s.rolling(14).mean().iloc[-1])
             _sl_dist_s  = SL_ATR_MULT * _atr_s
             _sl_s       = _fill_s - _sl_dist_s if _is_long_s else _fill_s + _sl_dist_s
+            # Swing guard: push SL outside the structural swing high/low so a wick
+            # can't sweep us before the market actually breaks structure (CHoCH).
+            if _is_long_s:
+                _swing_sl_s = float(df_ltf['low'].tail(SWING_LOOKBACK).min()) * 0.999
+                if _swing_sl_s < _sl_s:
+                    _sl_s = _swing_sl_s
+            else:
+                _swing_sl_s = float(df_ltf['high'].tail(SWING_LOOKBACK).max()) * 1.001
+                if _swing_sl_s > _sl_s:
+                    _sl_s = _swing_sl_s
             _risk_s     = abs(_fill_s - _sl_s)
             _tp_s       = _fill_s + MIN_AI_RR * _risk_s if _is_long_s else _fill_s - MIN_AI_RR * _risk_s
             _avail_s    = paper.check_daily_cap(BINANCE_CASH_AT_RISK * paper.balance)
             _margin_s   = min(_avail_s, BINANCE_CASH_AT_RISK * paper.balance)
             _qty_s      = _margin_s * PAPER_LEVERAGE / _fill_s if _fill_s and _margin_s > 0 else 0
-            if _qty_s > 1e-6:
+            _reward_s   = abs(_tp_s - _fill_s) * _qty_s
+            if _qty_s > 1e-6 and _margin_s >= 5.0 and _reward_s >= 25.0:
                 state.sniper_armed  = True
                 state.sniper_sl     = _sl_s
                 state.sniper_tp     = _tp_s
@@ -1395,6 +1407,24 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     risk_amt        = _max_sl_dist
                     print(f"[{base}] 📏 SL capped: {MAX_SL_ATR_MULT}×ATR max → SL ${state.stop_loss:,.4f}")
 
+            # Swing-high/low guard: pull SL to the structural invalidation point so
+            # a manipulation wick can't sweep us before the market actually breaks
+            # structure. Widens risk_amt → AI recalculates R:R → rejects if < MIN_AI_RR.
+            if is_long:
+                _swing_low = float(df_ltf['low'].tail(SWING_LOOKBACK).min())
+                _swing_sl  = _swing_low * 0.999
+                if _swing_sl < state.stop_loss:
+                    state.stop_loss = _swing_sl
+                    risk_amt        = price - state.stop_loss
+                    print(f"[{base}] 📏 SL → swing low ${state.stop_loss:,.4f} (wick-sweep guard)")
+            else:
+                _swing_high = float(df_ltf['high'].tail(SWING_LOOKBACK).max())
+                _swing_sl   = _swing_high * 1.001
+                if _swing_sl > state.stop_loss:
+                    state.stop_loss = _swing_sl
+                    risk_amt        = state.stop_loss - price
+                    print(f"[{base}] 📏 SL → swing high ${state.stop_loss:,.4f} (wick-sweep guard)")
+
             # 2. Find the nearest 4H liquidity pool — informs the AI's R:R choice,
             #    but the AI (floored at 1:4) has final say on the actual target.
             pool_tp  = indicators.find_next_liquidity_target(df_htf, price, bias_str)
@@ -1410,12 +1440,12 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                 amd_phase=state.amd_phase, zone_type=state.amd_zone_type,
             )
             # Target OFFSET — pull the TP a fraction of ATR inward so we fill BEFORE the
-            # herd's orders pile up at the round number / structural ceiling. Giving up a
-            # sliver of profit to guarantee the fill (front-run the front-runners).
-            # Cap at 25% of the reward so a tight-stop setup can never push TP across entry
-            # (which would make tp_dist≈0 → instant "TP" at a loss).
-            reward    = risk_amt * rr_actual
-            tp_offset = min(0.05 * entry_atr, 0.25 * reward)
+            # herd's orders pile up at the round number / structural ceiling.
+            # Hard cap: offset can never reduce effective R:R below MIN_AI_RR floor.
+            reward      = risk_amt * rr_actual
+            min_reward  = risk_amt * MIN_AI_RR
+            max_offset  = max(0.0, reward - min_reward)
+            tp_offset   = min(0.05 * entry_atr, 0.25 * reward, max_offset)
             state.take_profit = (price + reward - tp_offset if is_long
                                  else price - reward + tp_offset)
             icon = "✅ YES" if confirm else "❌ NO"
@@ -1453,12 +1483,14 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     print(f"[{base}] ⚡ SL auto-capped at 90% liq distance "
                           f"({PAPER_LEVERAGE}x liq at -{liq_dist:.4f}) → SL ${state.stop_loss:.4f}")
 
-                # Minimum-reward gate
-                MIN_REWARD_DOLLARS = 25.0
+                # Minimum-reward gate — scales with account size so tight-stop majors
+                # (BTC/ETH) aren't filtered out just for having a small $ risk_amt.
+                MIN_REWARD_PCT = 0.0015   # 0.15% of balance
+                min_reward_dollars = paper.balance * MIN_REWARD_PCT
                 actual_reward = qty * (risk_amt * rr_actual) if qty > 0 else 0
-                if actual_reward < MIN_REWARD_DOLLARS:
+                if actual_reward < min_reward_dollars:
                     print(f"[{base}] ⏭ Trade skipped — reward too small after position cap "
-                          f"(${actual_reward:.2f} < ${MIN_REWARD_DOLLARS:.0f} min). "
+                          f"(${actual_reward:.2f} < ${min_reward_dollars:.2f} min). "
                           f"Cheap coin + tight SL = deploy capital elsewhere.")
                     return price
 
@@ -1622,6 +1654,13 @@ def run():
                             _is_long = st.bias == "BULLISH"
                             _fill    = st.fvg_low if _is_long else st.fvg_high
                             _base    = sym.split("/")[0]
+                            _sniper_reward = abs(st.sniper_tp - _fill) * st.sniper_qty
+                            if st.sniper_margin < 5.0 or _sniper_reward < 25.0:
+                                print(f"[{_base}] ⏭ Sniper skipped — dust trade "
+                                      f"(margin ${st.sniper_margin:.2f}, reward ${_sniper_reward:.2f})",
+                                      flush=True)
+                                st.sniper_armed = False
+                                continue
                             if _is_long:
                                 paper.buy(sym, st.sniper_qty, _fill)
                             else:
@@ -1674,6 +1713,10 @@ def run():
                     # near-miss reversal before it round-trips to the original stop.
                     manage_open_trade(paper, st, sym, cur, base)
                     held = paper.get_position(sym)      # re-read after a possible scale-out
+                    prices[sym] = cur
+                    save_crypto_state(paper, states, symbols, prices)  # keep the live chart
+                    # in sync every 10s — otherwise a scale-out/break-even sits unpersisted
+                    # in memory until the next 5-min loop tick or an SL/TP exit.
                     if abs(held) < 1e-9:
                         continue
 
