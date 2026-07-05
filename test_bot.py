@@ -30,6 +30,16 @@ CRYPTO_BALANCE = 5_000.0
 POLL_SECONDS   = 60      # 1-minute poll — matches the 1M sniper timeframe
 TEST_STATE_FILE = "test_state.json"
 
+# ── Old constants (kept for backward compatibility during rewrite) ──────────────
+FAST           = 9
+SLOW           = 21
+STOCK_SL_PCT   = 0.005   # SL = 0.5% from entry
+STOCK_RR       = 3       # 1:3 R:R → TP = 1.5% from entry
+CRYPTO_RISK    = 0.05    # 5% of balance per trade
+CRYPTO_SL_PCT  = 0.015   # SL = 1.5% from entry
+CRYPTO_RR      = 6       # 1:6 R:R  →  TP = 9% from entry
+CRYPTO_SLEEP   = 5 * 60  # 5 minutes
+
 
 # ── Paper trader (crypto side) ─────────────────────────────────────────────────
 
