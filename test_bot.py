@@ -30,15 +30,11 @@ CRYPTO_BALANCE = 5_000.0
 POLL_SECONDS   = 60      # 1-minute poll — matches the 1M sniper timeframe
 TEST_STATE_FILE = "test_state.json"
 
-# ── Old constants (kept for backward compatibility during rewrite) ──────────────
+# ── Old constants (kept for stock bot, still in use) ───────────────────────────
 FAST           = 9
 SLOW           = 21
 STOCK_SL_PCT   = 0.005   # SL = 0.5% from entry
 STOCK_RR       = 3       # 1:3 R:R → TP = 1.5% from entry
-CRYPTO_RISK    = 0.05    # 5% of balance per trade
-CRYPTO_SL_PCT  = 0.015   # SL = 1.5% from entry
-CRYPTO_RR      = 6       # 1:6 R:R  →  TP = 9% from entry
-CRYPTO_SLEEP   = 5 * 60  # 5 minutes
 
 
 # ── Paper trader (crypto side) ─────────────────────────────────────────────────
@@ -118,7 +114,7 @@ def _patch_ccxt():
         pass
 
 
-def save_test_state(paper, sl_levels, tp_levels, prices):
+def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states):
     import json
     try:
         positions = {}
@@ -140,13 +136,22 @@ def save_test_state(paper, sl_levels, tp_levels, prices):
                 "unrealized_pnl": upnl,
                 "risk_dollars": risk, "reward_dollars": reward,
             }
+        pool_data = {
+            sym: {
+                "pool_high": pools[sym]["high"],
+                "pool_low":  pools[sym]["low"],
+                "state":     trade_states.get(sym),
+            }
+            for sym in pools
+        }
         data = {
             "last_updated": datetime.now(timezone.utc).isoformat(),
-            "bot": "EMATestBot",
+            "bot": "SweepTestBot",
             "balance": paper.balance,
             "start_balance": CRYPTO_BALANCE,
             "trade_count": paper.trade_count,
             "positions": positions,
+            "pools": pool_data,
             "live_prices": {s: prices.get(s, 0) for s in CRYPTO_SYMBOLS},
         }
         with open(TEST_STATE_FILE, "w") as f:
@@ -202,92 +207,110 @@ def size_position(balance: float, risk_pct: float, entry: float, sl: float) -> f
     return math.floor(qty * 1e6) / 1e6
 
 
-# ── Crypto EMA loop ────────────────────────────────────────────────────────────
+# ── Crypto sweep-reversal loop ────────────────────────────────────────────────
 
-def run_crypto_ema():
+def run_crypto_sweep():
     _patch_ccxt()
     import ccxt
 
     exchange = ccxt.coinbase({"enableRateLimit": True})
     paper    = PaperTrader(CRYPTO_BALANCE)
 
-    # SL/TP tracked per symbol — crossover opens the trade, price closes it
-    sl_levels: dict  = {s: None for s in CRYPTO_SYMBOLS}
-    tp_levels: dict  = {s: None for s in CRYPTO_SYMBOLS}
-    live_prices: dict = {s: 0.0  for s in CRYPTO_SYMBOLS}
+    pools        = {s: {"high": None, "low": None} for s in CRYPTO_SYMBOLS}
+    sl_levels    = {s: None for s in CRYPTO_SYMBOLS}
+    tp_levels    = {s: None for s in CRYPTO_SYMBOLS}
+    trade_states = {s: "RETIRED" for s in CRYPTO_SYMBOLS}   # forces a pool recalc on the first tick
+    last_recalc  = {s: 0.0 for s in CRYPTO_SYMBOLS}
+    live_prices  = {s: 0.0 for s in CRYPTO_SYMBOLS}
 
-    print(f"[CRYPTO] EMA{FAST}/{SLOW} on "
-          f"{', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} | 5m | "
-          f"${CRYPTO_BALANCE:,.0f} paper  |  SL={CRYPTO_SL_PCT*100:.1f}%  "
-          f"TP={CRYPTO_SL_PCT*CRYPTO_RR*100:.1f}%  (1:{CRYPTO_RR} R:R)")
+    print(f"[CRYPTO] 1H/1M Sweep-Reversal on "
+          f"{', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} | "
+          f"${CRYPTO_BALANCE:,.0f} paper  |  risk={RISK_PCT*100:.0f}%  "
+          f"min R:R=1:{MIN_RR:.0f}")
 
     while True:
-        ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        ts  = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        now = time.time()
         for symbol in CRYPTO_SYMBOLS:
             base = symbol.split("/")[0]
             try:
-                df    = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "5m", limit=SLOW + 5))
-                close = df["close"]
-                price = float(close.iloc[-1])
-                fast  = close.ewm(span=FAST, adjust=False).mean()
-                slow  = close.ewm(span=SLOW, adjust=False).mean()
+                if now - last_recalc[symbol] >= POOL_RECALC_SECONDS:
+                    df_1h = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "1h", limit=POOL_LOOKBACK_1H))
+                    pool_high, pool_low = compute_pools(df_1h, POOL_LOOKBACK_1H)
+                    pools[symbol]["high"] = pool_high
+                    pools[symbol]["low"]  = pool_low
+                    last_recalc[symbol]   = now
+                    trade_states[symbol]  = "WATCHING"
+                    print(f"[{base}] \U0001F553 1H recalc — pool_high=${pool_high:,.2f}  pool_low=${pool_low:,.2f}")
 
-                bull_cross = fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]
-                bear_cross = fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]
-                held       = paper.get_position(symbol)
+                pool_high = pools[symbol]["high"]
+                pool_low  = pools[symbol]["low"]
+                df_1m  = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "1m", limit=2))
+                candle = df_1m.iloc[-1]
+                price  = float(candle["close"])
                 live_prices[symbol] = price
-                side_label = "LONG" if held > 0 else "SHORT" if held < 0 else "flat"
+                held = paper.get_position(symbol)
 
-                sl = sl_levels[symbol]
-                tp = tp_levels[symbol]
-                sl_str = f"  SL=${sl:,.2f}  TP=${tp:,.2f}" if sl else ""
-                print(f"[{base}] {ts}  ${price:,.2f}  "
-                      f"EMA{FAST}={fast.iloc[-1]:,.3f}  EMA{SLOW}={slow.iloc[-1]:,.3f}  "
-                      f"pos={side_label}{sl_str}  bull={bull_cross}  bear={bear_cross}")
+                print(f"[{base}] {ts}  ${price:,.2f}  pool_high=${pool_high}  "
+                      f"pool_low=${pool_low}  state={trade_states[symbol]}")
 
-                # ── Check SL/TP first — price-based exits only ─────────────────
-                if held != 0 and sl and tp:
+                # ── Manage an open trade ────────────────────────────────────────
+                if held != 0:
+                    sl = sl_levels[symbol]
+                    tp = tp_levels[symbol]
                     is_long = held > 0
                     entry   = paper.entry_prices.get(symbol, price)
-                    hit     = None
-                    if is_long  and price <= sl: hit = ("SL", "red")
-                    elif is_long  and price >= tp: hit = ("TP", "green")
-                    elif not is_long and price >= sl: hit = ("SL", "red")
-                    elif not is_long and price <= tp: hit = ("TP", "green")
+                    hit = None
+                    if is_long and price <= sl: hit = "SL"
+                    elif is_long and price >= tp: hit = "TP"
+                    elif not is_long and price >= sl: hit = "SL"
+                    elif not is_long and price <= tp: hit = "TP"
 
                     if hit:
-                        label, _ = hit
                         if is_long:
                             paper.sell(symbol, abs(held), price)
                             pnl = (price - entry) * abs(held)
                         else:
                             paper.buy(symbol, abs(held), price)
                             pnl = (entry - price) * abs(held)
-                        icon = "🟢" if label == "TP" else "🔴"
-                        print(f"[{base}] {icon} {label} hit @ ${price:,.2f}  "
+                        icon = "\U0001F7E2" if hit == "TP" else "\U0001F534"
+                        print(f"[{base}] {icon} {hit} hit @ ${price:,.2f}  "
                               f"P&L: ${pnl:+.2f}  Balance: ${paper.balance:,.2f}")
                         sl_levels[symbol] = None
                         tp_levels[symbol] = None
-                    continue  # don't look for new entries mid-trade
+                        trade_states[symbol] = "RETIRED"   # stays retired until the next 1H recalc
+                    continue
 
-                # ── EMA crossover opens new position (only when flat) ──────────
-                if bull_cross and held <= 0:
-                    qty = math.floor((paper.balance * CRYPTO_RISK / price) * 1e6) / 1e6
-                    if qty > 0 and paper.buy(symbol, qty, price):
-                        sl_levels[symbol] = round(price * (1 - CRYPTO_SL_PCT), 4)
-                        tp_levels[symbol] = round(price * (1 + CRYPTO_SL_PCT * CRYPTO_RR), 4)
-                        print(f"[{base}] ✅ PAPER LONG  ${price:,.2f}  qty={qty:.6f}  "
-                              f"SL=${sl_levels[symbol]:,.2f}  TP=${tp_levels[symbol]:,.2f}  "
-                              f"Balance: ${paper.balance:,.2f}")
+                # ── Look for a new sweep+reversal entry ─────────────────────────
+                if trade_states[symbol] != "WATCHING" or pool_high is None:
+                    continue
 
-                elif bear_cross and held >= 0:
-                    qty = math.floor((paper.balance * CRYPTO_RISK / price) * 1e6) / 1e6
-                    if qty > 0 and paper.sell(symbol, qty, price):
-                        sl_levels[symbol] = round(price * (1 + CRYPTO_SL_PCT), 4)
-                        tp_levels[symbol] = round(price * (1 - CRYPTO_SL_PCT * CRYPTO_RR), 4)
-                        print(f"[{base}] 🔴 PAPER SHORT ${price:,.2f}  qty={qty:.6f}  "
-                              f"SL=${sl_levels[symbol]:,.2f}  TP=${tp_levels[symbol]:,.2f}  "
-                              f"Balance: ${paper.balance:,.2f}")
+                direction = detect_sweep(float(candle["high"]), float(candle["low"]),
+                                          float(candle["close"]), pool_high, pool_low)
+                if direction is None:
+                    continue
+
+                sl, tp = compute_stop_target(direction, float(candle["high"]), float(candle["low"]),
+                                              pool_high, pool_low, SL_BUFFER_PCT)
+                rr = compute_rr(price, sl, tp)
+                if rr < MIN_RR:
+                    print(f"[{base}] ⏭ Sweep {direction} skipped — R:R 1:{rr:.1f} < 1:{MIN_RR:.0f} min")
+                    continue
+
+                qty = size_position(paper.balance, RISK_PCT, price, sl)
+                if qty <= 0:
+                    print(f"[{base}] ⏭ Sweep {direction} skipped — position size rounds to zero")
+                    continue
+
+                if direction == "SHORT":
+                    paper.sell(symbol, qty, price)
+                else:
+                    paper.buy(symbol, qty, price)
+                sl_levels[symbol]    = sl
+                tp_levels[symbol]    = tp
+                trade_states[symbol] = "IN_TRADE"
+                print(f"[{base}] ⚡ SWEEP {direction} @ ${price:,.2f}  SL=${sl:,.2f}  "
+                      f"TP=${tp:,.2f}  R:R=1:{rr:.1f}  qty={qty:.6f}")
 
             except Exception as e:
                 print(f"[{base}] Error: {e}")
@@ -297,8 +320,8 @@ def run_crypto_ema():
             for k, v in paper.positions.items()
         ) or "flat"
         print(f"  [CRYPTO] Balance: ${paper.balance:,.2f}  |  {pos_str}\n")
-        save_test_state(paper, sl_levels, tp_levels, live_prices)
-        time.sleep(CRYPTO_SLEEP)
+        save_test_state(paper, sl_levels, tp_levels, live_prices, pools, trade_states)
+        time.sleep(POLL_SECONDS)
 
 
 # ── Stock EMA bot (lumibot + Alpaca) ──────────────────────────────────────────
