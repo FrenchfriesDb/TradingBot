@@ -234,7 +234,7 @@ def run_crypto_sweep():
         for symbol in CRYPTO_SYMBOLS:
             base = symbol.split("/")[0]
             try:
-                if now - last_recalc[symbol] >= POOL_RECALC_SECONDS:
+                if trade_states[symbol] != "IN_TRADE" and now - last_recalc[symbol] >= POOL_RECALC_SECONDS:
                     df_1h = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "1h", limit=POOL_LOOKBACK_1H))
                     pool_high, pool_low = compute_pools(df_1h, POOL_LOOKBACK_1H)
                     pools[symbol]["high"] = pool_high
