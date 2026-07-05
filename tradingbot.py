@@ -1,3 +1,13 @@
+import os
+
+# ── Kill LumiBot noise at the source (must be set BEFORE lumibot imports) ──────
+# LUMIBOT_TELEMETRY=false disables the telemetry emitter thread entirely (the
+# 5-min JSON spam). LUMIBOT_LOG_LEVEL=ERROR sets lumibot's own console handler to
+# ERROR-only — lumibot re-applies this level on every internal reconfigure, so
+# calling setLevel() from our side after import gets clobbered; the env var wins.
+os.environ.setdefault("LUMIBOT_TELEMETRY", "false")
+os.environ.setdefault("LUMIBOT_LOG_LEVEL", "ERROR")
+
 import logging
 
 # ── Quiet the self-healing network churn so the console stays readable ──────────
@@ -28,6 +38,9 @@ _QUIET = _QuietFilter()
 def quiet_logging():
     """(Re)apply noise suppression. Safe to call repeatedly — call again after Lumibot
     has set up its own log handlers so the handler-level filter actually takes effect."""
+    # Suppress all lumibot INFO/WARNING at the logger level — telemetry, balance
+    # polling errors, and websocket churn are all INFO; real failures are ERROR+.
+    logging.getLogger("lumibot").setLevel(logging.ERROR)
     root = logging.getLogger()
     if _QUIET not in root.filters:
         root.addFilter(_QUIET)
@@ -55,6 +68,7 @@ from bot.crypto_strategy import DebbieLaCrypto
 try:
     from lumibot.brokers.alpaca import Alpaca as _AlpacaBroker
     _orig_parse = _AlpacaBroker._parse_broker_order
+    _warned_order_ids: set = set()   # suppress repeat prints for same stale orders
 
     def _safe_parse_broker_order(self, response, strategy_name, strategy_object=None):
         try:
@@ -62,7 +76,9 @@ try:
         except (ValueError, TypeError) as e:
             order_id = (response.get("id", "?") if isinstance(response, dict)
                         else getattr(response, "id", "?"))
-            print(f"[patch] Skipping malformed order {order_id}: {e}")
+            if order_id not in _warned_order_ids:
+                _warned_order_ids.add(order_id)
+                print(f"[patch] Skipping malformed order {order_id}: {e}")
             return None
 
     _AlpacaBroker._parse_broker_order = _safe_parse_broker_order
