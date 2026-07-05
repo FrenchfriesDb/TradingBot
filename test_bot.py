@@ -19,17 +19,15 @@ API_KEY    = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 PAPER      = os.getenv("ALPACA_PAPER", "True").lower() in ("1", "true", "yes")
 
-FAST           = 9
-SLOW           = 21
+POOL_LOOKBACK_1H     = 24        # 1H candles used to mark the swing high/low anchor
+POOL_RECALC_SECONDS  = 60 * 60   # recompute the 1H pools once per hour
+SL_BUFFER_PCT        = 0.0005    # stop sits this far beyond the spike wick
+MIN_RR               = 3.0       # skip the trade if implied R:R is below this
+RISK_PCT             = 0.01      # 1% of balance/cash risked per trade
 STOCK_SYMBOL   = "IWM"  # kept off DebbieLaSMC's watchlist on purpose — avoids both bots trading the same ticker
-STOCK_SL_PCT   = 0.005   # SL = 0.5% from entry
-STOCK_RR       = 3       # 1:3 R:R → TP = 1.5% from entry
 CRYPTO_SYMBOLS = ["BTC/USD"]
 CRYPTO_BALANCE = 5_000.0
-CRYPTO_RISK    = 0.05    # 5% of balance per trade
-CRYPTO_SL_PCT  = 0.015   # SL = 1.5% from entry
-CRYPTO_RR      = 6       # 1:6 R:R  →  TP = 9% from entry
-CRYPTO_SLEEP   = 5 * 60  # 5 minutes
+POLL_SECONDS   = 60      # 1-minute poll — matches the 1M sniper timeframe
 TEST_STATE_FILE = "test_state.json"
 
 
@@ -151,6 +149,47 @@ def ohlcv_to_df(ohlcv):
     df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df.set_index("timestamp")
+
+
+def compute_pools(df_1h: pd.DataFrame, lookback: int = POOL_LOOKBACK_1H):
+    """Returns (pool_high, pool_low) — the swing high/low over the last `lookback` 1H candles."""
+    window = df_1h.tail(lookback)
+    return float(window["high"].max()), float(window["low"].min())
+
+
+def detect_sweep(candle_high: float, candle_low: float, candle_close: float,
+                  pool_high: float, pool_low: float):
+    """Returns 'SHORT', 'LONG', or None — a wick past the pool that closes back inside it."""
+    if candle_high > pool_high and candle_close <= pool_high:
+        return "SHORT"
+    if candle_low < pool_low and candle_close >= pool_low:
+        return "LONG"
+    return None
+
+
+def compute_stop_target(direction: str, candle_high: float, candle_low: float,
+                         pool_high: float, pool_low: float,
+                         sl_buffer_pct: float = SL_BUFFER_PCT):
+    """Returns (stop_loss, take_profit) for the given sweep direction."""
+    if direction == "SHORT":
+        return candle_high * (1 + sl_buffer_pct), pool_low
+    return candle_low * (1 - sl_buffer_pct), pool_high
+
+
+def compute_rr(entry: float, sl: float, tp: float) -> float:
+    """Risk:reward as a plain float (3.0 means 1:3). Returns 0.0 if risk <= 0."""
+    risk   = abs(entry - sl)
+    reward = abs(tp - entry)
+    return reward / risk if risk > 0 else 0.0
+
+
+def size_position(balance: float, risk_pct: float, entry: float, sl: float) -> float:
+    """Qty sized so a stop-out loses exactly risk_pct of balance. Returns 0.0 if risk <= 0."""
+    risk_per_unit = abs(entry - sl)
+    if risk_per_unit <= 0:
+        return 0.0
+    qty = (balance * risk_pct) / risk_per_unit
+    return math.floor(qty * 1e6) / 1e6
 
 
 # ── Crypto EMA loop ────────────────────────────────────────────────────────────
