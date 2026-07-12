@@ -2,9 +2,11 @@ from lumibot.strategies import Strategy
 from lumibot.entities import Asset, Order
 from bot import indicators
 from finbert_utils import estimate_sentiment
-from config import NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALPACA_API_SECRET, BASE_URL as ALPACA_BASE_URL
+from config import (NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALPACA_API_SECRET,
+                    BASE_URL as ALPACA_BASE_URL, GOOGLE_SHEET_URL)
+from sheets_logger import (get_sheet_client, ensure_tabs, log_daily_snapshot, log_trade,
+                            MACRO_HEADER, LEDGER_HEADER)
 import json
-import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -126,19 +128,6 @@ REASON: one concise sentence"""
     except Exception as e:
         return False, 0.0, f"API error ({e}) — no signal, skipping for safety"
 
-if not os.path.exists("./logs"):
-    os.makedirs("./logs")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("./logs/bot_activity.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
 STALE_TRADE_HOURS = 6   # intraday SMC: close stale positions that haven't resolved in 6h
 
 
@@ -183,6 +172,15 @@ class DebbieLaSMC(Strategy):
         self.amd_zone_type      = {s: None   for s in self.symbols}
         self.zone_set_price     = {s: None   for s in self.symbols}  # price when trend_follow zone armed
         self._iter_count        = 0
+
+        # ── Google Sheets logging ────────────────────────────────────────────
+        self._sheet_client      = get_sheet_client()
+        ensure_tabs(self._sheet_client, GOOGLE_SHEET_URL, {
+            "Stock Macro": MACRO_HEADER, "Stock Ledger": LEDGER_HEADER,
+        })
+        self._sheet_log_date    = None    # UTC date of the last daily-snapshot row written
+        self._daily_open_balance = None   # captured lazily on the first iteration
+        self._daily_open_spy    = None    # captured lazily on the first iteration with a SPY price
 
     def on_bot_start(self):
         """Kill the two stale BRACKET orders that spam WARNING every iteration."""
@@ -305,8 +303,19 @@ class DebbieLaSMC(Strategy):
                             close_qty  = abs(float(position.quantity))
                             close_side = (Order.OrderSide.BUY if not is_long
                                           else Order.OrderSide.SELL)
-                            self.submit_order(self.create_order(asset, close_qty, close_side))
-                            self._reset(symbol)
+                            submitted = self.submit_order(self.create_order(asset, close_qty, close_side))
+                            # Same guard as the manual/stale exits: only clear our tracking
+                            # if the close was actually accepted, otherwise _reconcile_position
+                            # re-adopts this position (with fresh protection) next iteration
+                            # instead of it silently going naked.
+                            if submitted is not None:
+                                self._reset(symbol)
+                            else:
+                                self.log_message(
+                                    f"[{symbol}] ⚠️ Gap-open close order submission failed — "
+                                    f"position still open, NOT resetting state.",
+                                    color="red"
+                                )
         except Exception as e:
             self.log_message(f"Startup sync skipped (broker not ready): {e}", color="red")
 
@@ -407,6 +416,15 @@ class DebbieLaSMC(Strategy):
                              f"posted GTC OCO (SL {sl:.2f} / TP {tp:.2f}).", color="yellow")
         except Exception as e:
             self.log_message(f"[{symbol}] ⚠️ Couldn't verify/re-attach protection: {e}", color="red")
+
+    def _log_trade_close_to_sheet(self, symbol, is_long, entry_price, exit_price, qty, pnl):
+        """Fire-and-forget: append a completed round-trip row to the Stock Ledger tab.
+        MUST be called before _reset(symbol) — that wipes entry_price/amd_phase, which
+        this reads. sheets_logger's own functions are already fail-soft."""
+        reason = f"{self.amd_phase[symbol] or 'BOS'} {'LONG' if is_long else 'SHORT'}"
+        log_trade(self._sheet_client, GOOGLE_SHEET_URL, "Stock Ledger",
+                  datetime.now(timezone.utc).isoformat(), symbol,
+                  "LONG" if is_long else "SHORT", entry_price, exit_price, qty, pnl, reason)
 
     def _reset(self, symbol):
         # Cancel the broker-side OCO/bracket legs (TP/SL) so they don't linger as orphans
@@ -612,12 +630,58 @@ class DebbieLaSMC(Strategy):
         confirm = not (sentiment == "negative" and probability >= 0.60)
         return confirm, sentiment, probability
 
+    def _reconcile_position(self, symbol, position, current_price=None):
+        """Broker truth wins. If Alpaca shows a real position but our internal state
+        doesn't (a close order that was submitted but never actually filled, a lost
+        restart, or any other desync), _ensure_protection's safety net never runs
+        again for this symbol — self.state gates it, and nothing else ever sets
+        state back to POSITION_OPEN. That's exactly how the MSFT short sat naked
+        for 6 days: the stale-exit path submitted a close order and reset state
+        immediately without confirming the close filled. Adopt the orphaned
+        position here so protection resumes within one iteration, not silently
+        forever."""
+        if self.state[symbol] == "POSITION_OPEN" or position is None or abs(position.quantity) < 1e-9:
+            return
+        is_long = position.quantity > 0
+        # Lumibot's Position exposes avg_fill_price (mapped from Alpaca's raw
+        # avg_entry_price field) and it can be None on a failed parse — fall back
+        # to the live price so an orphan still gets adopted with SOME risk plan
+        # rather than crashing the whole iteration and never being managed at all.
+        raw_entry = (getattr(position, "avg_fill_price", None)
+                     or getattr(position, "avg_entry_price", None)
+                     or current_price)
+        if not raw_entry:
+            self.log_message(f"[{symbol}] ⚠️ Orphaned position found but no entry/live price "
+                             f"available — retrying adoption next iteration.", color="red")
+            return
+        entry = float(raw_entry)
+        self.bias[symbol]        = "BULLISH" if is_long else "BEARISH"
+        self.entry_price[symbol] = entry
+        self.entry_qty[symbol]   = abs(position.quantity)
+        self.entry_time[symbol]  = datetime.now(timezone.utc)
+        if not self.stop_loss[symbol] or not self.take_profit[symbol]:
+            # No known risk plan for an adopted position — fall back to a conservative
+            # 1% stop distance at this file's own existing MIN_AI_RR floor, rather than
+            # leaving it with no SL/TP (which would make _ensure_protection a no-op).
+            risk = entry * 0.01
+            self.stop_loss[symbol]   = entry - risk if is_long else entry + risk
+            self.take_profit[symbol] = entry + risk * MIN_AI_RR if is_long else entry - risk * MIN_AI_RR
+        self.state[symbol] = "POSITION_OPEN"
+        self.log_message(
+            f"[{symbol}] ⚠️ Orphaned position detected — broker shows "
+            f"{position.quantity} shares but internal state was out of sync. Adopting as "
+            f"POSITION_OPEN (SL {self.stop_loss[symbol]:.2f} / TP {self.take_profit[symbol]:.2f}) "
+            f"so protection resumes.",
+            color="red"
+        )
+
     def _process_symbol(self, symbol):
         current_price = self.get_last_price(symbol)
         if not current_price:
             return
         asset = self._make_asset(symbol)
         position = self.get_position(asset)
+        self._reconcile_position(symbol, position, current_price)
 
         # ── STATE 4: POSITION_OPEN ─────────────────────────────────────────────
         # Check this first so we don't re-enter while a trade is live.
@@ -651,7 +715,7 @@ class DebbieLaSMC(Strategy):
             if hit:
                 close_qty  = abs(position.quantity)
                 close_side = Order.OrderSide.SELL if is_long else Order.OrderSide.BUY
-                self.submit_order(self.create_order(asset, close_qty, close_side))
+                submitted = self.submit_order(self.create_order(asset, close_qty, close_side))
                 entry_p = self.entry_price[symbol] or current_price
                 pnl = ((current_price - entry_p) * close_qty if is_long
                        else (entry_p - current_price) * close_qty)
@@ -667,7 +731,21 @@ class DebbieLaSMC(Strategy):
                     f"@ {current_price:.4f} | P&L: {pnl:+.2f}{lev_note}",
                     color="green" if pnl >= 0 else "red"
                 )
-                self._reset(symbol)  # also cancels broker SL/TP orders + saves state
+                # Only wipe our tracking if the close order was actually accepted. If
+                # submit_order returned nothing, the position is still open on the
+                # broker — resetting here would strip its protective legs (_reset
+                # cancels the OCO) while leaving it live, exactly how MSFT went naked
+                # for 6 days. Leave state as POSITION_OPEN; _reconcile_position and
+                # _ensure_protection keep it protected until this actually resolves.
+                if submitted is not None:
+                    self._log_trade_close_to_sheet(symbol, is_long, entry_p, current_price, close_qty, pnl)
+                    self._reset(symbol)  # also cancels broker SL/TP orders + saves state
+                else:
+                    self.log_message(
+                        f"[{symbol}] ⚠️ Close order submission failed — position still "
+                        f"open, NOT resetting state (would strip its protection).",
+                        color="red"
+                    )
                 return
 
             # Time-based exit: close stale trades after STALE_TRADE_HOURS
@@ -680,12 +758,26 @@ class DebbieLaSMC(Strategy):
                 if elapsed_hours >= STALE_TRADE_HOURS:
                     close_qty  = abs(position.quantity)
                     close_side = Order.OrderSide.SELL if is_long else Order.OrderSide.BUY
-                    self.submit_order(self.create_order(asset, close_qty, close_side))
+                    submitted = self.submit_order(self.create_order(asset, close_qty, close_side))
+                    entry_p = self.entry_price[symbol] or current_price
+                    pnl = ((current_price - entry_p) * close_qty if is_long
+                           else (entry_p - current_price) * close_qty)
                     self.log_message(
-                        f"[{symbol}] ⏰ Stale exit after {elapsed_hours:.1f}h — closing position.",
+                        f"[{symbol}] ⏰ Stale exit after {elapsed_hours:.1f}h — closing position. "
+                        f"P&L: {pnl:+.2f}",
                         color="red"
                     )
-                    self._reset(symbol)
+                    # Same guard as the manual SL/TP exit above — see comment there.
+                    if submitted is not None:
+                        self._log_trade_close_to_sheet(symbol, is_long, entry_p, current_price,
+                                                        close_qty, pnl)
+                        self._reset(symbol)
+                    else:
+                        self.log_message(
+                            f"[{symbol}] ⚠️ Stale-exit close order submission failed — "
+                            f"position still open, NOT resetting state.",
+                            color="red"
+                        )
             return
 
         # ── FETCH DATA ─────────────────────────────────────────────────────────
@@ -1055,10 +1147,10 @@ class DebbieLaSMC(Strategy):
                 if prob > 0:
                     self.log_message(
                         f"[{symbol}] AI: {sentiment.upper()} ({prob*100:.1f}%) → {'✅' if confirm else '❌'}",
-                        color="purple"
+                        color="magenta"
                     )
                 else:
-                    self.log_message(f"[{symbol}] No news — proceeding on technicals.", color="purple")
+                    self.log_message(f"[{symbol}] No news — proceeding on technicals.", color="magenta")
 
                 if confirm:
                     is_long = self.bias[symbol] == "BULLISH"
@@ -1117,7 +1209,7 @@ class DebbieLaSMC(Strategy):
                     self.log_message(
                         f"[{symbol}] 🤖 AI Bot Approval: {'✅ YES' if ai_confirm else '❌ NO'}  "
                         f"R:R=1:{rr_actual:.1f}  {ai_reason}",
-                        color="purple"
+                        color="magenta"
                     )
 
                     if ai_confirm:
@@ -1316,6 +1408,32 @@ class DebbieLaSMC(Strategy):
         self._iter_count += 1
         for symbol in self.symbols:
             self._process_symbol(symbol)
+        self._log_daily_snapshot_if_new_day()
+
+    def _log_daily_snapshot_if_new_day(self):
+        """Once-per-UTC-day portfolio snapshot to the Stock Macro tab. Uses
+        get_portfolio_value() (cash + open positions), not get_cash() — a large open
+        position deducting from cash must not read as a loss, same fix as test_bot.py's
+        equity display. SPY is already in the watchlist so this costs no extra fetch."""
+        today = datetime.now(timezone.utc).date()
+        if self._sheet_log_date == today:
+            return
+        balance = self.get_portfolio_value()
+        if self._daily_open_balance is None:
+            self._daily_open_balance = balance   # first iteration ever — nothing to compare yet
+        spy_price = self.get_last_price("SPY")
+        if self._daily_open_spy is None:
+            self._daily_open_spy = spy_price
+        daily_return_pct = ((balance - self._daily_open_balance) / self._daily_open_balance * 100
+                             if self._daily_open_balance else 0.0)
+        spy_return_pct = (((spy_price - self._daily_open_spy) / self._daily_open_spy * 100)
+                           if spy_price and self._daily_open_spy else 0.0)
+        log_daily_snapshot(self._sheet_client, GOOGLE_SHEET_URL, "Stock Macro",
+                            today.isoformat(), balance, daily_return_pct,
+                            spy_price or 0.0, spy_return_pct)
+        self._sheet_log_date     = today
+        self._daily_open_balance = balance
+        self._daily_open_spy     = spy_price
 
     def before_closing_bell(self):
         for symbol in self.symbols:
