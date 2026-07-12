@@ -34,7 +34,10 @@ def _patch_ccxt():
     except Exception as e:
         print(f"ccxt patch skipped: {e}")
 
-from config import BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET, BINANCE_CASH_AT_RISK, NVIDIA_API_KEY
+from config import (BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET, BINANCE_CASH_AT_RISK,
+                    NVIDIA_API_KEY, GOOGLE_SHEET_URL)
+from sheets_logger import (get_sheet_client, ensure_tabs, log_daily_snapshot, log_trade,
+                            MACRO_HEADER, LEDGER_HEADER)
 
 # ── Background library loader ─────────────────────────────────────────────────
 # macOS Gatekeeper rescans every .so file on the first import after a reboot —
@@ -546,6 +549,7 @@ class SymbolState:
         self.eqh_level = None; self.eqh_touch = 0   # latest equal-highs pool (for chart overlay)
         self.trendline = None    # {kind,t1,p1,t2,p2} diagonal trendline (for chart overlay)
         self.ai_reject_count = 0  # consecutive AI rejections; reset to IDLE at threshold
+        self.is_chase = False     # True when the current ENTRY_WAIT is a breakout-chase, not a retest
         self.last_tap_candle    = None  # suppress repeated zone-tap prints
         self.last_choch_aligned = None  # suppress repeated CHoCH-waiting prints
         # ── 10-second entry sniper ──────────────────────────────────────────────
@@ -611,6 +615,21 @@ def manage_open_trade(paper, state, symbol, cur_price, base):
         state.breakeven_moved = True
         print(f"[{base}] 🛡 60% to target — SL trailed to break-even ${state.stop_loss:,.4f} "
               f"(winner locked in — can no longer close at a loss)")
+
+
+# ── Google Sheets trade ledger ──────────────────────────────────────────────────
+
+def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, state):
+    """Fire-and-forget: append a completed round-trip row to the Crypto Ledger tab.
+    Called from BOTH close points (the 5-min loop's close_position() and the 10s
+    watcher's inline close) so every exit gets logged regardless of which path caught
+    it. sheets_logger's own functions are already fail-soft — this only builds the
+    reason string from context available at either call site."""
+    reason = (f"{'CHASE ' if state.is_chase else ''}{state.amd_phase or 'BOS'} "
+              f"{'LONG' if is_long else 'SHORT'}")
+    log_trade(get_sheet_client(), GOOGLE_SHEET_URL, "Crypto Ledger",
+              datetime.now(timezone.utc).isoformat(), base,
+              "LONG" if is_long else "SHORT", entry_price, exit_price, qty, pnl, reason)
 
 
 # ── NVIDIA AI trade confirmation ───────────────────────────────────────────────
@@ -704,6 +723,23 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
             f"${fvg_low:,.4f}–${fvg_high:,.4f} with bearish/bullish structure?\n"
             f"- Is there enough room to the next liquidity pool to justify a 1:3.5+ R:R?"
         )
+    elif amd_phase == 'breakout_chase':
+        amd_context = (
+            f"AMD Phase    : BREAKOUT_CHASE (half size — momentum-continuation, no retest)\n"
+            f"Narrative    : Price broke toward the {side} continuation and never retraced to\n"
+            f"               tap the original zone — it ran away without giving a retest entry.\n"
+            f"               This is a direct momentum-chase: no structural entry zone, the risk\n"
+            f"               band below is the swing-based invalidation stop to current price.\n"
+            f"               Original setup armed at ${sweep_level:,.4f}, now ${price:,.4f}.\n"
+            f"               Chase risk band: ${fvg_low:,.4f} – ${fvg_high:,.4f}  SL: ${sl:,.4f}"
+        )
+        amd_question = (
+            f"- Does the 4H chart show genuine fresh displacement/momentum still supporting "
+            f"{side}, or does this look already extended/exhausted?\n"
+            f"- Is the daily trend aligned with chasing this {side}?\n"
+            f"- Is there still enough room to the next liquidity pool to justify a 1:3.5+ R:R "
+            f"after chasing an already-extended move?"
+        )
     else:
         amd_context  = f"AMD Phase    : standard BOS-based setup"
         amd_question = (
@@ -785,6 +821,178 @@ REASON: one concise sentence"""
     except Exception as e:
         _executor.shutdown(wait=False)
         return False, 0.0, f"API error ({e}) — no signal, skipping for safety"
+
+
+def check_chase_continuation(df_ltf, bias):
+    """Returns (eligible: bool, reason: str) — used when price has run away from a
+    retest zone without ever tapping it. Momentum must still be intact in the
+    breakout direction: no reversal candle just printed, and price hasn't stalled."""
+    is_long = bias == "BULLISH"
+    last, prev = df_ltf.iloc[-1], df_ltf.iloc[-2]
+    candle = indicators.classify_candle(last, prev)
+    reversal_vs_long  = {"shooting_star", "gravestone_doji", "bearish_engulfing",
+                         "hanging_man", "marubozu_bear"}
+    reversal_vs_short = {"hammer", "dragonfly_doji", "bullish_engulfing",
+                         "inverted_hammer", "marubozu_bull"}
+    reversal_set = reversal_vs_long if is_long else reversal_vs_short
+    no_reversal_candle = candle not in reversal_set
+
+    close_now  = float(df_ltf['close'].iloc[-1])
+    close_prev = float(df_ltf['close'].iloc[-3])
+    momentum_intact = (close_now > close_prev) if is_long else (close_now < close_prev)
+
+    if no_reversal_candle and momentum_intact:
+        return True, f"candle={candle}, momentum intact"
+    return False, f"candle={candle}, momentum_intact={momentum_intact}"
+
+
+def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt,
+                             df_ltf, df_htf, daily_trend, entry_atr, now, risk_fraction):
+    """Shared AI-confirmation + position-sizing + execution tail for BOTH the
+    retest-entry path and the breakout-chase path. The caller must already have set
+    state.stop_loss (zone-edge+ATR-cap+swing-guard for a retest, swing-high/low
+    directly for a chase) and state.is_chase before calling."""
+    bias_str   = "bullish" if is_long else "bearish"
+    side_label = "LONG" if is_long else "SHORT"
+    label      = f"🚀 CHASE {side_label}" if state.is_chase else side_label
+
+    # 2. Find the nearest 4H liquidity pool — informs the AI's R:R choice,
+    #    but the AI (floored at 1:4) has final say on the actual target.
+    pool_tp = indicators.find_next_liquidity_target(df_htf, price, bias_str)
+
+    # 3. Ask NVIDIA AI — pass the TRADE direction (state.bias), not the current BOS
+    #    direction. For trend-follow setups with no sweep, pass the zone edge as the
+    #    structural reference level instead of $0. A chase entry has no structural
+    #    zone to reference — pass the risk band (SL to current price) instead, and
+    #    a distinct amd_phase so the prompt frames it honestly as a momentum-chase.
+    if state.is_chase:
+        amd_phase           = 'breakout_chase'
+        zone_type           = state.amd_zone_type
+        ref_level           = state.zone_set_price
+        zone_lo, zone_hi    = min(state.stop_loss, price), max(state.stop_loss, price)
+    else:
+        amd_phase        = state.amd_phase
+        zone_type        = state.amd_zone_type
+        ref_level        = state.sweep_low or (state.fvg_high if not is_long else state.fvg_low)
+        zone_lo, zone_hi = state.fvg_low, state.fvg_high
+
+    confirm, rr_actual, ai_reason = get_ai_confirmation(
+        symbol, price, daily_trend, bias_str,
+        zone_lo, zone_hi, ref_level,
+        state.stop_loss, risk_amt, pool_tp, df_ltf, df_htf,
+        amd_phase=amd_phase, zone_type=zone_type,
+    )
+    # Target OFFSET — pull the TP a fraction of ATR inward so we fill BEFORE the
+    # herd's orders pile up at the round number / structural ceiling.
+    # Hard cap: offset can never reduce effective R:R below MIN_AI_RR floor.
+    reward      = risk_amt * rr_actual
+    min_reward  = risk_amt * MIN_AI_RR
+    max_offset  = max(0.0, reward - min_reward)
+    tp_offset   = min(0.05 * entry_atr, 0.25 * reward, max_offset)
+    state.take_profit = (price + reward - tp_offset if is_long
+                         else price - reward + tp_offset)
+    icon = "✅ YES" if confirm else "❌ NO"
+    print(f"[{base}] 🤖 AI Bot Approval: {icon}  R:R=1:{rr_actual:.1f}  {ai_reason[:140]}")
+
+    # 4. Execute only if AI confirms
+    if confirm:
+        effective_fraction = risk_fraction * 0.5 if (state.ranging_mode or state.is_chase) else risk_fraction
+        # Margin-based sizing: deploy risk_fraction% of balance as MARGIN.
+        # Leverage stretches that margin into a larger controlled position.
+        #   margin  = balance × risk_fraction          ← what you "put in"
+        #   qty     = margin × PAPER_LEVERAGE / price  ← what you control
+        margin_to_deploy = paper.balance * effective_fraction
+        margin_to_deploy = min(margin_to_deploy, paper.balance * 0.20)  # cap 20% per trade
+        # Daily margin cap: total margin across all trades ≤ 5% of balance per day
+        daily_remaining = paper.check_daily_cap(margin_to_deploy)
+        if daily_remaining <= 0:
+            print(f"[{base}] ⏭ Daily margin cap reached (5% of balance) — skipping entry.")
+            return
+        margin_to_deploy = min(margin_to_deploy, daily_remaining)
+        qty = math.floor(margin_to_deploy * PAPER_LEVERAGE / price * 1e6) / 1e6
+
+        # Liquidation guard: SL must sit INSIDE the liq distance (1/L from entry).
+        # If the structural SL is wider than liq distance, tighten it to 90% of liq
+        # so the stop always fires before the exchange forces liquidation.
+        liq_dist = price / PAPER_LEVERAGE   # distance from entry to liquidation
+        if not is_long and (state.stop_loss - price) >= liq_dist:
+            state.stop_loss = price + liq_dist * 0.90
+            risk_amt = state.stop_loss - price
+            print(f"[{base}] ⚡ SL auto-capped at 90% liq distance "
+                  f"({PAPER_LEVERAGE}x liq at +{liq_dist:.4f}) → SL ${state.stop_loss:.4f}")
+        elif is_long and (price - state.stop_loss) >= liq_dist:
+            state.stop_loss = price - liq_dist * 0.90
+            risk_amt = price - state.stop_loss
+            print(f"[{base}] ⚡ SL auto-capped at 90% liq distance "
+                  f"({PAPER_LEVERAGE}x liq at -{liq_dist:.4f}) → SL ${state.stop_loss:.4f}")
+
+        # Minimum-reward gate — scales with account size so tight-stop majors
+        # (BTC/ETH) aren't filtered out just for having a small $ risk_amt.
+        MIN_REWARD_PCT = 0.0015   # 0.15% of balance
+        min_reward_dollars = paper.balance * MIN_REWARD_PCT
+        actual_reward = qty * (risk_amt * rr_actual) if qty > 0 else 0
+        if actual_reward < min_reward_dollars:
+            print(f"[{base}] ⏭ Trade skipped — reward too small after position cap "
+                  f"(${actual_reward:.2f} < ${min_reward_dollars:.2f} min). "
+                  f"Cheap coin + tight SL = deploy capital elsewhere.")
+            return
+
+        if qty > 0:
+            # Final guard: never stack onto an existing position. The paper trader
+            # is synchronous so this is belt-and-suspenders, but it keeps both bots
+            # consistent and covers any state/position desync.
+            if abs(paper.get_position(symbol)) > 1e-6:
+                print(f"[{base}] ⛔ Entry aborted — position already open. Syncing to POSITION_OPEN.")
+                state.state = "POSITION_OPEN"
+                return
+
+            trade = paper.buy(symbol, qty, price) if is_long else paper.sell(symbol, qty, price)
+
+            if trade:
+                paper.record_margin(margin_to_deploy)   # count against daily 5% cap
+                state.state       = "POSITION_OPEN"
+                state.entry_price = price
+                state.entry_time  = now
+                pos_value = qty * price          # full controlled position
+                margin    = pos_value / PAPER_LEVERAGE   # actual capital posted
+
+                if PAPER_LEVERAGE > 1:
+                    lev_line = (
+                        f"\n[{base}]    💹 {PAPER_LEVERAGE}x LEVERAGE  "
+                        f"margin=${margin:,.2f} controls ${pos_value:,.2f} "
+                        f"({qty:,.4f} {base})  "
+                        f"liq if price moves {1/PAPER_LEVERAGE:.0%} against "
+                        f"(${price*(1-1/PAPER_LEVERAGE) if is_long else price*(1+1/PAPER_LEVERAGE):,.2f})"
+                    )
+                else:
+                    lev_line = ""
+
+                trade_print(base, f"✅ TRADE OPENED {label}",
+                            price, balance=paper.balance,
+                            extra=(f"margin=${margin:,.2f} → ${pos_value:,.2f} controlled  "
+                                   f"SL=${state.stop_loss:,.4f}  TP=${state.take_profit:,.4f}  "
+                                   f"R:R 1:{rr_actual:.1f}  "
+                                   f"risk=${risk_amt*qty:,.2f}  reward=${reward*qty:,.2f}"
+                                   + (f"  [{PAPER_LEVERAGE}x]" if PAPER_LEVERAGE > 1 else "")))
+                alert(f"🔔 TRADE OPENED — {label} {base}",
+                      f"${price:,.4f}  margin ${margin:,.0f} → ${pos_value:,.0f}  "
+                      f"SL ${state.stop_loss:,.2f}  TP ${state.take_profit:,.2f}  (1:{rr_actual:.1f})",
+                      sound="Submarine",
+                      speak=f"Trade opened. {label} {base}")
+    else:
+        if state.is_chase:
+            # Chasing is a one-shot, time-sensitive opportunity — unlike a retest zone
+            # that stays valid to re-check next cycle, a rejected chase has no reason
+            # to linger: price will only be further away next time. Reset immediately.
+            print(f"[{base}] AI rejected chase entry — abandoning (no zone to keep watching).")
+            state.reset()
+        else:
+            state.ai_reject_count += 1
+            if state.ai_reject_count >= 3:
+                print(f"[{base}] AI rejected setup {state.ai_reject_count}× — zone abandoned, resetting to IDLE.")
+                state.reset()
+            else:
+                print(f"[{base}] AI rejected setup ({state.ai_reject_count}/3) — staying in ENTRY_WAIT")
 
 
 # ── Core strategy loop per symbol ─────────────────────────────────────────────
@@ -919,6 +1127,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                   f"P&L ${pnl:+.2f}  Balance ${paper.balance:,.2f}",
                   sound="Glass" if won else "Basso",
                   speak=f"{base} closed. {'Profit' if won else 'Loss'} {abs(pnl):.0f} dollars")
+            _log_trade_close_to_sheet(base, is_long, state.entry_price, price, qty_now, pnl, state)
             state.reset()
 
         # Trade management first — scale out 50% at halfway, trail SL to break-even at 85%.
@@ -1213,16 +1422,40 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         # Stale-zone invalidation — applies to EVERY pending zone (AMD supply/demand,
         # trend-follow, CHoCH-FVG retest). They're all "wait for price to reach the zone"
         # setups; if price instead RUNS AWAY ≥1.5% in our direction from where the zone was
-        # armed, the move happened without us — abandon it and re-hunt the breakdown/breakout.
+        # armed, the move happened without us. Before giving up on it, check whether the
+        # breakout still shows genuine continuation strength — if so, chase it directly
+        # instead of only re-hunting a fresh setup.
         # (Measured vs the arm-price, not a displacement, so it never thrash-abandons.)
         if state.zone_set_price:
             ran_away = ((state.bias == "BEARISH" and price < state.zone_set_price * 0.985) or
                         (state.bias == "BULLISH" and price > state.zone_set_price * 1.015))
             if ran_away:
                 moved = abs(price - state.zone_set_price) / state.zone_set_price
-                print(f"[{base}] ⚠️ Zone abandoned — price ran {moved:.1%} from setup "
-                      f"(${state.zone_set_price:,.2f}→${price:,.2f}) without tapping; re-hunting the move.")
-                state.reset()
+                chase_ok, chase_reason = check_chase_continuation(df_ltf, state.bias)
+                if not chase_ok:
+                    print(f"[{base}] ⚠️ Zone abandoned — price ran {moved:.1%} from setup "
+                          f"(${state.zone_set_price:,.2f}→${price:,.2f}) without tapping; "
+                          f"re-hunting the move.")
+                    state.reset()
+                    return price
+
+                print(f"[{base}] 🚀 Chasing breakout — price ran {moved:.1%} without tapping "
+                      f"(${state.zone_set_price:,.2f}→${price:,.2f}), momentum intact "
+                      f"({chase_reason}) — entering directly.")
+                is_long = state.bias == "BULLISH"
+                state.is_chase = True
+                state.stop_loss = (float(df_ltf['low'].tail(SWING_LOOKBACK).min()) * 0.999 if is_long
+                                   else float(df_ltf['high'].tail(SWING_LOOKBACK).max()) * 1.001)
+                chase_risk_amt = abs(price - state.stop_loss)
+                if chase_risk_amt <= 0:
+                    print(f"[{base}] ⏭ Chase skipped — swing SL invalid (no room).")
+                    state.reset()
+                    return price
+                _chase_rng = df_htf['high'] - df_htf['low']
+                chase_entry_atr = max(_chase_rng.rolling(14).mean().iloc[-1],
+                                       _chase_rng.rolling(3).mean().iloc[-1])
+                execute_confirmed_entry(symbol, base, state, paper, is_long, price, chase_risk_amt,
+                                         df_ltf, df_htf, daily_trend, chase_entry_atr, now, risk_fraction)
                 return price
 
         # ── Sniper arming (once, on first bar, before zone tap) ─────────────────
@@ -1385,7 +1618,6 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             if is_long:
                 state.stop_loss = state.fvg_low - _sl_dist
                 risk_amt        = price - state.stop_loss
-                label = "LONG"
                 if risk_amt <= 0:
                     state.stop_loss = price - _sl_dist
                     risk_amt        = _sl_dist
@@ -1397,7 +1629,6 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             else:
                 state.stop_loss = state.fvg_high + _sl_dist
                 risk_amt        = state.stop_loss - price
-                label = "SHORT"
                 if risk_amt <= 0:
                     state.stop_loss = price + _sl_dist
                     risk_amt        = _sl_dist
@@ -1425,124 +1656,9 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     risk_amt        = state.stop_loss - price
                     print(f"[{base}] 📏 SL → swing high ${state.stop_loss:,.4f} (wick-sweep guard)")
 
-            # 2. Find the nearest 4H liquidity pool — informs the AI's R:R choice,
-            #    but the AI (floored at 1:4) has final say on the actual target.
-            pool_tp  = indicators.find_next_liquidity_target(df_htf, price, bias_str)
-
-            # 3. Ask NVIDIA AI — pass the TRADE direction (state.bias), not the current BOS
-            #    direction. For trend-follow setups with no sweep, pass the zone edge as the
-            #    structural reference level instead of $0.
-            ref_level = state.sweep_low or (state.fvg_high if not is_long else state.fvg_low)
-            confirm, rr_actual, ai_reason = get_ai_confirmation(
-                symbol, price, daily_trend, bias_str,
-                state.fvg_low, state.fvg_high, ref_level,
-                state.stop_loss, risk_amt, pool_tp, df_ltf, df_htf,
-                amd_phase=state.amd_phase, zone_type=state.amd_zone_type,
-            )
-            # Target OFFSET — pull the TP a fraction of ATR inward so we fill BEFORE the
-            # herd's orders pile up at the round number / structural ceiling.
-            # Hard cap: offset can never reduce effective R:R below MIN_AI_RR floor.
-            reward      = risk_amt * rr_actual
-            min_reward  = risk_amt * MIN_AI_RR
-            max_offset  = max(0.0, reward - min_reward)
-            tp_offset   = min(0.05 * entry_atr, 0.25 * reward, max_offset)
-            state.take_profit = (price + reward - tp_offset if is_long
-                                 else price - reward + tp_offset)
-            icon = "✅ YES" if confirm else "❌ NO"
-            print(f"[{base}] 🤖 AI Bot Approval: {icon}  R:R=1:{rr_actual:.1f}  {ai_reason[:140]}")
-
-            # 4. Execute only if AI confirms
-            if confirm:
-                effective_fraction = risk_fraction * 0.5 if state.ranging_mode else risk_fraction
-                # Margin-based sizing: deploy risk_fraction% of balance as MARGIN.
-                # Leverage stretches that margin into a larger controlled position.
-                #   margin  = balance × risk_fraction          ← what you "put in"
-                #   qty     = margin × PAPER_LEVERAGE / price  ← what you control
-                margin_to_deploy = paper.balance * effective_fraction
-                margin_to_deploy = min(margin_to_deploy, paper.balance * 0.20)  # cap 20% per trade
-                # Daily margin cap: total margin across all trades ≤ 5% of balance per day
-                daily_remaining = paper.check_daily_cap(margin_to_deploy)
-                if daily_remaining <= 0:
-                    print(f"[{base}] ⏭ Daily margin cap reached (5% of balance) — skipping entry.")
-                    return price
-                margin_to_deploy = min(margin_to_deploy, daily_remaining)
-                qty = math.floor(margin_to_deploy * PAPER_LEVERAGE / price * 1e6) / 1e6
-
-                # Liquidation guard: SL must sit INSIDE the liq distance (1/L from entry).
-                # If the structural SL is wider than liq distance, tighten it to 90% of liq
-                # so the stop always fires before the exchange forces liquidation.
-                liq_dist = price / PAPER_LEVERAGE   # distance from entry to liquidation
-                if not is_long and (state.stop_loss - price) >= liq_dist:
-                    state.stop_loss = price + liq_dist * 0.90
-                    risk_amt = state.stop_loss - price
-                    print(f"[{base}] ⚡ SL auto-capped at 90% liq distance "
-                          f"({PAPER_LEVERAGE}x liq at +{liq_dist:.4f}) → SL ${state.stop_loss:.4f}")
-                elif is_long and (price - state.stop_loss) >= liq_dist:
-                    state.stop_loss = price - liq_dist * 0.90
-                    risk_amt = price - state.stop_loss
-                    print(f"[{base}] ⚡ SL auto-capped at 90% liq distance "
-                          f"({PAPER_LEVERAGE}x liq at -{liq_dist:.4f}) → SL ${state.stop_loss:.4f}")
-
-                # Minimum-reward gate — scales with account size so tight-stop majors
-                # (BTC/ETH) aren't filtered out just for having a small $ risk_amt.
-                MIN_REWARD_PCT = 0.0015   # 0.15% of balance
-                min_reward_dollars = paper.balance * MIN_REWARD_PCT
-                actual_reward = qty * (risk_amt * rr_actual) if qty > 0 else 0
-                if actual_reward < min_reward_dollars:
-                    print(f"[{base}] ⏭ Trade skipped — reward too small after position cap "
-                          f"(${actual_reward:.2f} < ${min_reward_dollars:.2f} min). "
-                          f"Cheap coin + tight SL = deploy capital elsewhere.")
-                    return price
-
-                if qty > 0:
-                    # Final guard: never stack onto an existing position. The paper trader
-                    # is synchronous so this is belt-and-suspenders, but it keeps both bots
-                    # consistent and covers any state/position desync.
-                    if abs(paper.get_position(symbol)) > 1e-6:
-                        print(f"[{base}] ⛔ Entry aborted — position already open. Syncing to POSITION_OPEN.")
-                        state.state = "POSITION_OPEN"
-                        return price
-
-                    trade = paper.buy(symbol, qty, price) if is_long else paper.sell(symbol, qty, price)
-
-                    if trade:
-                        paper.record_margin(margin_to_deploy)   # count against daily 5% cap
-                        state.state       = "POSITION_OPEN"
-                        state.entry_price = price
-                        state.entry_time  = now
-                        pos_value = qty * price          # full controlled position
-                        margin    = pos_value / PAPER_LEVERAGE   # actual capital posted
-
-                        if PAPER_LEVERAGE > 1:
-                            lev_line = (
-                                f"\n[{base}]    💹 {PAPER_LEVERAGE}x LEVERAGE  "
-                                f"margin=${margin:,.2f} controls ${pos_value:,.2f} "
-                                f"({qty:,.4f} {base})  "
-                                f"liq if price moves {1/PAPER_LEVERAGE:.0%} against "
-                                f"(${price*(1-1/PAPER_LEVERAGE) if is_long else price*(1+1/PAPER_LEVERAGE):,.2f})"
-                            )
-                        else:
-                            lev_line = ""
-
-                        trade_print(base, f"✅ TRADE OPENED {label}",
-                                    price, balance=paper.balance,
-                                    extra=(f"margin=${margin:,.2f} → ${pos_value:,.2f} controlled  "
-                                           f"SL=${state.stop_loss:,.4f}  TP=${state.take_profit:,.4f}  "
-                                           f"R:R 1:{rr_actual:.1f}  "
-                                           f"risk=${risk_amt*qty:,.2f}  reward=${reward*qty:,.2f}"
-                                           + (f"  [{PAPER_LEVERAGE}x]" if PAPER_LEVERAGE > 1 else "")))
-                        alert(f"🔔 TRADE OPENED — {label} {base}",
-                              f"${price:,.4f}  margin ${margin:,.0f} → ${pos_value:,.0f}  "
-                              f"SL ${state.stop_loss:,.2f}  TP ${state.take_profit:,.2f}  (1:{rr_actual:.1f})",
-                              sound="Submarine",
-                              speak=f"Trade opened. {label} {base}")
-            else:
-                state.ai_reject_count += 1
-                if state.ai_reject_count >= 3:
-                    print(f"[{base}] AI rejected setup {state.ai_reject_count}× — zone abandoned, resetting to IDLE.")
-                    state.reset()
-                else:
-                    print(f"[{base}] AI rejected setup ({state.ai_reject_count}/3) — staying in ENTRY_WAIT")
+            state.is_chase = False   # this is a retest entry, not a chase
+            execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt,
+                                     df_ltf, df_htf, daily_trend, entry_atr, now, risk_fraction)
 
     return price
 
@@ -1603,12 +1719,22 @@ def run():
                     pnl = (st.entry_price - fill) * close_qty
                 trade_print(base, f"{label} HIT (startup catch-up — bot was offline)", fill,
                             pnl=pnl, balance=paper.balance)
+                _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st)
                 st.reset()
                 print(f"  ⚠️  {base} {label} was missed while bot was offline — closed now at ${fill:,.4f}", flush=True)
             else:
                 print(f"  ✅  {base} position intact  price=${_cur:,.4f}  SL=${st.stop_loss:,.4f}  TP=${st.take_profit:,.4f}", flush=True)
         except Exception as e:
             print(f"  Catch-up check failed for {sym}: {e}", flush=True)
+
+    # ── Google Sheets: create tabs once at startup, track daily snapshot baseline ──
+    _sheet_client = get_sheet_client()
+    ensure_tabs(_sheet_client, GOOGLE_SHEET_URL, {
+        "Crypto Macro": MACRO_HEADER, "Crypto Ledger": LEDGER_HEADER,
+    })
+    _sheet_log_date    = None    # UTC date of the last daily-snapshot row written
+    _daily_open_balance = paper.balance
+    _daily_open_btc     = None   # captured on the first tick that has a BTC/USD price
 
     prices = {}
     while True:
@@ -1630,6 +1756,28 @@ def run():
         )
         print(f"\n  Balance: ${paper.balance:,.2f}  |  Positions: {positions_str}")
         save_crypto_state(paper, states, symbols, prices)
+
+        # ── Google Sheets: once-per-UTC-day portfolio snapshot ──────────────────
+        _btc_price = prices.get("BTC/USD")
+        if _btc_price is None:
+            try:
+                _btc_price = float(exchange.fetch_ticker("BTC/USD")["last"])
+            except Exception:
+                _btc_price = None
+        if _daily_open_btc is None:
+            _daily_open_btc = _btc_price   # first tick ever — nothing to compare against yet
+        _today = datetime.now(timezone.utc).date()
+        if _sheet_log_date != _today:
+            _daily_return_pct = ((paper.balance - _daily_open_balance) / _daily_open_balance * 100
+                                  if _daily_open_balance else 0.0)
+            _btc_return_pct = (((_btc_price - _daily_open_btc) / _daily_open_btc * 100)
+                                if _btc_price and _daily_open_btc else 0.0)
+            log_daily_snapshot(_sheet_client, GOOGLE_SHEET_URL, "Crypto Macro",
+                                _today.isoformat(), paper.balance, _daily_return_pct,
+                                _btc_price or 0.0, _btc_return_pct)
+            _sheet_log_date     = _today
+            _daily_open_balance = paper.balance
+            _daily_open_btc     = _btc_price
         print(f"  Sleeping {SLEEP_SECONDS // 60}m (SL/TP watching every 10s) …\n")
 
         # ── Fast SL/TP watcher ─────────────────────────────────────────────────
@@ -1766,6 +1914,7 @@ def run():
                           sound="Glass" if won else "Basso",
                           speak=f"{base} {'take profit' if won else 'stop loss'} hit. "
                                 f"{'Profit' if won else 'Loss'} {abs(pnl):.0f} dollars")
+                    _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st)
                     st.reset()
                     prices[sym] = cur
                     save_crypto_state(paper, states, symbols, prices)
