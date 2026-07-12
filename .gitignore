@@ -5,3 +5,5 @@ venv/
 logs/
 models/
 *.sqlite
+google_credentials.json
+*.credentials.json

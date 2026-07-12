@@ -57,3 +57,10 @@ BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTC/USDT")
 BINANCE_CASH_AT_RISK = float(os.getenv("BINANCE_CASH_AT_RISK", 0.02))  # 2% risk per trade
 NVIDIA_API_KEY       = os.getenv("NVIDIA_API_KEY", "")               # build.nvidia.com
 
+# ============================================================================
+# GOOGLE SHEETS TRADE LOGGING
+# ============================================================================
+# See docs/superpowers/specs/2026-07-12-google-sheets-trade-logging-design.md
+GOOGLE_SHEETS_CREDS_FILE = os.getenv("GOOGLE_SHEETS_CREDS_FILE", "google_credentials.json")
+GOOGLE_SHEET_URL         = os.getenv("GOOGLE_SHEET_URL", "")
+
