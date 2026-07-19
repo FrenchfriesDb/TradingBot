@@ -8,3 +8,7 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 flask>=3.0.0
 ccxt>=4.0.0,<4.5.0
+gspread>=6.0.0
+google-auth>=2.30.0
+mplfinance>=0.12.10
+playwright>=1.40.0

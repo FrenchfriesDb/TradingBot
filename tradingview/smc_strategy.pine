@@ -1,0 +1,235 @@
+// ============================================================
+// Debbie-la SMC Strategy — Pine Script v6
+// State machine: IDLE → SWEEP_HUNT → ENTRY_WAIT → POSITION_OPEN
+//
+// USE ON: BTCUSD 5m  or  SPY 5m
+// SETUP:  Pine Editor → Add to chart → Strategy Tester tab
+// ============================================================
+//@version=6
+strategy("Debbie-La SMC Strategy", overlay=true,
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=2,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         slippage=2,
+         process_orders_on_close=true,
+         max_boxes_count=200,
+         max_lines_count=200,
+         max_labels_count=200)
+
+// ── Inputs ──────────────────────────────────────────────────
+htf          = input.timeframe("240",  "HTF timeframe (BOS)")
+bos_lookback = input.int(15,           "BOS lookback candles")
+bos_body_min = input.float(0.15,       "Min body ratio for BOS")
+sweep_lb     = input.int(20,           "Sweep lookback candles")
+fvg_expiry   = input.int(50,           "FVG expiry (bars)")
+rr           = input.float(3.0,        "R:R ratio")
+atr_period   = input.int(14,           "ATR period (sets SL distance)")
+atr_mult     = input.float(1.5,        "ATR multiplier for SL")
+account_size = input.float(10000.0,    "Account size ($)")
+risk_pct_in  = input.float(2.0,        "Risk per trade (%)") / 100
+
+// ── ATR — scales SL to the chart's actual volatility ────────
+atr_val = ta.atr(atr_period)
+
+// ── HTF BOS (edge-triggered) ─────────────────────────────────
+htf_o = request.security(syminfo.tickerid, htf, open,  lookahead=barmerge.lookahead_off)
+htf_h = request.security(syminfo.tickerid, htf, high,  lookahead=barmerge.lookahead_off)
+htf_l = request.security(syminfo.tickerid, htf, low,   lookahead=barmerge.lookahead_off)
+htf_c = request.security(syminfo.tickerid, htf, close, lookahead=barmerge.lookahead_off)
+
+htf_body  = math.abs(htf_c - htf_o)
+htf_range = htf_h - htf_l
+htf_ratio = htf_range > 0 ? htf_body / htf_range : 0.0
+
+htf_swing_high = ta.highest(htf_h, bos_lookback)[1]
+htf_swing_low  = ta.lowest(htf_l,  bos_lookback)[1]
+
+bull_bos_raw = htf_c > htf_swing_high and htf_ratio >= bos_body_min
+bear_bos_raw = htf_c < htf_swing_low  and htf_ratio >= bos_body_min
+
+// Fire ONCE on the transition bar only (false → true)
+bull_bos = bull_bos_raw and not bull_bos_raw[1]
+bear_bos = bear_bos_raw and not bear_bos_raw[1]
+
+// ── Liquidity Sweep (edge-triggered) ─────────────────────────
+local_support = ta.lowest(low, sweep_lb)[1]
+sweep_raw     = low < local_support and close > local_support
+is_sweep      = sweep_raw and not sweep_raw[1]
+
+// ── Fair Value Gaps ──────────────────────────────────────────
+bull_fvg     = low[2] > high[0] and close[1] > open[1]
+bull_fvg_top = low[2]
+bull_fvg_bot = high[0]
+
+bear_fvg     = low[2] > high[0] and close[1] < open[1]
+bear_fvg_top = low[2]
+bear_fvg_bot = high[0]
+
+// ── State Machine ─────────────────────────────────────────────
+var int   bias       = 0
+var bool  sweep_hunt = false
+var bool  entry_wait = false
+var float fvg_lo     = na
+var float fvg_hi     = na
+var int   fvg_bars   = 0
+var box   fvg_box    = na
+
+// ── IDLE → SWEEP_HUNT ─────────────────────────────────────────
+if bull_bos and not sweep_hunt and not entry_wait and strategy.position_size == 0
+    bias       := 1
+    sweep_hunt := true
+    label.new(bar_index, low - atr_val * 0.5, "BOS ↑",
+              style=label.style_label_up, color=color.lime,
+              textcolor=color.black, size=size.small)
+    alert("4H BOS — bias BULLISH", alert.freq_once_per_bar)
+
+if bear_bos and not sweep_hunt and not entry_wait and strategy.position_size == 0
+    bias       := -1
+    sweep_hunt := true
+    label.new(bar_index, high + atr_val * 0.5, "BOS ↓",
+              style=label.style_label_down, color=color.red,
+              textcolor=color.white, size=size.small)
+    alert("4H BOS — bias BEARISH", alert.freq_once_per_bar)
+
+// ── Sweep marker ──────────────────────────────────────────────
+if sweep_hunt and is_sweep
+    label.new(bar_index, low - atr_val * 0.3, "sweep",
+              style=label.style_label_up, color=color.yellow,
+              textcolor=color.black, size=size.tiny)
+
+// ── SWEEP_HUNT → ENTRY_WAIT ───────────────────────────────────
+if sweep_hunt and not entry_wait
+    if bias == 1 and bull_fvg
+        entry_wait := true
+        sweep_hunt := false
+        fvg_lo     := bull_fvg_bot
+        fvg_hi     := bull_fvg_top
+        fvg_bars   := 0
+        if not na(fvg_box)
+            box.delete(fvg_box)
+        // Bounded box — only spans fvg_expiry bars, no extend
+        fvg_box := box.new(bar_index, fvg_hi, bar_index + fvg_expiry, fvg_lo,
+                           bgcolor=color.new(color.lime, 82),
+                           border_color=color.new(color.lime, 50), border_width=1)
+        label.new(bar_index, fvg_hi,
+                  "FVG " + str.tostring(fvg_lo, format.mintick) + "–" + str.tostring(fvg_hi, format.mintick),
+                  style=label.style_label_down, color=color.new(color.lime, 30),
+                  textcolor=color.black, size=size.tiny)
+
+    if bias == -1 and bear_fvg
+        entry_wait := true
+        sweep_hunt := false
+        fvg_lo     := bear_fvg_bot
+        fvg_hi     := bear_fvg_top
+        fvg_bars   := 0
+        if not na(fvg_box)
+            box.delete(fvg_box)
+        fvg_box := box.new(bar_index, fvg_hi, bar_index + fvg_expiry, fvg_lo,
+                           bgcolor=color.new(color.red, 82),
+                           border_color=color.new(color.red, 50), border_width=1)
+        label.new(bar_index, fvg_lo,
+                  "FVG " + str.tostring(fvg_lo, format.mintick) + "–" + str.tostring(fvg_hi, format.mintick),
+                  style=label.style_label_up, color=color.new(color.red, 30),
+                  textcolor=color.white, size=size.tiny)
+
+// ── FVG expiry ────────────────────────────────────────────────
+if entry_wait
+    fvg_bars += 1
+    if fvg_bars > fvg_expiry
+        entry_wait := false
+        fvg_bars   := 0
+        bias       := 0
+        if not na(fvg_box)
+            box.delete(fvg_box)
+        fvg_box := na
+
+// ── ENTRY_WAIT → POSITION_OPEN ────────────────────────────────
+in_fvg = entry_wait and not na(fvg_lo) and close >= fvg_lo and close <= fvg_hi
+
+// Trade box width — just 30 bars, fully bounded, moves with chart
+TRADE_W = 30
+
+if in_fvg and bias == 1 and strategy.position_size == 0
+    sl         = math.round(close - atr_val * atr_mult, 2)
+    tp         = math.round(close + (close - sl) * rr, 2)
+    risk_amt   = account_size * risk_pct_in
+    sl_dist    = math.max(close - sl, 0.0001)
+    qty        = risk_amt / sl_dist
+    profit_amt = risk_amt * rr
+    stop_pct   = sl_dist / close * 100
+    tgt_pct    = (tp - close) / close * 100
+
+    // Green box: entry → TP  (profit zone)
+    box.new(bar_index, tp, bar_index + TRADE_W, close,
+            bgcolor=color.new(color.lime, 78),
+            border_color=color.new(color.lime, 40), border_width=1)
+    // Red box: SL → entry  (risk zone)
+    box.new(bar_index, close, bar_index + TRADE_W, sl,
+            bgcolor=color.new(color.red, 78),
+            border_color=color.new(color.red, 40), border_width=1)
+
+    // Single compact label anchored to the entry bar at entry price
+    label.new(bar_index, close,
+              "▲ LONG   R:R " + str.tostring(rr, "#.0") + ":1\n" +
+              "Entry $" + str.tostring(close,    format.mintick) + "\n" +
+              "SL    $" + str.tostring(sl,       format.mintick) + "  -" + str.tostring(stop_pct,   "#.##") + "%  -$" + str.tostring(risk_amt,   "#.00") + "\n" +
+              "TP    $" + str.tostring(tp,       format.mintick) + "  +" + str.tostring(tgt_pct, "#.##") + "%  +$" + str.tostring(profit_amt, "#.00") + "\n" +
+              "Qty   " + str.tostring(math.round(qty, 6)),
+              style=label.style_label_up,
+              color=color.new(#0d47a1, 5), textcolor=color.white, size=size.small)
+
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    alert("SMC LONG entry — " + syminfo.ticker + " @ $" + str.tostring(close, format.mintick) + "  SL $" + str.tostring(sl, format.mintick) + "  TP $" + str.tostring(tp, format.mintick), alert.freq_once_per_bar)
+    entry_wait := false
+    sweep_hunt := false
+    if not na(fvg_box)
+        box.delete(fvg_box)
+
+if in_fvg and bias == -1 and strategy.position_size == 0
+    sl         = math.round(close + atr_val * atr_mult, 2)
+    tp         = math.round(close - (sl - close) * rr, 2)
+    risk_amt   = account_size * risk_pct_in
+    sl_dist    = math.max(sl - close, 0.0001)
+    qty        = risk_amt / sl_dist
+    profit_amt = risk_amt * rr
+    stop_pct   = sl_dist / close * 100
+    tgt_pct    = (close - tp) / close * 100
+
+    // Red box: entry → SL  (risk zone, SL is above for shorts)
+    box.new(bar_index, sl, bar_index + TRADE_W, close,
+            bgcolor=color.new(color.red, 78),
+            border_color=color.new(color.red, 40), border_width=1)
+    // Green box: TP → entry  (profit zone, TP is below for shorts)
+    box.new(bar_index, close, bar_index + TRADE_W, tp,
+            bgcolor=color.new(color.lime, 78),
+            border_color=color.new(color.lime, 40), border_width=1)
+
+    label.new(bar_index, close,
+              "▼ SHORT   R:R " + str.tostring(rr, "#.0") + ":1\n" +
+              "Entry $" + str.tostring(close, format.mintick) + "\n" +
+              "SL    $" + str.tostring(sl,    format.mintick) + "  +" + str.tostring(stop_pct,   "#.##") + "%  -$" + str.tostring(risk_amt,   "#.00") + "\n" +
+              "TP    $" + str.tostring(tp,    format.mintick) + "  -" + str.tostring(tgt_pct, "#.##") + "%  +$" + str.tostring(profit_amt, "#.00") + "\n" +
+              "Qty   " + str.tostring(math.round(qty, 6)),
+              style=label.style_label_down,
+              color=color.new(#b71c1c, 5), textcolor=color.white, size=size.small)
+
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    alert("SMC SHORT entry — " + syminfo.ticker + " @ $" + str.tostring(close, format.mintick) + "  SL $" + str.tostring(sl, format.mintick) + "  TP $" + str.tostring(tp, format.mintick), alert.freq_once_per_bar)
+    entry_wait := false
+    sweep_hunt := false
+    if not na(fvg_box)
+        box.delete(fvg_box)
+
+// ── Reset on trade close ──────────────────────────────────────
+if strategy.position_size == 0 and not sweep_hunt and not entry_wait
+    bias := 0
+
+// ── Background bias tint ──────────────────────────────────────
+bgcolor(bias == 1  ? color.new(color.lime, 96) :
+        bias == -1 ? color.new(color.red,  96) : na)
+
+// alertcondition() is indicator-only — alerts are handled above with alert() inside each condition block

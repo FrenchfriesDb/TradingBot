@@ -8,7 +8,7 @@ import time
 import math
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ── Patch ccxt _version.py bug BEFORE importing ccxt ──────────────────────────
 # ccxt 4.5.x crashes on import due to int(None) in toolz/_version.py.
@@ -38,6 +38,8 @@ from config import (BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET, BINANCE_CA
                     NVIDIA_API_KEY, GOOGLE_SHEET_URL)
 from sheets_logger import (get_sheet_client, ensure_tabs, log_daily_snapshot, log_trade,
                             MACRO_HEADER, LEDGER_HEADER)
+from chart_renderer import render_trade_chart, save_chart_locally
+from github_chart_uploader import upload_chart_to_github
 
 # ── Background library loader ─────────────────────────────────────────────────
 # macOS Gatekeeper rescans every .so file on the first import after a reboot —
@@ -393,6 +395,7 @@ def save_crypto_state(paper: "PaperTrader", states: dict, symbols: list, prices:
                 "amd_phase":          st.amd_phase,
                 "amd_zone_type":      st.amd_zone_type,
                 "partial_taken":      st.partial_taken,
+                "banked_pnl":         st.banked_pnl,
                 "breakeven_moved":    st.breakeven_moved,
                 "zone_set_price":     st.zone_set_price,
                 "eql_level":          st.eql_level,
@@ -468,6 +471,7 @@ def load_crypto_state(paper: "PaperTrader", states: dict, symbols: list):
             st.amd_phase          = saved.get("amd_phase")
             st.amd_zone_type      = saved.get("amd_zone_type")
             st.partial_taken      = saved.get("partial_taken", False)
+            st.banked_pnl         = saved.get("banked_pnl", 0.0)
             st.breakeven_moved    = saved.get("breakeven_moved", False)
             st.zone_set_price     = saved.get("zone_set_price")
             raw_time              = saved.get("entry_time")
@@ -543,7 +547,9 @@ class SymbolState:
         self.amd_phase = None      # 'manipulation_up'|'manipulation_down' when AMD override active
         self.amd_zone_type = None  # 'bearish_fvg'|'bearish_ob'|'ifvg'|'bullish_fvg'|...
         self.partial_taken = False    # True after scaling out the first 50% tranche
-        self.breakeven_moved = False  # True after SL trailed to break-even
+        self.banked_pnl = 0.0         # profit realized by the scale-out leg — added to the
+                                      # final ledger row so the sheet shows the trade's TRUE total
+        self.breakeven_moved = False  # True after SL trailed to +0.5R profit lock
         self.zone_set_price = None    # price when a trend_follow zone was armed (for stale-zone invalidation)
         self.eql_level = None; self.eql_touch = 0   # latest equal-lows pool (for chart overlay)
         self.eqh_level = None; self.eqh_touch = 0   # latest equal-highs pool (for chart overlay)
@@ -569,9 +575,11 @@ class SymbolState:
 
 def manage_open_trade(paper, state, symbol, cur_price, base):
     """Defeat the round-trip heartbreak. Runs from BOTH the 5-min loop and the 10s
-    watcher (so break-even moves fast enough to actually catch a reversal):
+    watcher (so the trail moves fast enough to actually catch a reversal):
       • SCALE OUT 50% once price is halfway to target — banks profit, lets the rest run.
-      • BREAK-EVEN at 85% of the way — a near-miss can no longer turn into a loss.
+      • PROFIT LOCK at 80% of the way — SL trails to entry+0.5R so a near-miss still
+        keeps half an R. (The old 60% break-even trail made every retracing winner
+        close at ~+0.1% — ledger showed +$1 "wins" against full -1R losses.)
     Idempotent: each action fires at most once per trade (flags on SymbolState)."""
     if state.state != "POSITION_OPEN" or not state.entry_price or not state.take_profit:
         return
@@ -595,6 +603,7 @@ def manage_open_trade(paper, state, symbol, cur_price, base):
             else:
                 paper.buy(symbol, half, cur_price);  pnl = (entry - cur_price) * half
             state.partial_taken = True
+            state.banked_pnl += pnl   # so the final ledger row reports the true trade total
             left = abs(paper.get_position(symbol))
             lev_tag = f"[{PAPER_LEVERAGE}x]" if PAPER_LEVERAGE > 1 else ""
             trade_print(base, "💰 SCALED OUT 50%", cur_price,
@@ -605,36 +614,80 @@ def manage_open_trade(paper, state, symbol, cur_price, base):
                   sound="Ping",
                   speak=f"{base} halfway. Scaled out fifty percent. Locked {abs(pnl):.0f} dollars.")
 
-    # 2. Trail SL to break-even (+ small fee buffer) at 60% of the way to target.
-    # 85% was too close to TP — in choppy post-spike markets price would bounce from
-    # 85% progress back to entry, closing the trade at 0 before ever reaching TP.
-    # 60% gives the same protection (no losing a winner) but locks it in much earlier,
-    # so the distance from break-even SL to current price is larger and harder to wick through.
-    if progress >= 0.60 and not state.breakeven_moved:
-        state.stop_loss = entry * (1.001 if is_long else 0.999)
+    # 2. Trail SL to a +0.5R profit lock at 80% of the way to target.
+    # The old 60% break-even trail neutered every winner: any retrace after 60%
+    # closed at entry+0.1% (~+$1) while losers still took the full -1R stop.
+    # 80% + entry±0.5R means a trade that got within reach of TP keeps half an R
+    # even on a full reversal — realized R:R can no longer invert.
+    if progress >= 0.80 and not state.breakeven_moved:
+        risk_dist = abs(entry - state.stop_loss)   # stop_loss still original here (fires once)
+        state.stop_loss = entry + (0.5 * risk_dist if is_long else -0.5 * risk_dist)
         state.breakeven_moved = True
-        print(f"[{base}] 🛡 60% to target — SL trailed to break-even ${state.stop_loss:,.4f} "
-              f"(winner locked in — can no longer close at a loss)")
+        print(f"[{base}] 🛡 80% to target — SL trailed to +0.5R lock ${state.stop_loss:,.4f} "
+              f"(worst case is now a WIN, not a scratch)")
 
 
 # ── Google Sheets trade ledger ──────────────────────────────────────────────────
 
-def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, state):
-    """Fire-and-forget: append a completed round-trip row to the Crypto Ledger tab.
+def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, state, exchange):
+    """Fire-and-forget: append a completed round-trip row to the Crypto Ledger tab,
+    including a candlestick chart of the trade hosted on GitHub (Drive hosting isn't
+    viable — service accounts have no storage quota and can't accept ownership
+    transfers) with a local charts/ save as a fallback if the GitHub push fails.
     Called from BOTH close points (the 5-min loop's close_position() and the 10s
-    watcher's inline close) so every exit gets logged regardless of which path caught
-    it. sheets_logger's own functions are already fail-soft — this only builds the
-    reason string from context available at either call site."""
+    watcher's inline close) so every exit gets logged regardless of which path
+    caught it. sheets_logger's own functions are already fail-soft; the chart
+    render/upload is separately wrapped so a bad candle fetch, GitHub hiccup, or
+    disk error can never block the ledger row itself from being written."""
     reason = (f"{'CHASE ' if state.is_chase else ''}{state.amd_phase or 'BOS'} "
               f"{'LONG' if is_long else 'SHORT'}")
+    now = datetime.now(timezone.utc)
+
+    chart_ref = None
+    try:
+        # Adaptive window: pick a timeframe so the whole trade PLUS ~60 bars of
+        # context always fits in one readable chart. Anchoring to entry_time with
+        # a fixed 5m limit made a 1-second trade render as 3 giant candles and a
+        # 10-hour trade overflow the window.
+        dur_min = (max(1.0, (now - state.entry_time).total_seconds() / 60)
+                   if state.entry_time else 60.0)
+        if dur_min <= 360:
+            tf, tf_min = "5m", 5
+        elif dur_min <= 1080:
+            tf, tf_min = "15m", 15
+        else:
+            tf, tf_min = "1h", 60
+        bars = min(140, int(dur_min / tf_min) + 60)
+        since_ms = int((now - timedelta(minutes=bars * tf_min)).timestamp() * 1000)
+        candles = exchange.fetch_ohlcv(f"{base}/USD", tf, since=since_ms, limit=bars)
+        chart_path = render_trade_chart(ohlcv_to_df(candles), base, "LONG" if is_long else "SHORT",
+                                          entry_price, state.stop_loss, state.take_profit,
+                                          PAPER_LEVERAGE, tf, state.entry_time)
+        filename = f"{base}_{now:%Y%m%dT%H%M%S}.png"
+        chart_ref = upload_chart_to_github(chart_path, filename)
+        if chart_ref:
+            os.remove(chart_path)
+        else:
+            chart_ref = save_chart_locally(chart_path, filename)
+    except Exception as e:
+        print(f"[SHEETS] Chart generation failed for {base}: {e}")
+
+    margin   = qty * entry_price / PAPER_LEVERAGE
+    notional = qty * entry_price
+    # Include profit banked by the mid-trade scale-out leg — the caller's pnl only
+    # covers the final close of the remainder, which understated every scaled winner.
+    pnl_total = pnl + (state.banked_pnl or 0.0)
     log_trade(get_sheet_client(), GOOGLE_SHEET_URL, "Crypto Ledger",
-              datetime.now(timezone.utc).isoformat(), base,
-              "LONG" if is_long else "SHORT", entry_price, exit_price, qty, pnl, reason)
+              (state.entry_time or now).isoformat(), now.isoformat(), base,
+              "LONG" if is_long else "SHORT", entry_price, state.stop_loss, state.take_profit,
+              exit_price, qty, margin, notional, PAPER_LEVERAGE, pnl_total, reason, chart_ref)
 
 
 # ── NVIDIA AI trade confirmation ───────────────────────────────────────────────
 
-MIN_AI_RR = 3.0   # hard floor — AI must find at least 1:3 R:R to approve entry
+MIN_AI_RR = 2.0   # hard floor — 1:2 minimum. Was 3.0, but ledger data showed ZERO trades
+                  # ever reached a 3R target before scale-out/trail/stale-exit clipped them;
+                  # 2R is actually hittable on 5m setups inside the 6h window.
 MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
 
 def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
@@ -649,7 +702,7 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
     never block a trade, it just falls back to the minimum acceptable R:R.
     """
     if not NVIDIA_API_KEY:
-        return True, MIN_AI_RR, "no_nvidia_key — proceeding at minimum 1:3.5 R:R"
+        return True, MIN_AI_RR, f"no_nvidia_key — proceeding at minimum 1:{MIN_AI_RR:g} R:R"
 
     side = "LONG" if bos_dir == "bullish" else "SHORT"
     pool_line = (f"Nearest 4H liquidity pool target: ${pool_tp:,.4f}  "
@@ -1127,7 +1180,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                   f"P&L ${pnl:+.2f}  Balance ${paper.balance:,.2f}",
                   sound="Glass" if won else "Basso",
                   speak=f"{base} closed. {'Profit' if won else 'Loss'} {abs(pnl):.0f} dollars")
-            _log_trade_close_to_sheet(base, is_long, state.entry_price, price, qty_now, pnl, state)
+            _log_trade_close_to_sheet(base, is_long, state.entry_price, price, qty_now, pnl, state, exchange)
             state.reset()
 
         # Trade management first — scale out 50% at halfway, trail SL to break-even at 85%.
@@ -1719,7 +1772,7 @@ def run():
                     pnl = (st.entry_price - fill) * close_qty
                 trade_print(base, f"{label} HIT (startup catch-up — bot was offline)", fill,
                             pnl=pnl, balance=paper.balance)
-                _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st)
+                _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st, exchange)
                 st.reset()
                 print(f"  ⚠️  {base} {label} was missed while bot was offline — closed now at ${fill:,.4f}", flush=True)
             else:
@@ -1728,8 +1781,7 @@ def run():
             print(f"  Catch-up check failed for {sym}: {e}", flush=True)
 
     # ── Google Sheets: create tabs once at startup, track daily snapshot baseline ──
-    _sheet_client = get_sheet_client()
-    ensure_tabs(_sheet_client, GOOGLE_SHEET_URL, {
+    ensure_tabs(get_sheet_client(), GOOGLE_SHEET_URL, {
         "Crypto Macro": MACRO_HEADER, "Crypto Ledger": LEDGER_HEADER,
     })
     _sheet_log_date    = None    # UTC date of the last daily-snapshot row written
@@ -1772,7 +1824,7 @@ def run():
                                   if _daily_open_balance else 0.0)
             _btc_return_pct = (((_btc_price - _daily_open_btc) / _daily_open_btc * 100)
                                 if _btc_price and _daily_open_btc else 0.0)
-            log_daily_snapshot(_sheet_client, GOOGLE_SHEET_URL, "Crypto Macro",
+            log_daily_snapshot(get_sheet_client(), GOOGLE_SHEET_URL, "Crypto Macro",
                                 _today.isoformat(), paper.balance, _daily_return_pct,
                                 _btc_price or 0.0, _btc_return_pct)
             _sheet_log_date     = _today
@@ -1800,9 +1852,27 @@ def run():
                         _in     = st.fvg_low - _tol <= _cur <= st.fvg_high + _tol
                         if _in:
                             _is_long = st.bias == "BULLISH"
-                            _fill    = st.fvg_low if _is_long else st.fvg_high
                             _base    = sym.split("/")[0]
-                            _sniper_reward = abs(st.sniper_tp - _fill) * st.sniper_qty
+                            # Market-order realism: we fill at the price that actually
+                            # printed, NOT the zone edge. Filling at fvg_high while the
+                            # market trades at the zone's other side booked instant fake
+                            # profit equal to the zone height (seen live: ADA "short from
+                            # 0.164" while price was 0.1605 — 0.164 never traded).
+                            _fill = _cur
+                            # Geometry sanity: price can blow through the zone between
+                            # arming and firing — never open a trade already past its
+                            # own stop or target.
+                            _past_sl = (_fill <= st.sniper_sl) if _is_long else (_fill >= st.sniper_sl)
+                            _past_tp = (_fill >= st.sniper_tp) if _is_long else (_fill <= st.sniper_tp)
+                            if _past_sl or _past_tp:
+                                print(f"[{_base}] ⏭ Sniper aborted — fill ${_fill:,.4f} already beyond "
+                                      f"{'SL' if _past_sl else 'TP'} "
+                                      f"(SL ${st.sniper_sl:,.4f} / TP ${st.sniper_tp:,.4f})", flush=True)
+                                st.sniper_armed = False
+                                continue
+                            # qty re-derived from the REAL fill so margin math stays exact
+                            _qty = st.sniper_margin * PAPER_LEVERAGE / _fill
+                            _sniper_reward = abs(st.sniper_tp - _fill) * _qty
                             if st.sniper_margin < 5.0 or _sniper_reward < 25.0:
                                 print(f"[{_base}] ⏭ Sniper skipped — dust trade "
                                       f"(margin ${st.sniper_margin:.2f}, reward ${_sniper_reward:.2f})",
@@ -1810,9 +1880,9 @@ def run():
                                 st.sniper_armed = False
                                 continue
                             if _is_long:
-                                paper.buy(sym, st.sniper_qty, _fill)
+                                paper.buy(sym, _qty, _fill)
                             else:
-                                paper.sell(sym, st.sniper_qty, _fill)
+                                paper.sell(sym, _qty, _fill)
                             paper.margin_used[sym] = st.sniper_margin
                             paper.record_margin(st.sniper_margin)
                             st.state       = "POSITION_OPEN"
@@ -1821,9 +1891,9 @@ def run():
                             st.take_profit = st.sniper_tp
                             st.entry_time  = datetime.now(timezone.utc)
                             _lbl = "LONG" if _is_long else "SHORT"
-                            _pv  = st.sniper_qty * _fill
-                            _r   = abs(_fill - st.sniper_sl) * st.sniper_qty
-                            _rw  = abs(st.sniper_tp - _fill) * st.sniper_qty
+                            _pv  = _qty * _fill
+                            _r   = abs(_fill - st.sniper_sl) * _qty
+                            _rw  = abs(st.sniper_tp - _fill) * _qty
                             trade_print(_base, f"⚡ SNIPER ENTRY — {_lbl} (10-sec precision)",
                                         _fill,
                                         extra=f"SL ${st.sniper_sl:,.4f}  TP ${st.sniper_tp:,.4f}  "
@@ -1871,15 +1941,27 @@ def run():
                     is_long   = held > 0
                     close_qty = abs(held)
 
-                    # Use 1m candle data to catch crosses between 10-second polls.
-                    # SL: use candle CLOSE — SMC liquidity grabs wick through SL then close
-                    #     back above/below, so a wick alone shouldn't stop you out.
-                    # TP: use candle HIGH/LOW wick — you want the fill as soon as target touched.
+                    # Use 1m wick data to catch crosses between polls. A real stop/limit
+                    # order fills the instant price TOUCHES the level — so scan the wicks
+                    # of EVERY candle since the last check, not just the forming one:
+                    # the strategy-processing part of the cycle can take minutes (8
+                    # symbols + AI calls), and a spike that pierced the level inside a
+                    # candle that CLOSED during that blind window must still fill.
+                    # Wick realism guard: a candle that STARTED before our entry may
+                    # carry pre-entry prices in its wick — a stop that didn't exist yet
+                    # can't fill on it (seen live: "TP hit" 1s after entry off a
+                    # pre-fill wick), so those candles count via live price only.
                     try:
-                        m1 = exchange.fetch_ohlcv(sym, "1m", limit=2)
+                        m1 = exchange.fetch_ohlcv(sym, "1m", limit=5)
                         candle_close = float(m1[-1][4]) if m1 else cur
-                        candle_high  = float(m1[-1][2]) if m1 else cur
-                        candle_low   = float(m1[-1][3]) if m1 else cur
+                        candle_high  = cur
+                        candle_low   = cur
+                        entry_ms = int(st.entry_time.timestamp() * 1000) if st.entry_time else 0
+                        for c in (m1 or []):
+                            if c[0] < entry_ms:
+                                continue   # candle opened pre-entry — wick untrustworthy
+                            candle_high = max(candle_high, float(c[2]))
+                            candle_low  = min(candle_low,  float(c[3]))
                     except Exception:
                         candle_close = cur
                         candle_high  = cur
@@ -1914,7 +1996,7 @@ def run():
                           sound="Glass" if won else "Basso",
                           speak=f"{base} {'take profit' if won else 'stop loss'} hit. "
                                 f"{'Profit' if won else 'Loss'} {abs(pnl):.0f} dollars")
-                    _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st)
+                    _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st, exchange)
                     st.reset()
                     prices[sym] = cur
                     save_crypto_state(paper, states, symbols, prices)

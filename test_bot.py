@@ -1,20 +1,32 @@
 """
 1H/1M SMC Sweep-Reversal Test Bot — stocks + crypto.
 Stocks : IWM via Alpaca paper (NYSE hours, long-only)
-Crypto : BTC only via Coinbase public (24/7, long + short)
+Crypto : 8 pairs via Coinbase public (24/7, long + short) — BTC, ETH, SOL,
+         DOGE, XRP, AVAX, POL, ADA, matching binance_bot.py's watchlist.
 Both pipelines: 1H swing high/low = liquidity pools (recalculated hourly),
 1M candle wicks past a pool and closes back inside = sweep+reversal entry,
 opposite pool = target, min 1:3 R:R, 1% risk per trade.
+Sound + desktop notification on entry/SL/TP; hourly session-stats summary.
 Purpose: confirm execution works on both pipelines before trusting the SMC bot.
 """
 
 import os
+import re
+import sys
 import math
 import time
+import logging
 import threading
 import pandas as pd
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+from bot import indicators
+from config import GOOGLE_SHEET_URL
+from sheets_logger import get_sheet_client, log_trade, ensure_tabs, LEDGER_HEADER
+from chart_renderer import (render_trade_chart, render_stock_tradingview,
+                             save_chart_locally)
+from github_chart_uploader import upload_chart_to_github, ensure_chart_branch
 
 load_dotenv()
 
@@ -27,11 +39,136 @@ POOL_RECALC_SECONDS  = 60 * 60   # recompute the 1H pools once per hour
 SL_BUFFER_PCT        = 0.0005    # stop sits this far beyond the spike wick
 MIN_RR               = 3.0       # skip the trade if implied R:R is below this
 RISK_PCT             = 0.01      # 1% of balance/cash risked per trade
+MAX_NOTIONAL_PCT     = 0.10      # never deploy more than 10% of the account into one position
+DAILY_NOTIONAL_CAP   = 200.0     # max $ opened across ALL crypto trades combined, per UTC day
 STOCK_SYMBOL   = "IWM"  # kept off DebbieLaSMC's watchlist on purpose — avoids both bots trading the same ticker
-CRYPTO_SYMBOLS = ["BTC/USD"]
+CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD",
+                   "XRP/USD", "AVAX/USD", "POL/USD", "ADA/USD"]
 CRYPTO_BALANCE = 5_000.0
 POLL_SECONDS   = 60      # 1-minute poll — matches the 1M sniper timeframe
 TEST_STATE_FILE = "test_state.json"
+TEST_LEDGER_TAB = "Test Ledger"   # own tab — test trades never pollute the real ledgers
+TRADE_ALERTS   = True    # macOS sound + desktop notification + spoken alert on entry/exit
+
+
+# ── Google Sheets trade ledger (same system as the main bots) ──────────────────
+
+def ensure_test_sheet():
+    """Create the Test Ledger tab (with header) and the GitHub chart branch if
+    missing. Idempotent and fully fail-soft — call it at every pipeline start."""
+    try:
+        ensure_tabs(get_sheet_client(), GOOGLE_SHEET_URL, {TEST_LEDGER_TAB: LEDGER_HEADER})
+        ensure_chart_branch()
+    except Exception as e:
+        print(f"[SHEETS] Test Ledger setup skipped: {e}")
+
+
+def log_test_trade(ticker, is_long, entry_price, exit_price, qty, pnl, sl, tp,
+                    entry_time, reason, chart_path=None):
+    """Append one closed test trade to the Test Ledger tab, uploading its chart to
+    GitHub (local charts/ fallback). Unleveraged, so margin == notional and the
+    Leverage column reads 1. Never raises — a Sheets or chart error can't break
+    the test loop."""
+    try:
+        now = datetime.now(timezone.utc)
+        chart_ref = None
+        if chart_path:
+            filename = f"TEST_{ticker}_{now:%Y%m%dT%H%M%S}.png"
+            chart_ref = upload_chart_to_github(chart_path, filename)
+            if chart_ref:
+                os.remove(chart_path)
+            else:
+                chart_ref = save_chart_locally(chart_path, filename)
+        notional = qty * entry_price
+        log_trade(get_sheet_client(), GOOGLE_SHEET_URL, TEST_LEDGER_TAB,
+                  (entry_time or now).isoformat(), now.isoformat(), ticker,
+                  "LONG" if is_long else "SHORT", entry_price, sl, tp, exit_price,
+                  qty, notional, notional, 1, pnl, reason, chart_ref)
+    except Exception as e:
+        print(f"[SHEETS] Test ledger log failed for {ticker}: {e}")
+
+
+def render_crypto_test_chart(exchange, symbol, is_long, entry_price, sl, tp, entry_time):
+    """Chart for a closed crypto test trade — same adaptive-window lightweight-charts
+    render as binance_bot. Returns a temp PNG path or None; never raises."""
+    try:
+        now = datetime.now(timezone.utc)
+        dur_min = (max(1.0, (now - entry_time).total_seconds() / 60)
+                   if entry_time else 60.0)
+        if dur_min <= 360:
+            tf, tf_min = "5m", 5
+        elif dur_min <= 1080:
+            tf, tf_min = "15m", 15
+        else:
+            tf, tf_min = "1h", 60
+        bars = min(140, int(dur_min / tf_min) + 60)
+        since = int((now.timestamp() - bars * tf_min * 60) * 1000)
+        df = ohlcv_to_df(exchange.fetch_ohlcv(symbol, tf, since=since, limit=bars))
+        return render_trade_chart(df, symbol.split("/")[0], "LONG" if is_long else "SHORT",
+                                   entry_price, sl, tp, 1, tf, entry_time)
+    except Exception as e:
+        print(f"[CHART] Test chart failed for {symbol}: {e}")
+        return None
+
+
+def alert(title, message, sound="Glass", speak=None):
+    """Fire a macOS desktop notification + sound (+ optional spoken alert). Non-blocking
+    (Popen, never waits) and wrapped so it can never crash or slow the trading loop."""
+    if not TRADE_ALERTS:
+        return
+    try:
+        import subprocess
+        safe_msg   = message.replace('"', "'")
+        safe_title = title.replace('"', "'")
+        snd = f"/System/Library/Sounds/{sound}.aiff"
+        # Sound FIRST — afplay needs no permissions (unlike notifications) so it always
+        # rings. Play it twice back-to-back in a detached shell so it's hard to miss.
+        subprocess.Popen(["sh", "-c", f"afplay '{snd}' 2>/dev/null; sleep 0.4; afplay '{snd}' 2>/dev/null"])
+        # Desktop notification (needs Terminal/iTerm notification permission to appear).
+        subprocess.Popen(["osascript", "-e",
+            f'display notification "{safe_msg}" with title "{safe_title}" sound name "{sound}"'])
+        if speak:
+            subprocess.Popen(["say", speak])
+    except Exception:
+        pass
+
+
+# ── Silence lumibot's Alpaca order-sync spam (stock thread only) ───────────────
+# The shared Alpaca paper account carries ~44 dead early-July bracket/OCO orders
+# that lumibot's parser can't read; every 1-minute sync re-warns on ALL of them.
+# tradingbot.py already dedups these, but that filter lives in ITS process — this
+# is the same treatment for test_bot's own lumibot instance: each dead order ID
+# warns once per run, then goes silent.
+_MALFORMED_ORDER_RE = re.compile(r"Skipping malformed order (\S+)")
+_seen_malformed_order_ids: set = set()
+
+class _DedupMalformedOrders(logging.Filter):
+    def filter(self, record):
+        try:
+            m = _MALFORMED_ORDER_RE.search(record.getMessage())
+        except Exception:
+            return True
+        if not m:
+            return True
+        if m.group(1) in _seen_malformed_order_ids:
+            return False
+        _seen_malformed_order_ids.add(m.group(1))
+        return True
+
+_DEDUP_MALFORMED = _DedupMalformedOrders()
+
+def _quiet_lumibot_noise():
+    """Attach the dedup filter to every handler lumibot has set up. Lumibot's console
+    handler hangs off the 'lumibot' logger (not the true root), and records that reach
+    a handler-less root fall through to logging.lastResort — cover all three."""
+    for lg in (logging.getLogger("lumibot"), logging.getLogger()):
+        if _DEDUP_MALFORMED not in lg.filters:
+            lg.addFilter(_DEDUP_MALFORMED)
+        for h in lg.handlers:
+            if _DEDUP_MALFORMED not in h.filters:
+                h.addFilter(_DEDUP_MALFORMED)
+    if _DEDUP_MALFORMED not in logging.lastResort.filters:
+        logging.lastResort.addFilter(_DEDUP_MALFORMED)
 
 
 
@@ -43,9 +180,32 @@ class PaperTrader:
         self.positions     = {}   # symbol -> qty (negative = short)
         self.entry_prices  = {}
         self.trade_count   = 0
+        self.daily_notional = 0.0   # total $ opened today, across ALL symbols (resets each UTC day)
+        self.daily_date     = None
 
     def get_position(self, symbol):
         return self.positions.get(symbol, 0.0)
+
+    def _roll_daily_window(self):
+        """Reset the daily notional counter on a UTC day change. Both check_daily_cap
+        and record_notional call this independently — neither may assume the other
+        ran first, or a record-before-check call order silently loses the day's total."""
+        today = datetime.now(timezone.utc).date()
+        if self.daily_date != today:
+            self.daily_notional = 0.0
+            self.daily_date     = today
+
+    def check_daily_cap(self, notional_needed: float, daily_cap_dollars: float) -> float:
+        """Returns how much notional is still available today under the fixed dollar
+        cap — NOT released when a trade closes, matches binance_bot.py's PaperTrader:
+        this limits how much NEW capital gets deployed per day, not concurrent exposure."""
+        self._roll_daily_window()
+        return max(0.0, daily_cap_dollars - self.daily_notional)
+
+    def record_notional(self, notional: float):
+        """Call after an entry is confirmed to count it against today's cap."""
+        self._roll_daily_window()
+        self.daily_notional += notional
 
     def buy(self, symbol, qty, price):
         held = self.positions.get(symbol, 0.0)
@@ -112,8 +272,9 @@ def _patch_ccxt():
         pass
 
 
-def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states):
+def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states, stats=None, entry_times=None):
     import json
+    entry_times = entry_times or {}
     try:
         positions = {}
         for sym, qty in paper.positions.items():
@@ -123,6 +284,7 @@ def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states):
             cur   = prices.get(sym, 0.0)
             sl    = sl_levels.get(sym)
             tp    = tp_levels.get(sym)
+            et    = entry_times.get(sym)
             is_long = qty > 0
             upnl  = (cur - entry) * qty if is_long else (entry - cur) * abs(qty)
             risk  = abs(entry - sl) * abs(qty) if sl else None
@@ -131,6 +293,7 @@ def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states):
                 "qty": qty, "side": "LONG" if is_long else "SHORT",
                 "entry_price": entry, "current_price": cur,
                 "stop_loss": sl, "take_profit": tp,
+                "entry_time": et.isoformat() if et else None,
                 "unrealized_pnl": upnl,
                 "risk_dollars": risk, "reward_dollars": reward,
             }
@@ -142,15 +305,30 @@ def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states):
             }
             for sym in pools
         }
+        # True account equity, not just leftover cash. Longs deduct their cost from
+        # balance at open (this paper model is spot), so a big open position makes raw
+        # "balance" look like the account got wiped when the money is just deployed.
+        # Longs add back market value; shorts (no cash moved at open) add unrealized P&L.
+        equity = paper.balance
+        for sym, qty in paper.positions.items():
+            if abs(qty) < 1e-9:
+                continue
+            cur = prices.get(sym, 0.0)
+            if qty > 0:
+                equity += qty * cur
+            else:
+                equity += (paper.entry_prices.get(sym, cur) - cur) * abs(qty)
         data = {
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "bot": "SweepTestBot",
             "balance": paper.balance,
+            "equity": equity,
             "start_balance": CRYPTO_BALANCE,
             "trade_count": paper.trade_count,
             "positions": positions,
             "pools": pool_data,
             "live_prices": {s: prices.get(s, 0) for s in CRYPTO_SYMBOLS},
+            "stats": stats or {},
         }
         with open(TEST_STATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -197,12 +375,82 @@ def compute_rr(entry: float, sl: float, tp: float) -> float:
 
 
 def size_position(balance: float, risk_pct: float, entry: float, sl: float) -> float:
-    """Qty sized so a stop-out loses exactly risk_pct of balance. Returns 0.0 if risk <= 0."""
+    """Qty sized so a stop-out loses exactly risk_pct of balance. Returns 0.0 if risk <= 0.
+
+    Capped at MAX_NOTIONAL_PCT of balance: with a tight stop, pure risk-based sizing
+    demands more capital than the account even has (e.g. a $123 stop on a $61k coin
+    with 1% of a $5k account = $24k of notional) — without this cap the paper trader
+    would silently deploy ~the whole account into one position. A capped trade risks
+    LESS than risk_pct, never more."""
     risk_per_unit = abs(entry - sl)
     if risk_per_unit <= 0:
         return 0.0
     qty = (balance * risk_pct) / risk_per_unit
+    qty = min(qty, (balance * MAX_NOTIONAL_PCT) / entry)
     return math.floor(qty * 1e6) / 1e6
+
+
+def new_stats():
+    """Fresh running-session stats accumulator."""
+    return {"trades": 0, "wins": 0, "losses": 0, "gross_win": 0.0, "gross_loss": 0.0}
+
+
+def record_trade_result(stats: dict, pnl: float):
+    """Update a stats accumulator (in place) with one closed trade's P&L."""
+    stats["trades"] += 1
+    if pnl >= 0:
+        stats["wins"]       += 1
+        stats["gross_win"]  += pnl
+    else:
+        stats["losses"]     += 1
+        stats["gross_loss"] += abs(pnl)
+
+
+def stats_summary_line(stats: dict, balance: float, start_balance: float) -> str:
+    """Formats a running-session stats block for console printing."""
+    trades = stats["trades"]
+    win_rate = (stats["wins"] / trades * 100) if trades else 0.0
+    avg_win  = (stats["gross_win"]  / stats["wins"])   if stats["wins"]   else 0.0
+    avg_loss = (stats["gross_loss"] / stats["losses"]) if stats["losses"] else 0.0
+    net_pnl  = balance - start_balance
+    bar = "━" * 30
+    return (f"{bar} SESSION STATS {bar}\n"
+            f"Trades: {trades}   Win rate: {win_rate:.1f}%   "
+            f"Avg win: ${avg_win:.2f}   Avg loss: ${avg_loss:.2f}\n"
+            f"Balance: ${balance:,.2f}   Net P&L: {net_pnl:+,.2f}\n"
+            f"{bar}{'━' * 15}{bar}")
+
+
+def preview_rr_string(candle, pool_high, pool_low,
+                       sl_buffer_pct: float = SL_BUFFER_PCT, min_wick_frac: float = 0.10) -> str:
+    """Live 'what-if' R:R preview for both directions off the current candle, shown while
+    WATCHING. Only shows a side's number when that side's wick is at least min_wick_frac
+    of the candle's range — otherwise a strong trend candle (marubozu, near-zero wick)
+    produces a near-zero hypothetical risk and an absurdly inflated, meaningless R:R,
+    since it's using a candle that could never actually trigger a real sweep on that side."""
+    if pool_high is None or pool_low is None:
+        return ""
+    c_hi, c_lo = float(candle["high"]), float(candle["low"])
+    c_op, c_cl = float(candle["open"]), float(candle["close"])
+    rng = c_hi - c_lo
+    if rng <= 0:
+        return ""
+    upper_wick = c_hi - max(c_op, c_cl)
+    lower_wick = min(c_op, c_cl) - c_lo
+
+    if upper_wick / rng >= min_wick_frac:
+        sl_s, tp_s = compute_stop_target("SHORT", c_hi, c_lo, pool_high, pool_low, sl_buffer_pct)
+        short_str = f"SHORT@high 1:{compute_rr(c_cl, sl_s, tp_s):.1f}"
+    else:
+        short_str = "SHORT@high n/a"
+
+    if lower_wick / rng >= min_wick_frac:
+        sl_l, tp_l = compute_stop_target("LONG", c_hi, c_lo, pool_high, pool_low, sl_buffer_pct)
+        long_str = f"LONG@low 1:{compute_rr(c_cl, sl_l, tp_l):.1f}"
+    else:
+        long_str = "LONG@low n/a"
+
+    return f"  preview: {short_str} · {long_str}"
 
 
 # ── Crypto sweep-reversal loop ────────────────────────────────────────────────
@@ -213,6 +461,7 @@ def run_crypto_sweep():
 
     exchange = ccxt.coinbase({"enableRateLimit": True})
     paper    = PaperTrader(CRYPTO_BALANCE)
+    ensure_test_sheet()
 
     pools        = {s: {"high": None, "low": None} for s in CRYPTO_SYMBOLS}
     sl_levels    = {s: None for s in CRYPTO_SYMBOLS}
@@ -220,6 +469,9 @@ def run_crypto_sweep():
     trade_states = {s: "RETIRED" for s in CRYPTO_SYMBOLS}   # forces a pool recalc on the first tick
     last_recalc  = {s: 0.0 for s in CRYPTO_SYMBOLS}
     live_prices  = {s: 0.0 for s in CRYPTO_SYMBOLS}
+    entry_times  = {s: None for s in CRYPTO_SYMBOLS}   # so the chart can anchor the entry zone box precisely
+    stats        = new_stats()   # combined across all symbols
+    last_stats_print = 0.0
 
     print(f"[CRYPTO] 1H/1M Sweep-Reversal on "
           f"{', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} | "
@@ -243,14 +495,30 @@ def run_crypto_sweep():
 
                 pool_high = pools[symbol]["high"]
                 pool_low  = pools[symbol]["low"]
-                df_1m  = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "1m", limit=3))
+                # limit=10, not 3: thin pairs (AVAX/POL/ADA) often have minutes with
+                # zero trades, and Coinbase simply omits those candles — asking for 10
+                # returns the last 10 candles that EXIST, so we nearly always get the
+                # ≥2 closed candles needed instead of skipping the whole tick.
+                df_1m  = ohlcv_to_df(exchange.fetch_ohlcv(symbol, "1m", limit=10))
+                if len(df_1m) < 2:
+                    print(f"[{base}] ⏭ Skipping tick — exchange returned only "
+                          f"{len(df_1m)} 1m candle(s)")
+                    continue
                 candle = df_1m.iloc[-2]   # last CLOSED candle — iloc[-1] is still forming
+                prev_candle = df_1m.iloc[-3] if len(df_1m) >= 3 else None
                 price  = float(candle["close"])
                 live_prices[symbol] = price
                 held = paper.get_position(symbol)
 
-                print(f"[{base}] {ts}  ${price:,.2f}  pool_high=${pool_high}  "
-                      f"pool_low=${pool_low}  state={trade_states[symbol]}")
+                candle_type = indicators.classify_candle(candle, prev_candle)
+                dist_high = f"(→{(pool_high - price) / price * 100:+.1f}%)" if pool_high else ""
+                dist_low  = f"(→{(price - pool_low) / price * 100:+.1f}%)" if pool_low else ""
+                preview = (preview_rr_string(candle, pool_high, pool_low)
+                           if trade_states[symbol] == "WATCHING" else "")
+
+                print(f"[{base}] {ts}  ${price:,.2f}  pool_high=${pool_high}{dist_high}  "
+                      f"pool_low=${pool_low}{dist_low}")
+                print(f"[{base}]   candle={candle_type}  state={trade_states[symbol]}{preview}")
 
                 # ── Manage an open trade ────────────────────────────────────────
                 if held != 0:
@@ -258,24 +526,43 @@ def run_crypto_sweep():
                     tp = tp_levels[symbol]
                     is_long = held > 0
                     entry   = paper.entry_prices.get(symbol, price)
+                    # Wick-based, not close-based: a real stop/limit order fills the
+                    # instant price TOUCHES the level, it doesn't wait for the candle
+                    # to close past it. Check the candle's high/low, not just its close.
+                    c_high, c_low = float(candle["high"]), float(candle["low"])
                     hit = None
-                    if is_long and price <= sl: hit = "SL"
-                    elif is_long and price >= tp: hit = "TP"
-                    elif not is_long and price >= sl: hit = "SL"
-                    elif not is_long and price <= tp: hit = "TP"
+                    if is_long and (price <= sl or c_low <= sl): hit = "SL"
+                    elif is_long and (price >= tp or c_high >= tp): hit = "TP"
+                    elif not is_long and (price >= sl or c_high >= sl): hit = "SL"
+                    elif not is_long and (price <= tp or c_low <= tp): hit = "TP"
 
                     if hit:
+                        # Fill at the level that was crossed, not wherever price
+                        # happens to be polled after — that's where the order actually fills.
+                        fill = sl if hit == "SL" else tp
                         if is_long:
-                            paper.sell(symbol, abs(held), price)
-                            pnl = (price - entry) * abs(held)
+                            paper.sell(symbol, abs(held), fill)
+                            pnl = (fill - entry) * abs(held)
                         else:
-                            paper.buy(symbol, abs(held), price)
-                            pnl = (entry - price) * abs(held)
+                            paper.buy(symbol, abs(held), fill)
+                            pnl = (entry - fill) * abs(held)
                         icon = "\U0001F7E2" if hit == "TP" else "\U0001F534"
-                        print(f"[{base}] {icon} {hit} hit @ ${price:,.2f}  "
+                        print(f"[{base}] {icon} {hit} hit @ ${fill:,.2f}  "
                               f"P&L: ${pnl:+.2f}  Balance: ${paper.balance:,.2f}")
+                        record_trade_result(stats, pnl)
+                        alert(f"{icon} {hit} hit — {base}",
+                              f"@ ${fill:,.4f}  P&L ${pnl:+.2f}  Balance ${paper.balance:,.2f}",
+                              sound="Glass" if hit == "TP" else "Basso",
+                              speak=f"{base} {'take profit' if hit == 'TP' else 'stop loss'} hit. "
+                                    f"{'Profit' if pnl >= 0 else 'Loss'} {abs(pnl):.0f} dollars")
+                        chart = render_crypto_test_chart(exchange, symbol, is_long,
+                                                          entry, sl, tp, entry_times[symbol])
+                        log_test_trade(base, is_long, entry, fill, abs(held), pnl, sl, tp,
+                                        entry_times[symbol], f"sweep {'LONG' if is_long else 'SHORT'}",
+                                        chart)
                         sl_levels[symbol] = None
                         tp_levels[symbol] = None
+                        entry_times[symbol] = None
                         trade_states[symbol] = "RETIRED"   # stays retired until the next 1H recalc
                         last_recalc[symbol] = now   # restart the recalc countdown fresh from this close —
                         # never let a recalc that was merely deferred by IN_TRADE fire immediately on exit
@@ -302,15 +589,40 @@ def run_crypto_sweep():
                     print(f"[{base}] ⏭ Sweep {direction} skipped — position size rounds to zero")
                     continue
 
+                # Daily total-notional cap — shared across ALL symbols, not released
+                # when a trade closes. Trim to whatever's left rather than skipping
+                # outright, so a smaller trade can still use up the day's budget.
+                notional = qty * price
+                daily_remaining = paper.check_daily_cap(notional, DAILY_NOTIONAL_CAP)
+                if daily_remaining <= 0:
+                    print(f"[{base}] ⏭ Sweep {direction} skipped — daily "
+                          f"${DAILY_NOTIONAL_CAP:.0f} cap reached, resets next UTC day")
+                    continue
+                if notional > daily_remaining:
+                    qty = math.floor((daily_remaining / price) * 1e6) / 1e6
+                    notional = qty * price
+                    if qty <= 0 or notional < 10.0:   # dust floor — not worth opening
+                        print(f"[{base}] ⏭ Sweep {direction} skipped — only "
+                              f"${daily_remaining:.2f} left of daily ${DAILY_NOTIONAL_CAP:.0f} cap")
+                        continue
+                    print(f"[{base}] ⚠️ Position trimmed to ${notional:.2f} — "
+                          f"daily ${DAILY_NOTIONAL_CAP:.0f} cap has ${daily_remaining:.2f} left")
+
                 if direction == "SHORT":
                     paper.sell(symbol, qty, price)
                 else:
                     paper.buy(symbol, qty, price)
+                paper.record_notional(notional)
                 sl_levels[symbol]    = sl
                 tp_levels[symbol]    = tp
+                entry_times[symbol]  = datetime.now(timezone.utc)
                 trade_states[symbol] = "IN_TRADE"
                 print(f"[{base}] ⚡ SWEEP {direction} @ ${price:,.2f}  SL=${sl:,.2f}  "
                       f"TP=${tp:,.2f}  R:R=1:{rr:.1f}  qty={qty:.6f}")
+                alert(f"⚡ SWEEP {direction} — {base}",
+                      f"@ ${price:,.4f}  SL ${sl:,.4f}  TP ${tp:,.4f}  R:R 1:{rr:.1f}",
+                      sound="Submarine",
+                      speak=f"{base} sweep {direction.lower()} entry")
 
             except Exception as e:
                 print(f"[{base}] Error: {e}")
@@ -319,8 +631,18 @@ def run_crypto_sweep():
             f"{k.split('/')[0]}={'L' if v>0 else 'S'}{abs(v):.4f}"
             for k, v in paper.positions.items()
         ) or "flat"
-        print(f"  [CRYPTO] Balance: ${paper.balance:,.2f}  |  {pos_str}\n")
-        save_test_state(paper, sl_levels, tp_levels, live_prices, pools, trade_states)
+        _equity = paper.balance + sum(
+            (q * live_prices.get(s, 0.0)) if q > 0
+            else (paper.entry_prices.get(s, live_prices.get(s, 0.0)) - live_prices.get(s, 0.0)) * abs(q)
+            for s, q in paper.positions.items() if abs(q) > 1e-9
+        )
+        print(f"  [CRYPTO] Cash: ${paper.balance:,.2f}  |  Equity: ${_equity:,.2f}  |  {pos_str}\n")
+
+        if now - last_stats_print >= POOL_RECALC_SECONDS:
+            print(stats_summary_line(stats, paper.balance, CRYPTO_BALANCE))
+            last_stats_print = now
+
+        save_test_state(paper, sl_levels, tp_levels, live_prices, pools, trade_states, stats, entry_times)
         time.sleep(POLL_SECONDS)
 
 
@@ -333,6 +655,8 @@ def run_stock_sweep():
         from lumibot.brokers import Alpaca
         from lumibot.traders import Trader
 
+        _quiet_lumibot_noise()   # lumibot's handlers exist once it's imported
+
         class SweepTestBot(Strategy):
             def initialize(self):
                 self.sleeptime    = "1M"
@@ -341,10 +665,19 @@ def run_stock_sweep():
                 self.tp_order     = None
                 self.stop_loss    = None
                 self.take_profit  = None
+                self.entry_price  = None
+                self.entry_time   = None
                 self.pool_high    = None
                 self.pool_low     = None
                 self.last_recalc  = None   # datetime of the last 1H pool recalculation
                 self.armed        = False
+                # NOTE: named session_stats, not stats — lumibot's own Strategy base
+                # class already defines a read-only `stats` property; assigning
+                # self.stats crashes with "property 'stats' has no setter".
+                self.session_stats    = new_stats()
+                self.last_stats_print = None
+                self.start_cash       = None   # captured lazily on first tick
+                ensure_test_sheet()
 
             def _cancel_resting_orders(self):
                 for attr in ("sl_order", "tp_order"):
@@ -370,6 +703,8 @@ def run_stock_sweep():
 
                 sl = self.stop_loss
                 tp = self.take_profit
+                self.entry_price = price
+                self.entry_time  = datetime.now(timezone.utc)
                 try:
                     oco_order = self.create_order(
                         asset, abs(quantity), Order.OrderSide.SELL,
@@ -384,6 +719,10 @@ def run_stock_sweep():
                         f"[{STOCK_SYMBOL}] \U0001F6D1\U0001F3AF OCO order placed — SL @ ${sl:.2f}  TP @ ${tp:.2f}",
                         color="yellow"
                     )
+                    alert(f"⚡ SWEEP LONG — {STOCK_SYMBOL}",
+                          f"@ ${price:.2f}  SL ${sl:.2f}  TP ${tp:.2f}",
+                          sound="Submarine",
+                          speak=f"{STOCK_SYMBOL} sweep long entry")
                 except Exception as e:
                     self.log_message(f"[{STOCK_SYMBOL}] OCO order failed: {e}", color="red")
 
@@ -392,6 +731,8 @@ def run_stock_sweep():
                 price    = self.get_last_price(STOCK_SYMBOL)
                 position = self.get_position(asset)
                 now      = self.get_datetime()
+                if self.start_cash is None:
+                    self.start_cash = self.get_cash()
 
                 if not (position and abs(position.quantity) > 0) and (
                     self.last_recalc is None or (now - self.last_recalc).total_seconds() >= POOL_RECALC_SECONDS
@@ -408,41 +749,102 @@ def run_stock_sweep():
                                 f"pool_high=${self.pool_high:.2f}  pool_low=${self.pool_low:.2f}"
                             )
 
-                sl_str = f"  SL=${self.stop_loss:.2f}  TP=${self.take_profit:.2f}" if self.stop_loss else ""
+                # Fetch the current 1m candle once per tick — used for logging (candle
+                # classification, R:R preview) regardless of position state, and for
+                # entry detection below when flat.
+                candle, prev_candle = None, None
+                bars_1m = self.get_historical_prices(asset, 3, "1 minute")
+                if bars_1m is not None:
+                    df_1m = bars_1m.pandas_df
+                    if len(df_1m) >= 2:
+                        candle      = df_1m.iloc[-2]   # last CLOSED candle — iloc[-1] is still forming
+                        prev_candle = df_1m.iloc[-3] if len(df_1m) >= 3 else None
+
+                has_position = bool(position and abs(position.quantity) > 0)
+                sl_str      = f"  SL=${self.stop_loss:.2f}  TP=${self.take_profit:.2f}" if self.stop_loss else ""
+                dist_high   = f"(→{(self.pool_high - price) / price * 100:+.1f}%)" if self.pool_high else ""
+                dist_low    = f"(→{(price - self.pool_low) / price * 100:+.1f}%)" if self.pool_low  else ""
+                candle_type = indicators.classify_candle(candle, prev_candle) if candle is not None else "n/a"
+                preview = ""
+                if self.armed and not has_position and self.pool_high is not None and candle is not None:
+                    preview = preview_rr_string(candle, self.pool_high, self.pool_low)
                 self.log_message(
-                    f"[{STOCK_SYMBOL}] ${price:.2f}  pool_high={self.pool_high}  "
-                    f"pool_low={self.pool_low}  armed={self.armed}{sl_str}"
+                    f"[{STOCK_SYMBOL}] ${price:.2f}  pool_high={self.pool_high}{dist_high}  "
+                    f"pool_low={self.pool_low}{dist_low}{sl_str}"
                 )
+                self.log_message(f"[{STOCK_SYMBOL}]   candle={candle_type}  armed={self.armed}{preview}")
+
+                if self.last_stats_print is None or \
+                   (now - self.last_stats_print).total_seconds() >= POOL_RECALC_SECONDS:
+                    self.log_message(stats_summary_line(self.session_stats, self.get_cash(), self.start_cash))
+                    self.last_stats_print = now
 
                 # Manual SL/TP check — closes the position if the resting broker order
                 # hasn't filled yet by the time we poll (keeps this in sync either way).
+                # Wick-aware like the crypto side: a real stop/limit order fills the
+                # instant price touches the level, not when a candle closes past it.
                 if position and position.quantity > 0 and self.stop_loss and self.take_profit:
-                    if price <= self.stop_loss or price >= self.take_profit:
-                        label = "SL" if price <= self.stop_loss else "TP"
+                    c_low  = float(candle["low"])  if candle is not None else price
+                    c_high = float(candle["high"]) if candle is not None else price
+                    sl_hit = price <= self.stop_loss or c_low  <= self.stop_loss
+                    tp_hit = price >= self.take_profit or c_high >= self.take_profit
+                    if sl_hit or tp_hit:
+                        label = "SL" if sl_hit else "TP"
+                        fill  = self.stop_loss if sl_hit else self.take_profit
+                        pnl   = (fill - self.entry_price) * position.quantity if self.entry_price else None
+                        # capture before _cancel_resting_orders() wipes them — the ledger needs both
+                        sl_at_close, tp_at_close = self.stop_loss, self.take_profit
                         self._cancel_resting_orders()
                         self.submit_order(
                             self.create_order(asset, position.quantity, Order.OrderSide.SELL))
+                        pnl_str = f"  P&L: ${pnl:+.2f}" if pnl is not None else ""
                         self.log_message(
-                            f"[{STOCK_SYMBOL}] {'🔴' if label=='SL' else '🟢'} {label} hit @ ${price:.2f}",
+                            f"[{STOCK_SYMBOL}] {'🔴' if label=='SL' else '🟢'} {label} hit @ ${fill:.2f}{pnl_str}",
                             color="red" if label == "SL" else "green")
+                        if pnl is not None:
+                            record_trade_result(self.session_stats, pnl)
+                        alert(f"{'🟢 TP' if label == 'TP' else '🔴 SL'} hit — {STOCK_SYMBOL}",
+                              f"@ ${fill:.2f}" + (f"  P&L ${pnl:+.2f}" if pnl is not None else ""),
+                              sound="Glass" if label == "TP" else "Basso",
+                              speak=f"{STOCK_SYMBOL} {'take profit' if label == 'TP' else 'stop loss'} hit"
+                                    + (f". {'Profit' if pnl >= 0 else 'Loss'} {abs(pnl):.0f} dollars"
+                                       if pnl is not None else ""))
+                        # Ledger + chart — real TradingView screenshot first (same system
+                        # as the main stock bot), self-rendered chart from Alpaca bars as
+                        # fallback. Fail-soft: never blocks the trading loop.
+                        try:
+                            entry_for_log = self.entry_price if self.entry_price else fill
+                            chart = render_stock_tradingview(
+                                STOCK_SYMBOL, "LONG", entry_for_log, sl_at_close or fill,
+                                tp_at_close or fill, 1, self.entry_time,
+                                datetime.now(timezone.utc))
+                            if not chart:
+                                bars_c = self.get_historical_prices(asset, 200, "5 minutes")
+                                df_c = bars_c.pandas_df if bars_c is not None else None
+                                chart = render_trade_chart(df_c, STOCK_SYMBOL, "LONG",
+                                                            entry_for_log, sl_at_close or fill,
+                                                            tp_at_close or fill, 1, "5m",
+                                                            self.entry_time)
+                            log_test_trade(STOCK_SYMBOL, True, entry_for_log, fill,
+                                            float(position.quantity),
+                                            pnl if pnl is not None else 0.0,
+                                            sl_at_close, tp_at_close,
+                                            self.entry_time, "sweep LONG", chart)
+                        except Exception as e:
+                            self.log_message(f"[{STOCK_SYMBOL}] Test ledger log failed: {e}", color="red")
+                        self.entry_time  = None
+                        self.entry_price = None
                         self.armed = False   # retired until the next 1H recalc
                         self.last_recalc = now   # restart the recalc countdown fresh from this close —
                         # never let a recalc that was merely deferred by an open position fire immediately on exit
                         return
 
-                if position and abs(position.quantity) > 0:
+                if has_position:
                     return   # already in a trade — nothing else to do this tick
 
-                if not self.armed or self.pool_high is None:
+                if not self.armed or self.pool_high is None or candle is None:
                     return
 
-                bars_1m = self.get_historical_prices(asset, 3, "1 minute")
-                if bars_1m is None:
-                    return
-                df_1m = bars_1m.pandas_df
-                if len(df_1m) < 2:
-                    return
-                candle = df_1m.iloc[-2]   # last CLOSED candle — iloc[-1] is still forming
                 entry_price = float(candle["close"])
                 direction = detect_sweep(float(candle["high"]), float(candle["low"]),
                                           float(candle["close"]), self.pool_high, self.pool_low)
@@ -489,16 +891,22 @@ def run_stock_sweep():
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    crypto_only = "--crypto-only" in sys.argv
+
     print("=" * 65)
-    print("1H/1M SWEEP-REVERSAL TEST BOT — STOCKS + CRYPTO")
-    print(f"  Stocks : {STOCK_SYMBOL} via Alpaca paper  (long-only, fires at NYSE open)")
+    if crypto_only:
+        print("1H/1M SWEEP-REVERSAL TEST BOT — CRYPTO ONLY")
+    else:
+        print("1H/1M SWEEP-REVERSAL TEST BOT — STOCKS + CRYPTO")
+        print(f"  Stocks : {STOCK_SYMBOL} via Alpaca paper  (long-only, fires at NYSE open)")
     print(f"  Crypto : {', '.join(s.split('/')[0] for s in CRYPTO_SYMBOLS)} via Coinbase  (24/7, long+short)")
     print(f"  Pools  : 1H, {POOL_LOOKBACK_1H}-candle lookback  |  Entries: 1M sweep+reversal")
     print(f"  Risk   : {RISK_PCT*100:.0f}% per trade  |  Min R:R: 1:{MIN_RR:.0f}")
     print("=" * 65)
 
-    # Stock bot runs in a background thread (lumibot blocks internally)
-    threading.Thread(target=run_stock_sweep, daemon=True).start()
+    if not crypto_only:
+        # Stock bot runs in a background thread (lumibot blocks internally)
+        threading.Thread(target=run_stock_sweep, daemon=True).start()
 
     # Crypto bot runs in the main thread
     run_crypto_sweep()

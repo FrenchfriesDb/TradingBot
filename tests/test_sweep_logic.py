@@ -3,6 +3,7 @@ import pytest
 
 from test_bot import (
     compute_pools, detect_sweep, compute_stop_target, compute_rr, size_position,
+    PaperTrader,
 )
 
 
@@ -69,10 +70,50 @@ def test_compute_rr_zero_risk_returns_zero():
 
 
 def test_size_position_risks_exact_percent_of_balance():
-    qty = size_position(balance=10_000, risk_pct=0.01, entry=100, sl=95)
+    # entry=40 (not 100) keeps notional ($800) well under the 10% notional cap
+    # ($1,000 on a $10k balance) — isolates the risk-based formula from capping,
+    # which has its own dedicated test below.
+    qty = size_position(balance=10_000, risk_pct=0.01, entry=40, sl=35)
     # risk_per_unit = 5, risk_dollars = 100 -> qty = 20
     assert qty == pytest.approx(20.0)
 
 
 def test_size_position_zero_when_risk_non_positive():
     assert size_position(balance=10_000, risk_pct=0.01, entry=100, sl=100) == 0.0
+
+
+def test_size_position_caps_notional():
+    # Tight stop on an expensive coin: uncapped risk-sizing would demand ~5x the
+    # account in notional ($24.6k on $5k). The cap must hold it to 10% of balance.
+    qty = size_position(balance=5_000, risk_pct=0.01, entry=60_000, sl=59_880)
+    assert qty * 60_000 <= 5_000 * 0.10 + 1e-6
+    assert qty == pytest.approx(5_000 * 0.10 / 60_000, rel=1e-3)
+
+
+def test_daily_cap_full_room_on_first_trade():
+    pt = PaperTrader(balance=5_000)
+    assert pt.check_daily_cap(notional_needed=150, daily_cap_dollars=200) == 200
+
+
+def test_daily_cap_shrinks_after_recording():
+    pt = PaperTrader(balance=5_000)
+    pt.record_notional(120)
+    assert pt.check_daily_cap(notional_needed=150, daily_cap_dollars=200) == pytest.approx(80)
+
+
+def test_daily_cap_not_released_when_a_trade_closes():
+    # record_notional tracks $ OPENED today, not concurrent exposure — a closed
+    # trade must NOT free up room, matching binance_bot.py's PaperTrader semantics.
+    pt = PaperTrader(balance=5_000)
+    pt.record_notional(200)   # one trade opened for the full daily cap
+    assert pt.check_daily_cap(notional_needed=10, daily_cap_dollars=200) == 0
+
+
+def test_daily_cap_resets_on_a_new_utc_day():
+    pt = PaperTrader(balance=5_000)
+    pt.record_notional(200)
+    assert pt.check_daily_cap(notional_needed=10, daily_cap_dollars=200) == 0
+    # Simulate the clock rolling over to a new UTC day.
+    import datetime as _dt
+    pt.daily_date = _dt.date(2000, 1, 1)
+    assert pt.check_daily_cap(notional_needed=10, daily_cap_dollars=200) == 200

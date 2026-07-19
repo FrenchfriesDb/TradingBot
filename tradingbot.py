@@ -9,6 +9,13 @@ os.environ.setdefault("LUMIBOT_TELEMETRY", "false")
 os.environ.setdefault("LUMIBOT_LOG_LEVEL", "ERROR")
 
 import logging
+import warnings
+
+# alpaca-py's trading-stream module still calls asyncio.iscoroutinefunction, which
+# Python 3.12+ deprecates (removal slated for 3.16). It's alpaca's code, not ours,
+# fixed in their newer releases — purely cosmetic here, so silence just that one.
+warnings.filterwarnings("ignore", message=".*iscoroutinefunction.*",
+                        category=DeprecationWarning)
 
 # ── Quiet the self-healing network churn so the console stays readable ──────────
 # Lumibot auto-reconnects the Alpaca order-stream websocket; the giant tracebacks and
@@ -35,18 +42,73 @@ class _QuietFilter(logging.Filter):
 
 _QUIET = _QuietFilter()
 
+# ── Dedupe "Skipping malformed order X" spam ──────────────────────────────────
+# Alpaca keeps old bracket/OCO order history with no child order prices. Lumibot's
+# own _parse_broker_order (alpaca.py) catches this INTERNALLY and calls
+# logger.warning(...) itself before returning None — it never raises, so the
+# try/except patch below (which assumes it raises) never actually engages for this
+# case. Every broker sync re-parses the same ~30 dead orders and re-warns on all of
+# them, forever, on whatever schedule lumibot syncs on (independent of market hours
+# or on_trading_iteration). Dedupe by order ID at the log-record level instead: each
+# ID's warning gets through once, then stays silent for the rest of the run.
+import re as _re
+_MALFORMED_ORDER_RE = _re.compile(r"Skipping malformed order (\S+)")
+_seen_malformed_order_ids: set = set()
+
+class _DedupMalformedOrderFilter(logging.Filter):
+    # Dead legacy bracket/OCO orders in the account history each warn once per run
+    # under pure per-ID dedup — with ~40 of them that's still a 40-line wall at every
+    # startup sync. Show the first few as a heads-up, then suppress the rest.
+    _MAX_SHOWN = 3
+
+    def filter(self, record):
+        try:
+            m = _MALFORMED_ORDER_RE.search(record.getMessage())
+        except Exception:
+            return True
+        if not m:
+            return True
+        order_id = m.group(1)
+        if order_id in _seen_malformed_order_ids:
+            return False
+        _seen_malformed_order_ids.add(order_id)
+        if len(_seen_malformed_order_ids) == self._MAX_SHOWN + 1:
+            print("[LOG] More malformed legacy orders skipped — suppressing the rest "
+                  "(dead bracket/OCO orders from old test runs; lumibot ignores them safely).",
+                  flush=True)
+        return len(_seen_malformed_order_ids) <= self._MAX_SHOWN
+
+_DEDUP_MALFORMED = _DedupMalformedOrderFilter()
+
+def _add_filters(logger_obj):
+    for f in (_QUIET, _DEDUP_MALFORMED):
+        if f not in logger_obj.filters:
+            logger_obj.addFilter(f)
+    for h in logger_obj.handlers:
+        for f in (_QUIET, _DEDUP_MALFORMED):
+            if f not in h.filters:
+                h.addFilter(f)
+
 def quiet_logging():
     """(Re)apply noise suppression. Safe to call repeatedly — call again after Lumibot
     has set up its own log handlers so the handler-level filter actually takes effect."""
     # Suppress all lumibot INFO/WARNING at the logger level — telemetry, balance
     # polling errors, and websocket churn are all INFO; real failures are ERROR+.
-    logging.getLogger("lumibot").setLevel(logging.ERROR)
-    root = logging.getLogger()
-    if _QUIET not in root.filters:
-        root.addFilter(_QUIET)
-    for h in root.handlers:
-        if _QUIET not in h.filters:
-            h.addFilter(_QUIET)
+    lumibot_logger = logging.getLogger("lumibot")
+    lumibot_logger.setLevel(logging.ERROR)
+    # Lumibot attaches its OWN console/file handlers directly to the "lumibot" logger
+    # (not the true root) — a filter only on root's handlers never sees those records
+    # at all, since they're already printed by lumibot's own handler before propagating.
+    _add_filters(lumibot_logger)
+    _add_filters(logging.getLogger())
+    # Third-party libraries lumibot depends on (e.g. alpaca-py's own trading-stream
+    # websocket reconnect logging) use their OWN logger namespace ("alpaca.trading.*",
+    # not "lumibot"), which propagates straight to the true root. With no handler left
+    # on root, Python's own logging.lastResort fallback prints it raw — no formatting,
+    # and it never passes through either filter above. Filter that fallback directly.
+    for f in (_QUIET, _DEDUP_MALFORMED):
+        if f not in logging.lastResort.filters:
+            logging.lastResort.addFilter(f)
     # The big tracebacks come from these two loggers — mute them; auto-reconnect handles it.
     logging.getLogger("websockets").setLevel(logging.CRITICAL)
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)

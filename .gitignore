@@ -7,3 +7,20 @@ models/
 *.sqlite
 google_credentials.json
 *.credentials.json
+charts/
+binance_bot.out
+nohup.out
+
+# local environments / tool state
+.venv/
+.venv311/
+.lumibot/
+.claude/
+
+# runtime state files (rewritten every few minutes by the bots)
+crypto_state.json
+strategy_state.json
+test_state.json
+
+# macOS Finder duplicates ("foo 2.py")
+* 2.*

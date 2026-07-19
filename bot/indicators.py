@@ -191,15 +191,24 @@ def detect_equal_highs(df, lookback=40, tolerance_pct=0.0015, min_touches=2):
     return _detect_equal_wicks(df, "high", lookback, tolerance_pct, min_touches)
 
 
-def detect_trendline(df, lookback=50, swing_window=2, min_points=3):
+def detect_trendline(df, lookback=50, swing_window=4, min_points=3):
     """
-    Detects the dominant DIAGONAL trendline so it can be drawn on the chart:
-      • ascending  — ≥3 strictly higher swing LOWS  → rising support under price
-      • descending — ≥3 strictly lower  swing HIGHS → falling resistance over price
+    Detects the DOMINANT diagonal trendline so it can be drawn on the chart:
+      • ascending  — the longest run of strictly higher swing LOWS  → rising support
+      • descending — the longest run of strictly lower  swing HIGHS → falling resistance
     Diagonal structure the horizontal EQH/EQL detector can't see.
 
+    swing_window=4 means a candle must be more extreme than the 4 candles on either
+    side of it to count as a swing point — wide enough that small intra-move noise
+    doesn't get flagged as its own swing, so only genuine structural pivots qualify.
+
+    Rather than only checking the most recent min_points swings, this scans the whole
+    lookback for the longest monotonic run in each direction and returns whichever run
+    covers more swing points (ties broken by price range covered) — so a big multi-hour
+    rally/selloff wins over a small recent pullback that happens to sit at the tail end.
+
     Returns (found, kind, (t1, p1), (t2, p2)) — anchors as (unix_seconds, price) for the
-    first and last swing on the line. (False, None, None, None) if no clean trendline.
+    first and last swing on the winning line. (False, None, None, None) if no clean trendline.
     """
     if df is None or len(df) < (2 * swing_window + 1):
         return False, None, None, None
@@ -217,16 +226,36 @@ def detect_trendline(df, lookback=50, swing_window=2, min_points=3):
         if hi > max(others_hi):
             highs.append((t, hi))
 
-    # Ascending support: the last min_points swing lows are strictly rising
-    if len(lows) >= min_points:
-        tail = lows[-min_points:]
-        if all(tail[k][1] > tail[k - 1][1] for k in range(1, len(tail))):
-            return True, 'ascending', tail[0], tail[-1]
-    # Descending resistance: the last min_points swing highs are strictly falling
-    if len(highs) >= min_points:
-        tail = highs[-min_points:]
-        if all(tail[k][1] < tail[k - 1][1] for k in range(1, len(tail))):
-            return True, 'descending', tail[0], tail[-1]
+    def longest_monotonic_run(points, ascending):
+        """Longest contiguous run of strictly increasing (ascending) or decreasing
+        (descending) points, at least min_points long. Returns (run, price_range)."""
+        best_run, best_range = None, 0.0
+        if not points:
+            return best_run, best_range
+        current = [points[0]]
+        for k in range(1, len(points)):
+            keeps_direction = (points[k][1] > points[k - 1][1]) if ascending \
+                          else (points[k][1] < points[k - 1][1])
+            current = current + [points[k]] if keeps_direction else [points[k]]
+            if len(current) >= min_points:
+                price_range = abs(current[-1][1] - current[0][1])
+                if best_run is None or len(current) > len(best_run) or \
+                   (len(current) == len(best_run) and price_range > best_range):
+                    best_run, best_range = current, price_range
+        return best_run, best_range
+
+    asc_run,  asc_range  = longest_monotonic_run(lows,  ascending=True)
+    desc_run, desc_range = longest_monotonic_run(highs, ascending=False)
+
+    if asc_run and desc_run:
+        # More swing points covered wins; a tie is broken by which move spans more price.
+        if len(asc_run) > len(desc_run) or (len(asc_run) == len(desc_run) and asc_range >= desc_range):
+            return True, 'ascending', asc_run[0], asc_run[-1]
+        return True, 'descending', desc_run[0], desc_run[-1]
+    if asc_run:
+        return True, 'ascending', asc_run[0], asc_run[-1]
+    if desc_run:
+        return True, 'descending', desc_run[0], desc_run[-1]
     return False, None, None, None
 
 def detect_consolidation(df, lookback=20):

@@ -48,7 +48,7 @@ HTML = r"""<!DOCTYPE html>
 <div id="header">
   <h1>⚡ DEBBIE-LA LIVE CHART</h1>
   <select id="botSel">
-    <option value="test">test_bot  (EMA 9/21)</option>
+    <option value="test">test_bot  (1H/1M Sweep)</option>
     <option value="smc">binance_bot  (SMC)</option>
     <option value="strat">tradingbot  (SMC/Alpaca)</option>
   </select>
@@ -203,6 +203,22 @@ function drawAnalysis(sm){
   if(sm.eqh_level) aLines.push(candles.createPriceLine({price:sm.eqh_level, color:'#42a5f5',
     lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true,
     title:`EQH ${sm.eqh_touch||''}`.trim()}));
+}
+
+// ── test_bot's 1H liquidity pools: the two swing high/low levels it's watching
+// for a sweep+reversal. Only meaningful while flat — cleared once a position opens.
+let poolLines = [];
+function clearPools(){ poolLines.forEach(l=>{try{candles.removePriceLine(l)}catch(e){}}); poolLines=[]; }
+
+function drawPools(pool){
+  clearPools();
+  if(!pool || pool.state==='IN_TRADE') return;
+  if(pool.pool_high) poolLines.push(candles.createPriceLine({price:pool.pool_high, color:'#ff7043',
+    lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true,
+    title:'1H HIGH'}));
+  if(pool.pool_low) poolLines.push(candles.createPriceLine({price:pool.pool_low, color:'#42a5f5',
+    lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true,
+    title:'1H LOW'}));
 }
 
 function drawZones(times, entry, sl, tp, isLong, entryTime){
@@ -360,10 +376,13 @@ function updateSymSel(state){
   }).join('');
   if(prev&&sorted.includes(prev)) sel.value=prev;
 
-  const bal=data?.balance, start=data?.start_balance;
+  // Prefer equity (cash + open position value) over raw cash balance — a large open
+  // position deducts its cost from cash, so raw balance reads like a huge loss when
+  // the money is merely deployed. Older state files without equity fall back to balance.
+  const bal=data?.equity ?? data?.balance, start=data?.start_balance;
   const pnl=bal&&start?(bal-start):null;
   document.getElementById('bal').textContent = bal
-    ? `  Balance: $${bal.toLocaleString(undefined,{minimumFractionDigits:2})}${pnl!=null?`  |  P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`:''}`
+    ? `  Equity: $${bal.toLocaleString(undefined,{minimumFractionDigits:2})}${pnl!=null?`  |  P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`:''}`
     : '';
 }
 
@@ -404,6 +423,7 @@ async function refresh(){
   const cur     = cdata.length ? cdata[cdata.length-1].close : pos?.current_price;
 
   const sm       = botData?.state_machine?.[sym] || null;
+  const pool     = bot==='test' ? botData?.pools?.[sym] || null : null;
   const lastTime = lastCandleTimes.length ? lastCandleTimes[lastCandleTimes.length-1] : null;
   if(pos){
     const isLong = pos.side==='LONG';
@@ -411,10 +431,12 @@ async function refresh(){
     drawZones(lastCandleTimes, pos.entry_price, pos.stop_loss, pos.take_profit, isLong,
               pos.entry_time || sm?.entry_time);
     clearAnalysis();   // position lines take over; hide the pending-zone overlay
+    clearPools();
     drawTrend(sm?.trendline, lastTime);   // keep the structural trendline visible
   } else {
     clearLines(); drawZones([],null,null,null,true);
-    drawAnalysis(sm);                      // show what the bot is watching
+    drawAnalysis(sm);                      // show what the bot is watching (SMC bot)
+    drawPools(pool);                       // show the 1H liquidity pools (test bot)
     drawTrend(sm?.trendline, lastTime);    // + the diagonal trendline
   }
   updateInfo(pos, cur);

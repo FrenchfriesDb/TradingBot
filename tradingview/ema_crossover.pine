@@ -1,0 +1,62 @@
+// ============================================================
+// Debbie-La EMA Crossover (test_bot.py)
+// Mirrors the exact logic running in test_bot.py:
+//   - EMA 9 / EMA 21 on close
+//   - LONG when EMA9 crosses above EMA21
+//   - SHORT when EMA9 crosses below EMA21
+//   - Green background = in long, red = in short
+// Use on: 5m (crypto) or 1m (SPY)
+// ============================================================
+//@version=6
+indicator("Debbie-La EMA Crossover", overlay=true)
+
+fast_len = input.int(9,  "Fast EMA", minval=1)
+slow_len = input.int(21, "Slow EMA", minval=1)
+
+ema_fast = ta.ema(close, fast_len)
+ema_slow = ta.ema(close, slow_len)
+
+bull_cross = ta.crossover(ema_fast,  ema_slow)
+bear_cross = ta.crossunder(ema_fast, ema_slow)
+
+// ── Plots ──────────────────────────────────────────────────
+plot(ema_fast, "EMA 9",  color=color.new(color.aqua,   0), linewidth=1)
+plot(ema_slow, "EMA 21", color=color.new(color.orange, 0), linewidth=2)
+
+plotshape(bull_cross, "Long entry",  location=location.belowbar,
+          color=color.lime, style=shape.triangleup,   size=size.normal)
+plotshape(bear_cross, "Short entry", location=location.abovebar,
+          color=color.red,  style=shape.triangledown, size=size.normal)
+
+// ── Position state background ──────────────────────────────
+var bool in_long  = false
+var bool in_short = false
+if bull_cross
+    in_long  := true
+    in_short := false
+if bear_cross
+    in_short := true
+    in_long  := false
+
+bgcolor(in_long  ? color.new(color.lime, 92) :
+        in_short ? color.new(color.red,  92) : na,
+        title="Position background")
+
+// ── Labels on cross ────────────────────────────────────────
+if bull_cross
+    label.new(bar_index, low,
+              "LONG\n" + str.tostring(close, "#.##"),
+              style=label.style_label_up,
+              color=color.lime, textcolor=color.black, size=size.small)
+
+if bear_cross
+    label.new(bar_index, high,
+              "SHORT\n" + str.tostring(close, "#.##"),
+              style=label.style_label_down,
+              color=color.red, textcolor=color.white, size=size.small)
+
+// ── Alerts ─────────────────────────────────────────────────
+alertcondition(bull_cross, "EMA Bull Cross",
+               "EMA9 crossed above EMA21 — LONG signal")
+alertcondition(bear_cross, "EMA Bear Cross",
+               "EMA9 crossed below EMA21 — SHORT signal")

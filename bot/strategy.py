@@ -6,6 +6,8 @@ from config import (NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALP
                     BASE_URL as ALPACA_BASE_URL, GOOGLE_SHEET_URL)
 from sheets_logger import (get_sheet_client, ensure_tabs, log_daily_snapshot, log_trade,
                             MACRO_HEADER, LEDGER_HEADER)
+from chart_renderer import render_trade_chart, render_stock_tradingview, save_chart_locally
+from github_chart_uploader import upload_chart_to_github
 import json
 import os
 import re
@@ -174,8 +176,7 @@ class DebbieLaSMC(Strategy):
         self._iter_count        = 0
 
         # ── Google Sheets logging ────────────────────────────────────────────
-        self._sheet_client      = get_sheet_client()
-        ensure_tabs(self._sheet_client, GOOGLE_SHEET_URL, {
+        ensure_tabs(get_sheet_client(), GOOGLE_SHEET_URL, {
             "Stock Macro": MACRO_HEADER, "Stock Ledger": LEDGER_HEADER,
         })
         self._sheet_log_date    = None    # UTC date of the last daily-snapshot row written
@@ -418,13 +419,52 @@ class DebbieLaSMC(Strategy):
             self.log_message(f"[{symbol}] ⚠️ Couldn't verify/re-attach protection: {e}", color="red")
 
     def _log_trade_close_to_sheet(self, symbol, is_long, entry_price, exit_price, qty, pnl):
-        """Fire-and-forget: append a completed round-trip row to the Stock Ledger tab.
-        MUST be called before _reset(symbol) — that wipes entry_price/amd_phase, which
-        this reads. sheets_logger's own functions are already fail-soft."""
+        """Fire-and-forget: append a completed round-trip row to the Stock Ledger tab,
+        including a candlestick chart of the trade hosted on GitHub (Drive hosting
+        isn't viable — service accounts have no storage quota and can't accept
+        ownership transfers) with a local charts/ save as a fallback if the GitHub
+        push fails. MUST be called before _reset(symbol) — that wipes
+        entry_price/amd_phase/stop_loss/take_profit/entry_time, which this reads.
+        sheets_logger's own functions are already fail-soft; the chart
+        render/upload is separately wrapped so a bad bars fetch, GitHub hiccup, or
+        disk error can never block the ledger row itself from being written."""
         reason = f"{self.amd_phase[symbol] or 'BOS'} {'LONG' if is_long else 'SHORT'}"
-        log_trade(self._sheet_client, GOOGLE_SHEET_URL, "Stock Ledger",
-                  datetime.now(timezone.utc).isoformat(), symbol,
-                  "LONG" if is_long else "SHORT", entry_price, exit_price, qty, pnl, reason)
+        now = datetime.now(timezone.utc)
+        entry_time = self.entry_time[symbol] or now
+        sl = self.stop_loss[symbol]
+        tp = self.take_profit[symbol]
+
+        chart_ref = None
+        try:
+            side = "LONG" if is_long else "SHORT"
+            # Preferred: screenshot of a REAL TradingView chart (their data/candles/
+            # axes) with entry/SL/TP overlaid — stock bot only, per user preference.
+            chart_path = render_stock_tradingview(symbol, side, entry_price, sl, tp,
+                                                    PAPER_LEVERAGE,
+                                                    self.entry_time[symbol], now)
+            if not chart_path:
+                # Fallback: self-rendered lightweight-charts image from Alpaca bars
+                asset = self._make_asset(symbol)
+                bars = self.get_historical_prices(asset, 200, self.timeframe_ltf)
+                df = bars.pandas_df if bars is not None else None
+                chart_path = render_trade_chart(df, symbol, side,
+                                                  entry_price, sl, tp, PAPER_LEVERAGE,
+                                                  str(self.timeframe_ltf), self.entry_time[symbol])
+            filename = f"{symbol}_{now:%Y%m%dT%H%M%S}.png"
+            chart_ref = upload_chart_to_github(chart_path, filename)
+            if chart_ref:
+                os.remove(chart_path)
+            else:
+                chart_ref = save_chart_locally(chart_path, filename)
+        except Exception as e:
+            self.log_message(f"[{symbol}] Chart generation failed: {e}", color="red")
+
+        margin   = qty * entry_price / PAPER_LEVERAGE
+        notional = qty * entry_price
+        log_trade(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Ledger",
+                  entry_time.isoformat(), now.isoformat(), symbol,
+                  "LONG" if is_long else "SHORT", entry_price, sl, tp, exit_price, qty,
+                  margin, notional, PAPER_LEVERAGE, pnl, reason, chart_ref)
 
     def _reset(self, symbol):
         # Cancel the broker-side OCO/bracket legs (TP/SL) so they don't linger as orphans
@@ -1428,7 +1468,7 @@ class DebbieLaSMC(Strategy):
                              if self._daily_open_balance else 0.0)
         spy_return_pct = (((spy_price - self._daily_open_spy) / self._daily_open_spy * 100)
                            if spy_price and self._daily_open_spy else 0.0)
-        log_daily_snapshot(self._sheet_client, GOOGLE_SHEET_URL, "Stock Macro",
+        log_daily_snapshot(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Macro",
                             today.isoformat(), balance, daily_return_pct,
                             spy_price or 0.0, spy_return_pct)
         self._sheet_log_date     = today

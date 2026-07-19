@@ -64,3 +64,11 @@ NVIDIA_API_KEY       = os.getenv("NVIDIA_API_KEY", "")               # build.nvi
 GOOGLE_SHEETS_CREDS_FILE = os.getenv("GOOGLE_SHEETS_CREDS_FILE", "google_credentials.json")
 GOOGLE_SHEET_URL         = os.getenv("GOOGLE_SHEET_URL", "")
 
+# ============================================================================
+# GITHUB CHART HOSTING (per-trade chart screenshots, see github_chart_uploader.py)
+# ============================================================================
+# Fine-grained PAT scoped to GITHUB_REPO with Contents: Read and write permission.
+GITHUB_TOKEN         = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO          = os.getenv("GITHUB_REPO", "frenchfriesdb/TradingBot")
+GITHUB_CHART_BRANCH  = os.getenv("GITHUB_CHART_BRANCH", "chart-images")
+
