@@ -76,26 +76,39 @@ def ensure_chart_branch():
         return False
 
 
-def upload_chart_to_github(local_path, filename):
-    """Uploads a local PNG to the chart-storage branch via a single Contents API
-    call (no local git operations). Returns a raw.githubusercontent.com URL usable
-    directly in a Sheets =IMAGE() formula, or None on any failure — never raises."""
+def upload_chart_to_github(local_path, filename, attempts=3):
+    """Uploads a local PNG to the chart-storage branch via the Contents API (no
+    local git operations). Retries transient failures (GitHub 5xx / network blips
+    — a real 503 outage stranded a chart as a local-path cell on 2026-07-19) with
+    a short backoff. Returns a raw.githubusercontent.com URL usable directly in a
+    Sheets =IMAGE() formula, or None once every attempt fails — never raises."""
+    import time as _time
+
     if not ensure_chart_branch():
         return None
     try:
         with open(local_path, "rb") as f:
             content_b64 = base64.b64encode(f.read()).decode("ascii")
-        path = f"charts/{filename}"
-        resp = requests.put(
-            f"{_API_ROOT}/repos/{GITHUB_REPO}/contents/{path}", headers=_headers(), timeout=15,
-            json={
-                "message": f"Add trade chart {filename}",
-                "content": content_b64,
-                "branch": GITHUB_CHART_BRANCH,
-            },
-        )
-        resp.raise_for_status()
-        return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_CHART_BRANCH}/{path}"
     except Exception as e:
-        print(f"[GITHUB] Chart upload failed: {e}")
+        print(f"[GITHUB] Chart upload failed (read): {e}")
         return None
+    path = f"charts/{filename}"
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.put(
+                f"{_API_ROOT}/repos/{GITHUB_REPO}/contents/{path}", headers=_headers(), timeout=15,
+                json={
+                    "message": f"Add trade chart {filename}",
+                    "content": content_b64,
+                    "branch": GITHUB_CHART_BRANCH,
+                },
+            )
+            resp.raise_for_status()
+            return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_CHART_BRANCH}/{path}"
+        except Exception as e:
+            transient = getattr(getattr(e, "response", None), "status_code", 0) >= 500 \
+                        or not getattr(e, "response", None)
+            print(f"[GITHUB] Chart upload attempt {attempt}/{attempts} failed: {e}")
+            if attempt == attempts or not transient:
+                return None
+            _time.sleep(5 * attempt)

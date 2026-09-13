@@ -1,0 +1,262 @@
+"""Replay-based backtester for binance_bot.py's SMC entry logic.
+
+    python3 backtest_crypto.py                      # default: 30d, all symbols
+    python3 backtest_crypto.py --days 60 --symbols BTC/USD,ETH/USD
+    python3 backtest_crypto.py --days 14 --verbose  # print every trade
+
+WHY THIS EXISTS
+    The live bot only learns whether a rule works by risking money on it for weeks. This
+    replays the SAME pure functions from bot/indicators.py over historical candles, so a
+    change to the entry rules can be measured in seconds instead of a month of forward
+    testing. Every incident this project has debugged (stale zones re-arming, fake FVGs,
+    fills below the zone) would have been visible here as a drop in expectancy.
+
+WHAT IT FAITHFULLY REPRODUCES
+    • the real indicator functions — detect_displacement_bos, detect_displacement_fvg,
+      detect_amd_phase, find_supply_zone / find_demand_zone, structural_stop_price,
+      structural_take_profit, find_next_liquidity_target, price_in_entry_zone
+    • closed-candle-only zone derivation (drop_forming_candle)
+    • zone age carried across re-arms (carried_zone_age) so STALE_ZONE_BARS really bites
+    • the $-risk cap (cap_qty_for_risk), stop/target geometry, and the stale-trade timeout
+
+WHAT IT DELIBERATELY DOES NOT — read this before trusting a number
+    • NO AI confirmation gate. get_ai_confirmation() calls a live LLM and cannot be
+      replayed, so this measures the TECHNICAL setup quality BEFORE that filter. The live
+      bot takes a subset of these trades. That is useful on purpose: if the raw structure
+      logic has no edge, no filter on top will save it.
+    • NO news context (same reason).
+    • Fills are assumed at the signal price, and stop/target are checked against candle
+      high/low. Real slippage, spread and partial fills are not modelled, so results are
+      optimistic — treat the sign and shape of the edge as meaningful, not the exact $.
+    • Intrabar order is unknowable at 5m: if a candle touches BOTH stop and target, the
+      STOP is assumed hit first (the pessimistic, honest assumption).
+"""
+import argparse
+import sys
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
+
+from bot import indicators
+
+# Mirror the live bot's constants so the backtest can't silently drift from production.
+from binance_bot import (
+    TAKER_FEE_RATE,
+    STALE_ZONE_BARS, MIN_AI_RR, MAX_AI_RR, MAX_RISK_DOLLARS,
+    SL_ATR_MULT, MIN_STOP_ATR_MULT_HTF, SWING_LOOKBACK, STALE_TRADE_HOURS,
+    DEFAULT_SYMBOLS,
+)
+
+LTF_TF, LTF_SECS = "5m", 300
+HTF_TF, HTF_SECS = "6h", 6 * 3600
+PER_CALL_CAP = 300          # Coinbase hard-caps a single fetch_ohlcv at 300 candles
+
+
+def fetch_paginated(ex, symbol, timeframe, tf_secs, since_ms, total):
+    """Coinbase returns at most 300 candles per call regardless of `limit`, so walk
+    forward in pages until we have the full window."""
+    out, cursor = [], since_ms
+    while len(out) < total:
+        batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor,
+                               limit=min(total - len(out), PER_CALL_CAP))
+        if not batch:
+            break
+        out.extend(batch)
+        cursor = batch[-1][0] + tf_secs * 1000
+        if len(batch) < min(total - len(out) + len(batch), PER_CALL_CAP):
+            break
+    df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"])
+    return df.drop_duplicates(subset="ts").reset_index(drop=True)
+
+
+class Trade:
+    __slots__ = ("symbol", "side", "entry", "stop", "target", "qty",
+                 "entry_ts", "exit_ts", "exit", "reason", "pnl", "fees")
+
+    def __init__(self, symbol, side, entry, stop, target, qty, entry_ts):
+        self.symbol, self.side = symbol, side
+        self.entry, self.stop, self.target, self.qty = entry, stop, target, qty
+        self.entry_ts, self.exit_ts, self.exit, self.reason, self.pnl = entry_ts, None, None, None, 0.0
+        self.fees = 0.0
+
+    def close(self, price, ts, reason):
+        self.exit, self.exit_ts, self.reason = price, ts, reason
+        gross = ((price - self.entry) if self.side == "LONG" else (self.entry - price)) * self.qty
+        # Charge the same round-trip cost the live PaperTrader now charges, on NOTIONAL at
+        # each side. Without this the backtest reports the gross number that made the live
+        # strategy look profitable while it sat exactly on its 0.245%/side break-even.
+        self.fees = (self.entry + price) * self.qty * TAKER_FEE_RATE
+        self.pnl = gross - self.fees
+        return self
+
+
+def backtest_symbol(ex, symbol, days, verbose=False):
+    """Replay one symbol bar-by-bar. Returns a list of closed Trades."""
+    now = datetime.now(timezone.utc)
+    ltf_needed = int(days * 24 * 3600 / LTF_SECS) + 100
+    htf_needed = int(days * 24 * 3600 / HTF_SECS) + 200      # +200 for indicator warmup
+
+    since_ltf = int((now - timedelta(seconds=ltf_needed * LTF_SECS)).timestamp() * 1000)
+    since_htf = int((now - timedelta(seconds=htf_needed * HTF_SECS)).timestamp() * 1000)
+    ltf = fetch_paginated(ex, symbol, LTF_TF, LTF_SECS, since_ltf, ltf_needed)
+    htf = fetch_paginated(ex, symbol, HTF_TF, HTF_SECS, since_htf, htf_needed)
+    if len(ltf) < 100 or len(htf) < 60:
+        print(f"  {symbol}: insufficient history ({len(ltf)} ltf / {len(htf)} htf) — skipped")
+        return []
+
+    trades, open_trade = [], None
+    # Zone state, mirroring SymbolState's fields that actually affect entries.
+    zone = None          # (lo, hi, bias)
+    bars_wait = 0
+    last_zone = (None, None, 0)   # (lo, hi, age) — feeds carried_zone_age across re-arms
+
+    start_i = 60
+    for i in range(start_i, len(ltf)):
+        bar = ltf.iloc[i]
+        ts = datetime.fromtimestamp(bar["ts"] / 1000, tz=timezone.utc)
+        price = float(bar["close"])
+
+        # ── manage an open trade first (stop/target/stale) ──────────────────────
+        if open_trade:
+            hi, lo = float(bar["high"]), float(bar["low"])
+            hit_stop = (lo <= open_trade.stop) if open_trade.side == "LONG" else (hi >= open_trade.stop)
+            hit_tgt  = (hi >= open_trade.target) if open_trade.side == "LONG" else (lo <= open_trade.target)
+            if hit_stop:          # pessimistic: stop wins a same-bar tie
+                trades.append(open_trade.close(open_trade.stop, ts, "SL")); open_trade = None
+            elif hit_tgt:
+                trades.append(open_trade.close(open_trade.target, ts, "TP")); open_trade = None
+            elif (ts - open_trade.entry_ts).total_seconds() / 3600 >= STALE_TRADE_HOURS:
+                trades.append(open_trade.close(price, ts, "STALE")); open_trade = None
+            if open_trade:
+                continue
+
+        # HTF frame as the live bot sees it: only candles CLOSED by this moment.
+        htf_upto = htf[htf["ts"] <= bar["ts"]]
+        if len(htf_upto) < 40:
+            continue
+        htf_closed = indicators.drop_forming_candle(htf_upto)
+        ltf_upto = ltf.iloc[max(0, i - 200):i + 1]
+
+        # ── arm a zone (IDLE) ──────────────────────────────────────────────────
+        if zone is None:
+            is_bos, direction, _lvl = indicators.detect_displacement_bos(htf_closed, lookback=15)
+            if not (is_bos and direction):
+                continue
+            found, d, z_lo, z_hi, _ = indicators.detect_displacement_fvg(htf_closed)
+            if not (found and d == direction):
+                continue
+            bias = "BULLISH" if direction == "bullish" else "BEARISH"
+            bars_wait = indicators.carried_zone_age(z_lo, z_hi, *last_zone)
+            zone = (z_lo, z_hi, bias)
+            continue
+
+        # ── ENTRY_WAIT ─────────────────────────────────────────────────────────
+        z_lo, z_hi, bias = zone
+        bars_wait += 1
+        is_long = bias == "BULLISH"
+
+        if bars_wait > 48:                       # zone expired
+            last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
+        if not indicators.price_in_entry_zone(price, z_lo, z_hi, is_long):
+            continue
+        if bars_wait > STALE_ZONE_BARS:          # tapped, but the zone is stale
+            last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
+
+        # ── structural stop / target, same helpers as live ─────────────────────
+        rng5 = ltf_upto["high"] - ltf_upto["low"]
+        atr5 = float(rng5.rolling(14).mean().iloc[-1])
+        rng6 = htf_closed["high"] - htf_closed["low"]
+        atr6 = float(rng6.rolling(14).mean().iloc[-1])
+        if not atr5 or not atr6 or pd.isna(atr5) or pd.isna(atr6):
+            continue
+        swing = (float(ltf_upto["low"].tail(SWING_LOOKBACK).min()) * 0.999 if is_long
+                 else float(ltf_upto["high"].tail(SWING_LOOKBACK).max()) * 1.001)
+        zone_lvl = indicators.crypto_zone_stop_level(
+            price, is_long, z_lo if is_long else z_hi, SL_ATR_MULT * atr5, swing)
+        stop = indicators.structural_stop_price(price, zone_lvl, atr6, is_long, MIN_STOP_ATR_MULT_HTF)
+        risk = abs(price - stop)
+        if risk <= 0:
+            last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
+        pool = indicators.find_next_liquidity_target(
+            htf_closed, price + MIN_AI_RR * risk if is_long else price - MIN_AI_RR * risk,
+            "bullish" if is_long else "bearish")
+        target = indicators.structural_take_profit(price, risk, pool, is_long, MIN_AI_RR, MAX_AI_RR)
+        qty = indicators.cap_qty_for_risk(MAX_RISK_DOLLARS / risk, risk, MAX_RISK_DOLLARS)
+
+        open_trade = Trade(symbol, "LONG" if is_long else "SHORT", price, stop, target, qty, ts)
+        if verbose:
+            print(f"    {ts:%m-%d %H:%M} {symbol:9} {open_trade.side:5} @ {price:>11,.4f} "
+                  f"SL {stop:>11,.4f} TP {target:>11,.4f} (age {bars_wait}b)")
+        last_zone = (z_lo, z_hi, bars_wait)
+        zone = None
+
+    return trades
+
+
+def report(all_trades, days):
+    if not all_trades:
+        print("\nNo trades generated — the entry rules never triggered over this window.")
+        print("That is a RESULT, not a failure: rules this selective may simply be rare.")
+        return
+    pnls = [t.pnl for t in all_trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    gw, gl = sum(wins), abs(sum(losses))
+    equity, peak, max_dd = 0.0, 0.0, 0.0
+    for p in pnls:
+        equity += p
+        peak = max(peak, equity)
+        max_dd = min(max_dd, equity - peak)
+
+    print("\n" + "=" * 62)
+    print(f"  RESULTS — {len(all_trades)} trades over {days} days")
+    print("=" * 62)
+    print(f"  net P&L         {sum(pnls):+,.2f}")
+    print(f"  expectancy      {sum(pnls)/len(pnls):+,.2f} per trade   <-- the number that matters")
+    print(f"  win rate        {len(wins)/len(pnls)*100:.1f}%  ({len(wins)}W / {len(losses)}L)")
+    print(f"  avg win         {gw/len(wins):+,.2f}" if wins else "  avg win         n/a")
+    print(f"  avg loss        {-gl/len(losses):+,.2f}" if losses else "  avg loss        n/a")
+    print(f"  profit factor   {gw/gl:.2f}" if gl else "  profit factor   inf")
+    print(f"  max drawdown    {max_dd:,.2f}")
+    tf = sum(getattr(t, "fees", 0.0) for t in all_trades)
+    print(f"  fees paid       {tf:,.2f}  (at {TAKER_FEE_RATE*100:.2f}%/side)   "
+          f"gross would be {sum(pnls)+tf:+,.2f}")
+    by_reason = {}
+    for t in all_trades:
+        by_reason.setdefault(t.reason, []).append(t.pnl)
+    print("  exits:          " + "  ".join(
+        f"{k}={len(v)} ({sum(v):+,.0f})" for k, v in sorted(by_reason.items())))
+    print("\n  Reminder: no AI gate, no news, no slippage (fees ARE modelled) — this is")
+    print("  before filtering, and it is optimistic. Judge the sign, not the cents.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Backtest binance_bot's SMC entry logic.")
+    ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--symbols", type=str, default=",".join(DEFAULT_SYMBOLS))
+    ap.add_argument("--verbose", action="store_true", help="print each trade as it opens")
+    args = ap.parse_args()
+
+    import ccxt
+    ex = ccxt.coinbase({"enableRateLimit": True})
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    print("=" * 62)
+    print(f"  BINANCE_BOT SMC BACKTEST — {args.days}d — {len(symbols)} symbols")
+    print(f"  risk/trade ${MAX_RISK_DOLLARS:.0f} | R:R {MIN_AI_RR}-{MAX_AI_RR} | "
+          f"stale zone {STALE_ZONE_BARS}b | stale trade {STALE_TRADE_HOURS}h")
+    print("=" * 62)
+
+    all_trades = []
+    for sym in symbols:
+        try:
+            t = backtest_symbol(ex, sym, args.days, args.verbose)
+            print(f"  {sym:10} {len(t):3} trades  {sum(x.pnl for x in t):+9,.2f}")
+            all_trades.extend(t)
+        except Exception as e:
+            print(f"  {sym:10} ERROR: {type(e).__name__}: {e}")
+    report(all_trades, args.days)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

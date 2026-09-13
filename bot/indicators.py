@@ -1,5 +1,218 @@
 # bot/indicators.py
+from datetime import datetime, timezone
+
 import pandas as pd
+
+
+def should_resend_entry_after_error(broker_has_live_order, broker_has_position,
+                                     verification_ok):
+    """Decide whether it is safe to re-send an entry after the order POST raised.
+
+    Pure so it can be tested without a broker. Returns True ONLY when the broker is
+    PROVABLY clean — no live order, no open position, and the check itself succeeded.
+
+    Fails CLOSED on purpose. A POST can raise after Alpaca has already accepted the
+    order (read timeout, connection reset, unparseable body), and the old code treated
+    every exception as "nothing happened" and fired a second market order. Real incident
+    2026-08-14: two MSFT entries at the identical price $494.77, both closing near -3R.
+    A missed entry costs one setup; a duplicate costs an unintended doubled position.
+    """
+    if not verification_ok:
+        return False                      # could not check -> assume it landed
+    return not (broker_has_live_order or broker_has_position)
+
+
+def build_protective_leg(stop_price, is_crypto, is_long, buffer_pct=0.005):
+    """Build the stop-loss leg of a bracket/OCO order. Equities accept a bare
+    {"stop_price": ...} (a plain stop order) — unchanged, matches existing behavior.
+    Crypto REJECTS that with a 422 "invalid order type for crypto order" (Alpaca requires
+    stop_limit for crypto, confirmed live against a real BTC/USD position that had never
+    had a stop-loss since its first fill because of exactly this) — so crypto legs also
+    carry a limit_price a small buffer past the stop, in the direction that keeps it
+    fillable as price continues moving past the trigger: below the stop when SELLING to
+    close a long, above the stop when BUYING to cover a short."""
+    leg = {"stop_price": str(stop_price)}
+    if not is_crypto:
+        return leg
+    limit_price = stop_price * ((1 - buffer_pct) if is_long else (1 + buffer_pct))
+    leg["limit_price"] = str(limit_price)
+    return leg
+
+
+# Re-exported so existing callers/tests can keep doing `from bot.indicators import
+# should_refuse_duplicate_start` — the real implementation lives in
+# bot/single_instance_lock.py, a zero-dependency (stdlib `os` only) module, because
+# binance_bot.py needs to run this lock check BEFORE its lazy pandas/ccxt import
+# finishes (a fresh-boot Gatekeeper scan can block that for ~16 minutes) and importing
+# anything from this file — which imports pandas at module level — would defeat that.
+from bot.single_instance_lock import should_refuse_duplicate_start, acquire_single_instance_lock  # noqa: E402,F401
+
+
+def needs_eod_catchup_flatten(now, already_flattened_today, catchup_grace_min=45):
+    """True if the pre-close EOD flatten window may have been MISSED (a single
+    on_trading_iteration overrunning past the whole EOD_FLATTEN_MIN window jumps
+    straight from 'not time yet' to 'market already closed', silently disabling that
+    check for the rest of the day) and we're now within `catchup_grace_min` minutes
+    AFTER the close, on a weekday, having not already flattened today. Independent of
+    loop timing/drift — explicitly asks 'did today's flatten actually happen?' rather
+    than relying on a narrow instant-in-time race."""
+    if already_flattened_today or now.weekday() >= 5:
+        return False
+    close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now < close:
+        return False
+    mins_past = (now - close).total_seconds() / 60.0
+    return mins_past <= catchup_grace_min
+
+
+def is_leftover_position(entry_iso, now):
+    """True if a still-open position was entered on an EARLIER calendar day than `now`
+    (compared in `now`'s timezone) — a leftover from a prior session that an intraday
+    bot must flatten at the next open rather than hold another whole day. This catches
+    the Fri→Mon case is_regular_session can't: the bot restarts DURING Monday's session
+    still holding Friday's position, which otherwise looks like a fresh mid-session entry.
+    Missing/unparseable entry → False (can't prove it's stale, so never force-close)."""
+    if not entry_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(entry_iso).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if dt.tzinfo is None:           # naive isoformat() output — treat as UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(now.tzinfo).date() < now.date()
+
+
+def detect_inducement(candles, zone_low, zone_high, current_price, is_long, lookback=30):
+    """Inducement (IDM): the minor liquidity level sitting BETWEEN current price and the
+    armed HTF zone — the stops that typically get swept to trap early entrants before
+    price actually delivers into the zone.
+
+    LONG setup (demand zone below price): the nearest minor swing LOW above zone_high and
+    below current_price — price must run those stops on its way down into the zone.
+    SHORT setup (supply zone above price): the nearest minor swing HIGH below zone_low and
+    above current_price.
+
+    "Nearest" = closest to the ZONE (the last level cleared before the zone tap), which is
+    the one that actually front-runs the entry. Returns None when no zone is armed or no
+    qualifying level exists. Display/context only — never gates an entry.
+
+    candles: list of (open, high, low, close), oldest first."""
+    if not candles or zone_low is None or zone_high is None:
+        return None
+    window = candles[-lookback:]
+    if is_long:
+        # strictly between the top of the demand zone and current price
+        lows = [c[2] for c in window if zone_high < c[2] < current_price]
+        return min(lows) if lows else None
+    highs = [c[1] for c in window if current_price < c[1] < zone_low]
+    return max(highs) if highs else None
+
+
+def is_disabled_engine_zone(amd_phase, enable_trend_follow, enable_wedge_breakout):
+    """True if a PENDING zone (state==ENTRY_WAIT, not yet filled) was armed by an engine
+    that's currently gated off — meaning a startup reconcile should reset it to IDLE
+    instead of letting it tap in. Catches the case a flag flip alone can't: an ARM-time
+    gate only stops NEW zones from being set; a zone armed by an OLDER process run
+    (before the flag was disabled) and restored verbatim from the state file on restart
+    is engine-agnostic at fill time, so it can still silently execute post-freeze. AMD
+    manipulation and BOS-chase zones are never gated by this — only the two engines the
+    trader explicitly asked to disable."""
+    if amd_phase == "trend_follow" and not enable_trend_follow:
+        return True
+    if amd_phase == "wedge_breakout" and not enable_wedge_breakout:
+        return True
+    return False
+
+
+def is_regular_session(weekday, hour, minute):
+    """True iff a US-equities regular session is active RIGHT NOW: Mon-Fri, 9:30am-4:00pm
+    ET (caller passes already-ET-localized wall-clock components — weekday: 0=Mon..6=Sun).
+    Used as a startup safety net: an intraday bot that restarts outside these hours while
+    still holding a position missed its EOD flatten and must close immediately, not ride
+    into the next session."""
+    if weekday >= 5:
+        return False
+    minutes_since_midnight = hour * 60 + minute
+    return 9 * 60 + 30 <= minutes_since_midnight < 16 * 60
+
+
+def account_equity(balance, positions, entry_prices, margin_used, prices, leverage):
+    """Mark-to-market equity for a paper margin account — what a real broker shows:
+    free cash + for every open position its locked margin + unrealized P&L. `balance`
+    alone is only FREE CASH (margin is deducted on open), so reporting it as portfolio
+    value makes opening a position look like an instant loss. Used by BOTH the live
+    header and the daily Macro snapshot so they can never disagree again."""
+    eq = balance
+    for sym, qty in positions.items():
+        if abs(qty) < 1e-9:
+            continue
+        entry = entry_prices.get(sym, 0.0)
+        cur = prices.get(sym, entry)
+        upnl = (cur - entry) * qty if qty > 0 else (entry - cur) * abs(qty)
+        margin = margin_used.get(sym, abs(qty) * entry / leverage)
+        eq += margin + upnl
+    return eq
+
+
+def has_displacement(candles, is_long, min_body_frac=0.5, min_body_abs=0.0, lookback=3):
+    """True if any of the last `lookback` candles is a real momentum (displacement) bar
+    in the trade direction — a decisive body, not indecision. Gates the continuation
+    setups (wedge/chase/BOS) so the bot stops entering weak breakouts into chop.
+
+    candles: list of (open, high, low, close), oldest first.
+    A bar qualifies when: body/range >= min_body_frac (decisive), body >= min_body_abs
+    (not a tiny bar — pass ~0.6× ATR), and it closes in the trade direction."""
+    for o, h, l, c in candles[-lookback:]:
+        rng = h - l
+        if rng <= 0:
+            continue
+        body = abs(c - o)
+        if body / rng < min_body_frac or body < min_body_abs:
+            continue
+        if (c > o) if is_long else (c < o):
+            return True
+    return False
+
+
+def blocked_by_overhead(entry, is_long, opposing_pool, min_room):
+    """True if there isn't enough room to the nearest opposing liquidity pool — i.e. a
+    long sitting right under a resistance pool (or a short right above a support pool),
+    with no space to reach target. `opposing_pool` = nearest resistance (long) / support
+    (short); None means none nearby (not blocked). A pool on the wrong side is ignored."""
+    if opposing_pool is None:
+        return False
+    room = (opposing_pool - entry) if is_long else (entry - opposing_pool)
+    if room <= 0:            # pool is behind us, not in the way
+        return False
+    return room < min_room
+
+
+def match_last_round_trip(orders):
+    """Pair the most recent closing fill with its true entry using ONLY the order
+    sequence — never an external is_long/bias hint, which can go stale (e.g. leftover
+    strategy_state.json from a much earlier, unrelated position) and splice together
+    legs from two DIFFERENT real trades into one fabricated round trip.
+
+    orders: Alpaca order dicts in any order (not required to be time-sorted). Filtered
+    to status=='filled', then sorted by filled_at descending.
+    exit  = the single most recent filled order (whatever side it is).
+    entry = the nearest PRECEDING filled order with the OPPOSITE side — this is what
+    stops two unrelated trips from merging: a same-side order in between is skipped, but
+    the search never crosses past an opposite-side order into an earlier round trip's
+    leg that isn't actually paired with this exit.
+    Returns (entry_order, exit_order), or (None, None) if no round trip is found."""
+    filled = sorted(
+        (o for o in orders if o.get("status") == "filled" and o.get("filled_avg_price")),
+        key=lambda o: o.get("filled_at") or "", reverse=True,
+    )
+    if len(filled) < 2:
+        return None, None
+    exit_o = filled[0]
+    for cand in filled[1:]:
+        if cand.get("side") != exit_o.get("side"):
+            return cand, exit_o
+    return None, None
 
 # ============================================================================
 # HIGHER TIMEFRAME (HTF) ANALYSIS - 4H Institutional Intent
@@ -32,6 +245,59 @@ def find_next_liquidity_target(df, price, bias, swing_bars=2):
                 if best is None or level > best:   # nearest swing low below price
                     best = level
     return best
+
+
+def structural_stop_price(entry, swing, atr_ref, is_long, min_atr_mult, liq_cap_dist=None):
+    """Stop PRICE anchored to real structure but kept OUTSIDE the noise.
+
+    The stop distance is the WIDER of (a) the structural swing invalidation and (b) a
+    noise floor of `min_atr_mult * atr_ref` (atr_ref = the higher-timeframe ATR). It is
+    then capped at `liq_cap_dist` so a leveraged position can't stop past liquidation.
+    Returns a price below entry (long) / above entry (short). This is what stops a $1
+    micro-wick stop from sitting inside single-candle noise on a liquid stock."""
+    struct_dist = abs(entry - swing) if swing else 0.0
+    dist = max(struct_dist, min_atr_mult * atr_ref)
+    if liq_cap_dist:
+        dist = min(dist, liq_cap_dist)
+    return entry - dist if is_long else entry + dist
+
+
+def structural_take_profit(entry, stop_dist, pool, is_long, min_rr, max_rr):
+    """Take-profit PRICE pinned to the nearest higher-timeframe liquidity pool / breaker.
+
+    - Pool within [min_rr, max_rr] of risk  → TP sits ON the pool (target real structure).
+    - Pool farther than max_rr              → capped at max_rr (kept reachable intraday).
+    - Pool closer than min_rr (in the noise) or absent → default min_rr target.
+    stop_dist is the positive entry→stop distance."""
+    if pool:
+        rr = (pool - entry) / stop_dist if is_long else (entry - pool) / stop_dist
+        if rr >= min_rr:
+            capped = min(rr, max_rr)
+            return entry + capped * stop_dist if is_long else entry - capped * stop_dist
+    return entry + min_rr * stop_dist if is_long else entry - min_rr * stop_dist
+
+
+def crypto_zone_stop_level(fill_price, is_long, zone_edge, breathing_room, swing_extreme):
+    """Combine the FVG/OB zone edge (+ ATR breathing room) with the structural
+    swing-high/low guard into a single candidate stop LEVEL (a price) — the "swing"
+    input later floored against higher-timeframe noise by structural_stop_price().
+
+    Mirrors binance_bot.py's zone+swing stop logic (previously duplicated across its
+    sniper-arm and retest code paths). The swing guard only ever WIDENS the stop
+    (never tightens past the zone edge) — it protects against a manipulation wick
+    sweeping the zone before real structure breaks. Falls back to a pure ATR offset
+    from fill_price if the entry already sits through its own zone edge (a chase /
+    momentum entry has no zone to reference)."""
+    if is_long:
+        zone_sl = zone_edge - breathing_room
+        if zone_sl >= fill_price:                 # entry already through the zone
+            zone_sl = fill_price - breathing_room
+        return min(zone_sl, swing_extreme) if swing_extreme is not None else zone_sl
+    else:
+        zone_sl = zone_edge + breathing_room
+        if zone_sl <= fill_price:
+            zone_sl = fill_price + breathing_room
+        return max(zone_sl, swing_extreme) if swing_extreme is not None else zone_sl
 
 
 def find_swing_points(df, lookback=10):
@@ -335,7 +601,334 @@ def detect_displacement_bos(df, lookback=15):
     return False, None, None
 
 
-def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40, clearance=0.0015):
+def range_atr(df, period=14):
+    """Mean high-low range over `period` bars — the same inline calc both bots already
+    repeat a dozen times. Returns 0.0 when it cannot be computed (short/NaN series), which
+    callers can pass straight to min_body_abs as "no floor" rather than crashing."""
+    try:
+        v = float((df["high"] - df["low"]).rolling(period).mean().iloc[-1])
+        return v if v == v and v > 0 else 0.0      # v == v filters NaN
+    except Exception:
+        return 0.0
+
+
+def displacement_min_body(atr, price, atr_mult=1.8, min_pct=0.0015):
+    """The absolute body a candle must clear to be called a displacement.
+
+    Returns max(atr_mult * atr, min_pct * price). Both terms are load-bearing:
+
+    • The ATR term is what makes "big" mean big FOR THIS MARKET. It must be > 1.0x,
+      or the gate selects an AVERAGE bar. The old multiplier was 0.6 — i.e. "60% of a
+      typical candle" — and on POL/USD 2026-09-04 a bar measuring 1.07x ATR sailed
+      through it. Displacement has to mean outlier.
+
+    • The percentage term is the backstop for a flat tape. When ATR collapses the ATR
+      term collapses with it, so on a market barely moving, even 1.8x ATR can be an
+      invisible bar. POL's 5m ATR was 0.169% of price at the time.
+
+    Deliberately NOT scaled off the higher timeframe: the 6H ATR is what decides
+    whether a market is tradeable at all (ATR_GATE), and reusing it here would let a
+    market that is volatile daily but dead right now keep arming zones — which is the
+    exact mismatch that produced the POL entry.
+    """
+    try:
+        atr = float(atr) if atr and atr == atr else 0.0
+        price = float(price) if price and price == price else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+    return max(atr_mult * max(atr, 0.0), min_pct * max(price, 0.0))
+
+
+def momentum_expanding(bars, is_long, min_body_abs=0.0, lookback=3, decay_tol=0.05):
+    """True while a move is still ACCELERATING — every bar pushing the trade's way, each
+    body at least as large as the one before, and the latest clearing `min_body_abs`.
+
+    Written for the breakout chase, whose whole momentum test used to be:
+
+        momentum_intact = close[-1] > close[-3]
+
+    Two bars of net drift. A run of SHRINKING green candles satisfies that perfectly,
+    which is what the operator watched happen on ASTER — "the green candles after that
+    showed slow momentum that kept getting smaller". A chase enters at MARKET with no
+    zone underneath it, so "price is a bit higher than it was" is not enough: the only
+    thing justifying a chase is that the move is still going, and a decaying sequence is
+    the move being distributed into, with the chaser as exit liquidity.
+
+    Equal bodies count as sustained — only shrinking disqualifies. `decay_tol` (5%) is
+    what makes that workable on real data: consecutive equal-looking bodies differ by
+    float dust (1.15-1.10 computes SMALLER than 1.10-1.05), so a strict non-decreasing
+    test rejects a perfectly steady move. It also stops a 1% wobble reading as decay,
+    while the decay this exists to catch — ASTER's roughly halving bodies — is nowhere
+    near the threshold.
+
+    Fails CLOSED on short or malformed input: acceleration that cannot be verified must
+    not become a free pass on the one path with no zone protecting it.
+    """
+    try:
+        if not bars or len(bars) < lookback:
+            return False
+        window = list(bars)[-lookback:]
+        bodies = []
+        for b in window:
+            o, c = float(b["open"]), float(b["close"])
+            if (c <= o) if is_long else (c >= o):
+                return False                      # a bar against the move = stall
+            bodies.append(abs(c - o))
+    except (TypeError, ValueError, KeyError, IndexError):
+        return False
+    if bodies[-1] < min_body_abs:
+        return False
+    return all(bodies[i] >= bodies[i - 1] * (1.0 - decay_tol) for i in range(1, len(bodies)))
+
+
+def entry_respects_zone(price, zone_lo, zone_hi, is_long, is_chase, tol_pct=0.005):
+    """Last-line check that a retest entry is filling inside the zone it armed.
+
+    Returns (ok, explanation). The explanation is meant to be printed on refusal — it
+    names how far outside the fill was, which is the detail needed to identify which
+    entry path misbehaved.
+
+    REAL INCIDENT (ASTER/USD LONG, 2026-09-05): the AMD engine armed demand at
+    0.7190-0.7588 and the bot filled at 0.7906 — 4.19% above the top of its own zone,
+    on a price that never traded down to the zone at all.
+
+    This duplicates price_in_entry_zone's directionality on purpose. That check runs at
+    TAP time; this one runs at EXECUTION, after the AI confirmation call, which can take
+    up to 25 seconds and during which `price` is never re-read. Every entry path funnels
+    through execute_confirmed_entry, so the invariant holds here no matter which engine
+    armed the zone.
+
+    `tol_pct` (0.5%) is deliberately looser than the tap check's 0.15%: a few ticks of
+    drift between tap and fill is ordinary, a 4% miss is a defect. Overshooting the far
+    side is always allowed — deeper into demand is a better long, deeper into supply a
+    better short.
+
+    Fails OPEN when no zone is set: some engines legitimately carry none, and vetoing
+    those would quietly switch the bot off.
+    """
+    if is_chase:
+        return True, "chase entry — outside the zone by design"
+    try:
+        price = float(price)
+        if zone_lo is None or zone_hi is None:
+            return True, "no zone set — guard skipped"
+        zone_lo, zone_hi = float(zone_lo), float(zone_hi)
+    except (TypeError, ValueError):
+        return True, "zone unreadable — guard skipped"
+    if zone_lo <= 0 or zone_hi <= 0 or zone_hi < zone_lo:
+        return True, "degenerate zone — guard skipped"
+
+    tol = abs(price) * tol_pct
+    if is_long:
+        if price > zone_hi + tol:
+            return False, (f"fill ${price:,.6g} is {(price - zone_hi) / zone_hi * 100:.2f}% "
+                           f"ABOVE the armed zone ${zone_lo:,.6g}-${zone_hi:,.6g}")
+        return True, "inside zone"
+    if price < zone_lo - tol:
+        return False, (f"fill ${price:,.6g} is {(zone_lo - price) / zone_lo * 100:.2f}% "
+                       f"BELOW the armed zone ${zone_lo:,.6g}-${zone_hi:,.6g}")
+    return True, "inside zone"
+
+
+def normalize_exit_reason(raw, breakeven_moved=False):
+    """Collapse a close's human label into one groupable token.
+
+    Returns one of: TARGET, STOP, BREAKEVEN, STALE, OTHER.
+
+    The ledger's existing "Reason" column records the strategy that OPENED a trade
+    ("BOS LONG"), never why it closed — so a run of near-zero rows could not be read
+    without replaying candles.
+
+    THE BREAK-EVEN CASE IS WHY THIS TAKES A SECOND ARGUMENT. There is no separate
+    break-even exit path: manage_open_trade trails `stop_loss` up at +1.25R and the
+    position then closes through the ordinary stop branch, labelled "SL hit". The string
+    is identical to a real stop-out; only `state.breakeven_moved` separates them. On 121
+    real trades BREAKEVEN was -$228.35 — the single most addressable line item — and
+    folding it into STOP hides it completely.
+
+    Order matters: a winner that trailed to break-even and then ran to target is a
+    TARGET, and one that trailed and then timed out exited on the CLOCK, not the stop.
+    So TARGET and STALE are both checked before the stop branch consults the flag.
+
+    Never raises — it runs after the position is already closed.
+    """
+    try:
+        s = str(raw or "").upper()
+    except Exception:
+        return "OTHER"
+    if "TP" in s or "TAKE PROFIT" in s or "TARGET" in s:
+        return "TARGET"
+    if "STALE" in s or "TIMEOUT" in s:
+        return "STALE"
+    if "SL" in s or "STOP" in s:
+        return "BREAKEVEN" if breakeven_moved else "STOP"
+    return "OTHER"
+
+
+def infer_exit_reason(exit_price, stop_loss, take_profit, breakeven_moved=False,
+                      tolerance=0.002):
+    """Exit reason for a close the bot did not itself trigger — read from the fill.
+
+    The crypto bot decides its own exits and hands normalize_exit_reason a label. The
+    stock bot's exits mostly fire at the BROKER (bracket OCO legs) and are discovered
+    afterwards by reconciliation, so there is no label to read — only the price the
+    position actually closed at. Whichever protective level the fill landed nearer is
+    the leg that filled, which is how you would read it off a chart by hand.
+
+    `tolerance` is a fraction of the stop-to-target span: a fill more than this far from
+    BOTH levels was neither leg (a manual flatten, an EOD close, a stale exit) and comes
+    back OTHER rather than being forced into a bucket it doesn't belong in. Guessing here
+    would poison exactly the grouping this column exists to enable.
+
+    Returns TARGET / STOP / BREAKEVEN / OTHER. Never raises.
+    """
+    try:
+        exit_price = float(exit_price); stop_loss = float(stop_loss)
+        take_profit = float(take_profit)
+    except (TypeError, ValueError):
+        return "OTHER"
+    span = abs(take_profit - stop_loss)
+    if span <= 0:
+        return "OTHER"
+    d_tp, d_sl = abs(exit_price - take_profit), abs(exit_price - stop_loss)
+    near = tolerance * span
+    if d_tp > near and d_sl > near:
+        return "OTHER"
+    if d_tp <= d_sl:
+        return "TARGET"
+    return "BREAKEVEN" if breakeven_moved else "STOP"
+
+
+def maker_limit_fill(limit_price, bar_low, bar_high, is_long, require_through=True):
+    """Fill price for a RESTING limit order against one bar, or None if it did not fill.
+
+    Earning the maker rate is not an accounting choice — it is an execution one. A maker
+    order rests on the book and waits for someone to cross to it. Relabelling a market
+    order's fee as "maker" while still filling at whatever price printed would make the
+    simulation describe a cost nobody paid, which is the same self-flattery as reporting
+    P&L gross.
+
+    So the fill model changes with the fee: the order sits at `limit_price` and fills THERE
+    — but only if the bar actually traded to it.
+
+    `require_through` (default True) demands strict penetration rather than a touch. A
+    resting order at a level price merely kisses is behind a queue of orders already
+    posted there and usually does NOT fill. Requiring penetration under-fills slightly,
+    which is the correct direction for a simulation to err.
+    """
+    try:
+        limit_price = float(limit_price)
+        bar_low, bar_high = float(bar_low), float(bar_high)
+    except (TypeError, ValueError):
+        return None
+    if bar_high < bar_low:
+        return None
+    if is_long:
+        reached = bar_low < limit_price if require_through else bar_low <= limit_price
+    else:
+        reached = bar_high > limit_price if require_through else bar_high >= limit_price
+    return limit_price if reached else None
+
+
+def round_trip_fee(entry_price, exit_price, qty, fee_rate, exit_fee_rate=None):
+    """What the exchange bills for opening AND closing `qty` — charged on NOTIONAL.
+
+    Each leg is priced at its own fill, because a big winner's exit leg costs more than
+    its entry leg. At 10x leverage this is the difference between a green row and a red
+    one: a $1,360 notional round trip at 0.25%/side costs $6.80, against trades whose
+    whole edge is a few dollars.
+
+    Exists because all three close paths reported the raw price difference as P&L while
+    _charge_fee quietly moved the balance by net — so the ledger and the account
+    disagreed on every single row. Returns 0.0 on bad input rather than raising: a close
+    path runs after the position is already gone, and must not throw.
+
+    `exit_fee_rate` exists because the two legs are not always the same kind of order. A
+    resting entry and a resting take-profit are MAKER fills; a stop-loss triggers and
+    crosses the book, so it is a TAKER fill no matter how the entry was placed. Charging
+    one blended rate across both understates losers and overstates winners.
+
+    NOTE on scale-outs: this prices the qty closed on THIS leg. A position that scaled
+    out earlier paid its entry fee on the full original size, so a partially-closed
+    trade is still slightly under-charged here. The scale-out leg's own fee belongs with
+    banked_pnl; that path is not yet netted.
+    """
+    try:
+        q = abs(float(qty))
+        rate_in = float(fee_rate)
+        rate_out = float(exit_fee_rate) if exit_fee_rate is not None else rate_in
+        return q * abs(float(entry_price)) * rate_in + q * abs(float(exit_price)) * rate_out
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def displacement_gates(df, atr_mult=1.8, min_pct=0.0015, gap_pct=0.0015):
+    """Both size floors for detect_displacement_fvg, derived from one dataframe.
+
+    Splat it at the call site — `**indicators.displacement_gates(df)` — so the crypto
+    and stock bots cannot drift apart on how "big enough" is defined. They already did
+    once: the arming path used a bare ATR fraction while the tap-time confirmation used
+    a different one, so a zone could be armed by a bar the confirmation would reject.
+
+    Returns {} when the frame has no usable close, which leaves detect_displacement_fvg
+    on its permissive defaults rather than crashing the trading loop.
+    """
+    try:
+        price = float(df["close"].iloc[-1])
+        if price != price or price <= 0:
+            return {}
+    except Exception:
+        return {}
+    return {
+        "min_body_abs": displacement_min_body(range_atr(df), price, atr_mult, min_pct),
+        "min_gap_abs":  gap_pct * price,
+    }
+
+
+def reachable_target(entry, stop, target, htf_atr, max_atr_mult=1.5, min_rr=2.0):
+    """Trim a target the hold window cannot possibly deliver, then re-check the R:R.
+
+    Positions are force-closed at STALE_TRADE_HOURS (6h) — one HTF candle. A target
+    further than `max_atr_mult` x the HTF ATR therefore needs several average HTF
+    candles of travel inside the span of one, and in practice only ever resolves as a
+    stale-timeout. It still prints a flattering R:R on the way in, which is worse than
+    useless: it makes the least achievable setups look like the best ones.
+
+    Real case: POL/USD LONG, entry 0.09465, target 0.10721 (13.3% away) against a
+    2.755% 6H ATR — reported 1:9.4, exited on the timer. The trade BEFORE it carried
+    the identical 0.10721 target and did the same thing for -$12.08.
+
+    Clamps rather than vetoes, because the setup itself may be fine — it is the target
+    that was fantasy. Returns (target, rr, ok); ok is False when the honest target can
+    no longer pay `min_rr` against the stop, or the stop distance is degenerate.
+
+    Fails OPEN on a missing/zero htf_atr: a data hiccup must not veto every setup, and
+    the displacement and gap-width gates still carry the size requirement.
+    """
+    try:
+        entry, stop, target = float(entry), float(stop), float(target)
+        htf_atr = float(htf_atr) if htf_atr and htf_atr == htf_atr else 0.0
+    except (TypeError, ValueError):
+        return target, 0.0, False
+
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return target, 0.0, False
+    if htf_atr <= 0:                      # unknown volatility -> leave it alone
+        return target, abs(target - entry) / risk, True
+
+    reach = max_atr_mult * htf_atr
+    if target >= entry:                                   # long
+        capped = min(target, entry + reach)
+    else:                                                 # short
+        capped = max(target, entry - reach)
+
+    rr = abs(capped - entry) / risk
+    return capped, rr, rr >= min_rr
+
+
+def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40,
+                            clearance=0.0015, min_body_abs=0.0, min_gap_abs=0.0):
     """
     Finds the FVG left behind by the displacement that broke structure — the
     'CHoCH FVG'. This is the heart of the sweep → displacement → retest model:
@@ -345,8 +938,22 @@ def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40, clear
 
     A displacement candle (the middle of the 3) must:
       • have a body >= min_body_pct of its range (real momentum)
+      • have a body >= min_body_abs in absolute price (not a tiny bar). Pass
+        displacement_min_body(atr, price) — do NOT pass a bare fraction of ATR below
+        1.0x, which selects an AVERAGE candle rather than an outlier. That was the
+        original defect: 0.6x ATR let a 1.07x-ATR bar arm POL/USD on 2026-09-04.
+        Without this the arming gate has NO size requirement at all, while the
+        tap-time gate (has_displacement) demands its own floor — so a zone could be
+        armed by a bar the confirmation step would reject.
+      • leave a gap at least min_gap_abs wide. A one-tick gap is a line, not a zone;
+        price grazes it on any tick and the "retest" carries no information.
       • close beyond the prior swing by `clearance` (genuine structure break)
       • leave a gap: prior.high < next.low (bullish) / prior.low > next.high (bearish)
+
+    The gap is defined by the FIRST and THIRD candles only. The displacement candle in
+    the middle necessarily trades through that range — a candle spans its own low to its
+    own high — and that traversal is exactly what creates the imbalance. The gap stays
+    "unfilled" until price RETURNS to it on a later bar.
 
     Scans the most recent `window` candles (newest first) and needs at least one
     candle AFTER the displacement so the gap is fully formed and retest-ready.
@@ -364,7 +971,11 @@ def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40, clear
         disp  = recent.iloc[i]
         body  = abs(disp['close'] - disp['open'])
         rng   = disp['high'] - disp['low']
-        if rng == 0 or body / rng < min_body_pct:
+        # min_body_pct is SCALE-FREE: "body is 40% of its own range" scores a $0.02 candle
+        # in dead chop identically to a $2,000 one. min_body_abs adds the absolute floor
+        # (pass ~0.6x ATR) so an armed zone requires a bar that is actually identifiable.
+        # Defaults to 0.0 = no floor, so untouched callers keep their old behaviour.
+        if rng == 0 or body / rng < min_body_pct or body < min_body_abs:
             continue
 
         prior  = recent.iloc[i - 1]
@@ -375,17 +986,35 @@ def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40, clear
         swing_high = float(struct['high'].max())
         swing_low  = float(struct['low'].min())
 
-        # Bullish displacement: strong up-close above structure that gapped up
+        # Bullish displacement: strong up-close above structure leaving C1.high < C3.low.
+        # NOTE: do NOT add a "disp.low >= prior.high" style check here. That was tried on
+        # 2026-08-07 and reverted on 2026-08-19: the displacement candle ALWAYS trades
+        # through its own gap (one candle spans its low to its high), and that traversal
+        # is what creates the imbalance. Requiring otherwise demands a true price gap
+        # between consecutive candles, which effectively never happens in 24/7 crypto —
+        # it silently disabled detection, rejecting BTC's real +5.75% 6h displacement on
+        # 2026-08-19 ($3,521 gap) because C2's low sat $72 under C1's high.
+        # See tests/test_displacement_fvg.py, which pins those real candles.
         if (disp['close'] > disp['open']
                 and disp['close'] > swing_high * (1 + clearance)
                 and float(prior['high']) < float(nxt['low'])):
-            return True, 'bullish', float(prior['high']), float(nxt['low']), swing_high
+            lo, hi = float(prior['high']), float(nxt['low'])
+            # A gap narrower than min_gap_abs is a LINE, not a zone: price "taps" it on
+            # any tick and the retest carries no information. POL/USD armed on a gap of
+            # 0.00001 (0.011% of price) on 2026-09-04. `continue` rather than bail —
+            # an older displacement in the window may have left a real one.
+            if hi - lo < min_gap_abs:
+                continue
+            return True, 'bullish', lo, hi, swing_high
 
-        # Bearish displacement: strong down-close below structure that gapped down
+        # Bearish displacement: mirror — C1.low > C3.high.
         if (disp['close'] < disp['open']
                 and disp['close'] < swing_low * (1 - clearance)
                 and float(prior['low']) > float(nxt['high'])):
-            return True, 'bearish', float(nxt['high']), float(prior['low']), swing_low
+            lo, hi = float(nxt['high']), float(prior['low'])
+            if hi - lo < min_gap_abs:
+                continue
+            return True, 'bearish', lo, hi, swing_low
 
     return False, None, None, None, None
 
@@ -478,13 +1107,26 @@ def check_market_structure_shift(df):
     
     return is_mss, recent_swing_high
 
-def find_bullish_fvg(df, lookback=15):
+def find_bullish_fvg(df, lookback=15, min_body_abs=0.0, min_gap_abs=0.0):
     """
     Scans the last `lookback` bars for a bullish imbalance zone.
     Primary: true FVG (c1.low > c3.high — literal gap between wicks).
     Fallback: bullish order block (last bearish candle before a strong up move)
               which is the zone pros actually trade on intraday stock charts.
     Returns (found, bottom, top) where bottom < top is the entry zone.
+
+    SIZE GATES ADDED 2026-09-08, and they matter more than they look. This is the
+    FALLBACK arm in binance_bot's STEP 2 — reached only when detect_displacement_fvg
+    finds nothing. When the displacement path was tightened on 2026-09-04 (1.8x ATR body,
+    0.15% minimum gap), traffic did not stop: it REROUTED here, which had no size
+    requirement whatsoever. Six of six setups in the following log armed through this
+    path. Tightening the strict branch without tightening the fallback just moves the
+    problem, and the operator spotted the result by eye: "there isn't even a single
+    3 candle pattern, nor an FVG bro".
+
+    So the same discipline applies here: the middle candle of a true FVG must clear
+    min_body_abs, the gap must clear min_gap_abs, and an order block's candle must clear
+    min_body_abs too. Both default to 0.0, so untouched callers keep prior behaviour.
     """
     if len(df) < 3:
         return False, None, None
@@ -498,6 +1140,12 @@ def find_bullish_fvg(df, lookback=15):
     for i in range(end, start - 1, -1):
         c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
         if c1['high'] < c3['low'] and c2['close'] > c2['open']:
+            # the middle candle IS the displacement — "much bigger than average", not
+            # merely green. Without this, any green bar of any size qualified.
+            if abs(float(c2['close']) - float(c2['open'])) < min_body_abs:
+                continue
+            if float(c3['low']) - float(c1['high']) < min_gap_abs:
+                continue
             return True, float(c1['high']), float(c3['low'])
 
     # 2. Order block fallback — last bearish candle before a confirmed breakout above its high.
@@ -509,7 +1157,7 @@ def find_bullish_fvg(df, lookback=15):
             continue
         body = abs(candle['close'] - candle['open'])
         rng  = candle['high'] - candle['low']
-        if rng == 0 or body / rng < 0.40:
+        if rng == 0 or body / rng < 0.40 or body < min_body_abs:
             continue
         later  = df.iloc[i + 1: end + 1]
         breaks = later[later['close'] > candle['high']]
@@ -520,10 +1168,12 @@ def find_bullish_fvg(df, lookback=15):
 
     return False, None, None
 
-def find_bearish_fvg(df, lookback=15):
+def find_bearish_fvg(df, lookback=15, min_body_abs=0.0, min_gap_abs=0.0):
     """
     Scans the last `lookback` bars for a bearish imbalance zone.
     Primary: true FVG (gap down). Fallback: bearish order block.
+
+    Same size gates as find_bullish_fvg — see there for why the fallback needs them.
     """
     if len(df) < 3:
         return False, None, None
@@ -535,6 +1185,10 @@ def find_bearish_fvg(df, lookback=15):
     for i in range(end, start - 1, -1):
         c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
         if c1['low'] > c3['high'] and c2['close'] < c2['open']:
+            if abs(float(c2['close']) - float(c2['open'])) < min_body_abs:
+                continue
+            if float(c1['low']) - float(c3['high']) < min_gap_abs:
+                continue
             return True, float(c3['high']), float(c1['low'])
 
     # 2. Order block fallback — last bullish candle before a breakdown below its low.
@@ -545,7 +1199,7 @@ def find_bearish_fvg(df, lookback=15):
             continue
         body = abs(candle['close'] - candle['open'])
         rng  = candle['high'] - candle['low']
-        if rng == 0 or body / rng < 0.40:
+        if rng == 0 or body / rng < 0.40 or body < min_body_abs:
             continue
         later  = df.iloc[i + 1: end + 1]
         breaks = later[later['close'] < candle['low']]
@@ -628,9 +1282,223 @@ def detect_amd_phase(df_htf, structure_bars=25, recent_bars=5):
     return 'unknown', {}
 
 
-def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12):
+# ============================================================================
+# ENTRY GATING — the four defects behind the real 2026-08-11 AVAX SHORT
+# (entry $6.231, zone $6.24-$6.454, $79 risk, in a market with a 1.5% 4h range).
+# All pure so the gating is unit-provable; see tests/test_entry_gating.py.
+# ============================================================================
+
+def carried_zone_age(new_lo, new_hi, prev_lo, prev_hi, prev_age, tol_pct=0.002):
+    """Bars-in-wait a newly armed zone should START at, carrying age across re-arms.
+
+    THE ROOT CAUSE of the recurring "armed ages ago, entered on nothing" trades:
+    binance_bot.py kept no memory of expired zones, and SymbolState.reset() calls
+    __init__(), zeroing bars_in_entry_wait. So an expired zone fell to IDLE, the next
+    5-min cycle re-derived the SAME zone from the same slow-moving 6h HTF data, and
+    re-armed with the counter back at 0 — indefinitely. bars_in_entry_wait therefore
+    measured time since the last RE-ARM, never how long the zone had actually existed,
+    and the STALE_ZONE_BARS freshness gate could never fire. Live proof: the counter
+    read 3 while the zone had visibly sat ~20 bars (1h40m) on the chart.
+
+    Returns prev_age when the re-armed zone matches the previous one within tol_pct
+    (HTF levels wobble slightly between recomputes), else 0 for a genuinely new zone."""
+    if prev_lo is None or prev_hi is None or new_lo is None or new_hi is None:
+        return 0
+    for new, prev in ((new_lo, prev_lo), (new_hi, prev_hi)):
+        ref = abs(prev) or 1.0
+        if abs(new - prev) / ref > tol_pct:
+            return 0
+    return prev_age
+
+
+def drop_forming_candle(df):
+    """Drop the newest (still-forming) bar so zone edges come only from CLOSED candles.
+
+    A zone is snapshotted at arm time but its edge could come from a bar still in
+    progress, whose high/low keeps moving. Real incident: the stored edge was $6.24;
+    by entry the same finder returned $6.326 because that bar had printed a higher
+    high — against live data price sat 1.5% BELOW the zone and the entry would never
+    have fired. Deriving zones from closed bars only makes them stable between
+    recomputes, so the stored zone still means what it meant when it was armed."""
+    if df is None or len(df) < 2:
+        return df
+    return df.iloc[:-1]
+
+
+def price_in_entry_zone(price, zone_lo, zone_hi, is_long, tol_pct=0.0015):
+    """True when price has genuinely REACHED its zone, not merely come close to it.
+
+    The old check was a symmetric ±tol band (`lo - tol <= price <= hi + tol`), which
+    let a SHORT fill BELOW the supply zone — selling supply at a discount, the exact
+    opposite of the setup. Real incident: price $6.231 vs zone_lo $6.24 cleared the
+    old $6.2307 threshold by $0.0003 (0.005% of price) and filled 3.6% below the top
+    of the supply it was supposedly selling into.
+
+    Tolerance now applies only on the FAR side, where overshooting still improves the
+    fill (a short deeper into supply, a long deeper into demand); the approach side is
+    hard — price must actually trade into the zone."""
+    if zone_lo is None or zone_hi is None:
+        return False
+    tol = abs(price) * tol_pct
+    if is_long:
+        return (zone_lo - tol) <= price <= zone_hi
+    return zone_lo <= price <= (zone_hi + tol)
+
+
+def sniper_entry_allowed(zone_type, is_stale, has_momentum,
+                         candle_confirms, choch_aligned):
+    """(ok, reason) — may the 10-second sniper fire on this tap?
+
+    The sniper and the 5-minute cycle are supposed to enforce the same entry rule. They
+    did not. The 5m path requires, on a FRESH zone:
+
+        choch_fvg      -> direct tap (the displacement IS the change of character)
+        anything else  -> rebounce = candle_confirms OR choch_aligned
+
+    The sniper checked NOTHING on a fresh zone. A staleness gate was added and its comment
+    claimed to mirror the main cycle "exactly", but it only covered the STALE branch — the
+    fresh branch stayed wide open. Because the sniper polls every 10s against the main
+    cycle's 5 minutes, it wins nearly every race, so in practice the candle gate became
+    dead code: of 22 logged taps, 19 FAILED the bot's own confirmation check and were
+    entered anyway — including four marubozu_bear candles at LONG taps.
+
+    Deliberate asymmetry: the sniper does not fetch 15m data on a 10-second cadence, so
+    callers pass choch_aligned=False. That makes it STRICTER than the 5m path, never
+    looser — a tap it declines is simply picked up by the next 5m cycle, which does have
+    the 15m read. Declining late is recoverable; entering wrongly is not.
     """
-    Scans the full 4H chart for supply zones (bearish imbalances) ABOVE current price.
+    if is_stale:
+        return (True, "stale zone, fresh momentum confirmed") if has_momentum else \
+               (False, "stale zone with no fresh displacement")
+    if zone_type == "choch_fvg":
+        return True, "fresh displacement FVG — direct tap"
+    if candle_confirms or choch_aligned:
+        return True, "fresh zone, tap confirmed"
+    return False, "fresh zone but the tap candle does not confirm the bias"
+
+
+def first_protective_breach(candles, stop, target, is_long, since_ms=0):
+    """The FIRST protective level a price series breached — ("STOP"|"TARGET", price, ts).
+
+    A paper bot's stop lives only in its own process, so when the bot is down the stop
+    does not exist. The startup catch-up compared the CURRENT price against the levels,
+    which means a stop that was blown through and recovered from during the downtime was
+    missed entirely and the position carried on as though nothing happened. The account
+    then reports a result no real broker would have produced.
+
+    Walking the candles of the gap restores the stop's authority after the fact: a resting
+    order would have filled the instant price TOUCHED the level, so wicks count, not
+    closes.
+
+    Chronological order is the whole point — a trade that hit its stop at 03:00 cannot be
+    rescued by its target printing at 05:00. When BOTH levels fall inside the SAME candle
+    the sequence within that bar is unknowable, so this returns STOP. A simulation must
+    not hand itself the better of two outcomes it cannot distinguish; that is how a
+    backtest ends up describing a strategy nobody could have traded.
+
+    `since_ms` skips bars that opened before the position existed — their wicks carry
+    prices that predate the entry, and an order that did not exist yet cannot fill on them.
+    """
+    if not candles:
+        return None
+    try:
+        stop = float(stop); target = float(target)
+    except (TypeError, ValueError):
+        return None
+    for c in candles:
+        try:
+            ts, high, low = int(c[0]), float(c[2]), float(c[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if ts < (since_ms or 0):
+            continue
+        if is_long:
+            hit_stop, hit_target = low <= stop, high >= target
+        else:
+            hit_stop, hit_target = high >= stop, low <= target
+        if hit_stop:                       # STOP wins ties — see above
+            return "STOP", stop, ts
+        if hit_target:
+            return "TARGET", target, ts
+    return None
+
+
+def risk_budget(equity, pct, floor=0.0, ceiling=None):
+    """Dollars to risk on ONE trade: `pct` of live equity, clamped to [floor, ceiling].
+
+    Replaces a hardcoded MAX_RISK_DOLLARS. A fixed dollar amount is a different bet at
+    every account size — $20 is 0.2% of $10,000 and 20% of $100 — so the constant silently
+    changes meaning the moment the balance does. Percent-of-equity keeps the meaning fixed
+    and does two things dollars cannot: it COMPOUNDS as the account grows, and it DE-RISKS
+    automatically in a drawdown (down 20% -> risk per trade drops 20% with it).
+
+    Deliberately takes EQUITY, not balance. PaperTrader.balance is free cash only, so with
+    positions open it understates the account and would shrink the budget for reasons that
+    have nothing to do with risk appetite.
+
+    `ceiling` is a circuit breaker, not a target: one bad equity read (a stale price, a
+    mispriced position) must not be able to size the next trade off a fantasy number.
+
+    Leverage is deliberately absent. Risk is (entry - stop) x qty; leverage only changes
+    how much cash is posted as margin. Sizing the same either way is what lets the same
+    constants work on 1x spot and 10x perps.
+    """
+    try:
+        equity = float(equity); pct = float(pct)
+    except (TypeError, ValueError):
+        return 0.0
+    if equity != equity or equity <= 0 or pct <= 0:
+        return 0.0
+    budget = equity * pct
+    if ceiling is not None:
+        budget = min(budget, float(ceiling))
+    return max(budget, float(floor or 0.0))
+
+
+def meets_exchange_minimums(qty, price, min_amount=None, min_cost=None):
+    """(ok, reason) — whether an order clears the venue's minimum size and notional.
+
+    A risk-sized order on a small account can come out below what the exchange will
+    accept, and the failure mode matters: rounding UP to the minimum silently breaks the
+    risk cap that produced the number. A $20-risk order that gets rounded up to a $50-risk
+    order is no longer the trade that was approved. So this REFUSES rather than adjusts —
+    the setup is simply too small for this account at this stop distance.
+
+    Both limits come from ccxt's market['limits']; either may be absent, and an absent
+    limit is not a constraint.
+    """
+    try:
+        qty = abs(float(qty)); price = float(price)
+    except (TypeError, ValueError):
+        return False, "unreadable qty/price"
+    if qty <= 0 or price <= 0:
+        return False, "zero qty or price"
+    if min_amount is not None and qty < float(min_amount):
+        return False, (f"qty {qty:.8g} below the venue minimum {float(min_amount):.8g} "
+                       f"— rounding up would break the risk cap, so skipping")
+    cost = qty * price
+    if min_cost is not None and cost < float(min_cost):
+        return False, (f"notional ${cost:,.2f} below the venue minimum "
+                       f"${float(min_cost):,.2f} — skipping")
+    return True, "ok"
+
+
+def cap_qty_for_risk(qty, risk_per_unit, max_risk_dollars):
+    """Shrink qty so a stop-out can't lose more than max_risk_dollars. Never scales UP.
+
+    binance_bot.py's main entry path sized by MARGIN (balance x fraction), so real risk
+    rode on however wide the structural stop happened to be — the live AVAX SHORT put
+    $79 at risk on a 3.9% stop. The 10-second sniper path already sized by fixed risk
+    (MAX_RISK_DOLLARS); this brings the main path in line so both agree."""
+    if risk_per_unit <= 0:
+        return 0.0
+    return min(qty, max_risk_dollars / risk_per_unit)
+
+
+def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12,
+                      max_age_bars=30):
+    """
+    Scans the 4H chart for supply zones (bearish imbalances) ABOVE current price.
 
     Checks in order of reliability:
     1. Unmitigated bearish FVG — genuine gap-down imbalance that hasn't been refilled
@@ -642,6 +1510,13 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
 
     max_distance_pct: ignore zones more than this % above price (default 12%)
                       prevents locking a supply zone $20k above BTC current price.
+    max_age_bars: ignore zones whose forming candle pattern is older than this many bars
+                  (default 30, matching detect_amd_phase's structure+recent window — about
+                  7.5 days on 6h HTF candles). "Unmitigated" (never revisited) alone is NOT
+                  the same as fresh — REAL INCIDENT 2026-08-02: an AVAX SHORT was armed off
+                  a bearish_ob candle from 34.2 days earlier, found purely because price
+                  hadn't traded back through it since. Without this bound the full HTF
+                  history (up to 200 bars / ~50 days) is fair game regardless of age.
 
     Returns: (found: bool, zone_low: float, zone_high: float, zone_type: str)
     """
@@ -654,7 +1529,8 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     max_price = current_price * (1 + max_distance_pct)
     candidates = []   # (zone_low, zone_high, zone_type)
 
-    for i in range(2, n - 1):
+    scan_start = max(2, n - 1 - max_age_bars)
+    for i in range(scan_start, n - 1):
         c1 = bars.iloc[i - 2]
         c2 = bars.iloc[i - 1]
         c3 = bars.iloc[i]
@@ -711,9 +1587,10 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     return True, z_lo, z_hi, z_type
 
 
-def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12):
+def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12,
+                      max_age_bars=30):
     """
-    Scans the full 4H chart for demand zones (bullish imbalances) BELOW current price.
+    Scans the 4H chart for demand zones (bullish imbalances) BELOW current price.
     Mirror of find_supply_zone for LONG setups.
 
     1. Unmitigated bullish FVG below price
@@ -723,6 +1600,7 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
        supply failed and the block flips polarity into support.
 
     max_distance_pct: ignore zones more than this % below price (default 12%).
+    max_age_bars: see find_supply_zone — same recency bound, same reasoning (default 30).
 
     Returns: (found: bool, zone_low: float, zone_high: float, zone_type: str)
     """
@@ -735,7 +1613,8 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     min_price = current_price * (1 - max_distance_pct)
     candidates = []
 
-    for i in range(2, n - 1):
+    scan_start = max(2, n - 1 - max_age_bars)
+    for i in range(scan_start, n - 1):
         c1 = bars.iloc[i - 2]
         c2 = bars.iloc[i - 1]
         c3 = bars.iloc[i]

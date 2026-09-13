@@ -1,0 +1,1057 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quant Trading Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
+                    },
+                },
+            },
+        };
+    </script>
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        :root {
+            --win: #30D158;
+            --win-soft: rgba(48, 209, 88, 0.16);
+            --win-border: rgba(48, 209, 88, 0.4);
+            --win-glow: rgba(48, 209, 88, 0.22);
+            --loss: #FF453A;
+            --loss-soft: rgba(255, 69, 58, 0.16);
+            --loss-border: rgba(255, 69, 58, 0.4);
+            --loss-glow: rgba(255, 69, 58, 0.22);
+            --ink: #F5F5F7;
+            --ink-dim: #86868B;
+            --accent: #22d3ee;
+        }
+
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
+
+        /* Real glass: saturated blur + a specular highlight sweeping the top edge,
+           like light catching the curved surface of a water droplet. */
+        .glass-panel {
+            position: relative;
+            background: rgba(20, 20, 24, 0.55);
+            backdrop-filter: blur(24px) saturate(180%);
+            -webkit-backdrop-filter: blur(24px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+        }
+        .glass-panel::before {
+            content: '';
+            position: absolute; inset: 0; border-radius: inherit;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.10) 0%, rgba(255, 255, 255, 0) 45%);
+            pointer-events: none;
+        }
+
+        .cal-cell {
+            position: relative;
+            min-height: 108px;
+            border-radius: 16px;
+            padding: 12px 14px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            overflow: hidden;
+            transition: transform .18s ease, box-shadow .18s ease;
+            background: rgba(255, 255, 255, 0.025);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .cal-cell::after {
+            content: '';
+            position: absolute; top: -50%; left: -25%; width: 55%; height: 200%;
+            background: linear-gradient(120deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0) 70%);
+            transform: rotate(20deg);
+            pointer-events: none;
+        }
+        /* 4-tier heatmap: small win/loss = soft, big day (>|BIG_DAY|) = intense */
+        .cal-cell.win { background: var(--win-soft); border-color: var(--win-border); box-shadow: 0 0 24px var(--win-glow), inset 0 1px 0 rgba(255,255,255,0.08); }
+        .cal-cell.loss { background: var(--loss-soft); border-color: var(--loss-border); box-shadow: 0 0 24px var(--loss-glow), inset 0 1px 0 rgba(255,255,255,0.08); }
+        .cal-cell.win-big { background: rgba(48,209,88,0.34); border-color: var(--win); box-shadow: 0 0 34px rgba(48,209,88,0.45), inset 0 1px 0 rgba(255,255,255,0.12); }
+        .cal-cell.loss-big { background: rgba(255,69,58,0.34); border-color: var(--loss); box-shadow: 0 0 34px rgba(255,69,58,0.45), inset 0 1px 0 rgba(255,255,255,0.12); }
+        .cal-cell.has-trades:hover { transform: translateY(-3px) scale(1.015); z-index: 10; cursor: pointer; }
+        .cal-cell.out-of-month { opacity: 0.32; }
+
+        /* Live ticker "spin" flash — the Robinhood-style pulse on the Portfolio Value
+           number when a new live-poll tick lands and its odometer tween is running. */
+        @keyframes tickUpFlash   { 0% { color: var(--win); text-shadow: 0 0 12px var(--win-glow); } 100% { color: var(--ink); text-shadow: none; } }
+        @keyframes tickDownFlash { 0% { color: var(--loss); text-shadow: 0 0 12px var(--loss-glow); } 100% { color: var(--ink); text-shadow: none; } }
+        #kpi-portfolio.tick-up   { animation: tickUpFlash 900ms ease-out; }
+        #kpi-portfolio.tick-down { animation: tickDownFlash 900ms ease-out; }
+        .cal-cell.is-today { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+        .week-cell {
+            min-height: 108px;
+            border-radius: 16px;
+            padding: 12px 14px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            background: rgba(255, 255, 255, 0.035);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .nav-btn { transition: background-color .15s ease, color .15s ease; }
+        .nav-btn:hover { background: rgba(255, 255, 255, 0.10); }
+
+        /* Sidebar */
+        .sidebar {
+            position: fixed; top: 0; left: 0; bottom: 0; width: 240px; z-index: 40;
+            display: flex; flex-direction: column; padding: 24px 18px;
+            background: rgba(14, 14, 17, 0.72);
+            backdrop-filter: blur(24px) saturate(160%);
+            -webkit-backdrop-filter: blur(24px) saturate(160%);
+            border-right: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        .side-link {
+            display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+            border-radius: 12px; color: var(--ink-dim); font-weight: 600; font-size: 14px;
+            cursor: pointer; transition: background-color .15s, color .15s;
+        }
+        .side-link:hover { background: rgba(255, 255, 255, 0.06); color: var(--ink); }
+        .side-link.active { background: rgba(34, 211, 238, 0.12); color: #67e8f9; }
+        .main-wrap { margin-left: 240px; }
+        @media (max-width: 1023px) {
+            .sidebar { display: none; }
+            .main-wrap { margin-left: 0; }
+        }
+        /* Live pulsing status dot */
+        /* Equity-curve range switcher (1H / 6H / 1D) */
+        .range-btn { font-size: 11px; font-weight: 700; font-family: ui-monospace, monospace;
+                     padding: 3px 10px; border-radius: 6px; cursor: pointer;
+                     background: rgba(255,255,255,0.05); color: var(--ink-dim);
+                     border: 1px solid rgba(255,255,255,0.08); transition: all .15s; }
+        .range-btn:hover  { color: #fff; border-color: rgba(255,255,255,0.2); }
+        .range-btn.active { background: rgba(34,211,238,0.15); color: #22d3ee;
+                            border-color: rgba(34,211,238,0.4); }
+
+        .status-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+        .status-dot.online { background: var(--win); box-shadow: 0 0 0 0 rgba(48,209,88,0.7); animation: pulse 2s infinite; }
+        .status-dot.offline { background: var(--loss); }
+        @keyframes pulse {
+            0%   { box-shadow: 0 0 0 0 rgba(48,209,88,0.6); }
+            70%  { box-shadow: 0 0 0 8px rgba(48,209,88,0); }
+            100% { box-shadow: 0 0 0 0 rgba(48,209,88,0); }
+        }
+    </style>
+</head>
+<body class="bg-black text-[var(--ink)] font-sans min-h-screen selection:bg-cyan-500/30 overflow-x-hidden relative">
+
+    <!-- Ambient Background Glows -->
+    <div class="fixed top-0 left-1/4 w-[600px] h-[600px] bg-cyan-900/20 rounded-full blur-[120px] pointer-events-none mix-blend-screen"></div>
+    <div class="fixed bottom-0 right-1/4 w-[500px] h-[500px] bg-purple-900/20 rounded-full blur-[100px] pointer-events-none mix-blend-screen"></div>
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+        <div class="flex items-center gap-2 mb-8 px-2">
+            <i data-lucide="activity" class="text-cyan-400 w-6 h-6"></i>
+            <span class="text-xl font-black tracking-tighter text-white">QUANT DESK.</span>
+        </div>
+        <nav class="flex flex-col gap-1 flex-1">
+            <a class="side-link active" data-section="top" onclick="goSection('top', this)"><i data-lucide="layout-dashboard" class="w-4 h-4"></i> Dashboard</a>
+            <a class="side-link" data-section="analytics" onclick="goSection('analytics', this)"><i data-lucide="pie-chart" class="w-4 h-4"></i> Analytics</a>
+            <a class="side-link" data-section="calendar" onclick="goSection('calendar', this)"><i data-lucide="calendar" class="w-4 h-4"></i> Calendar Matrix</a>
+            <a class="side-link" data-section="ledger" onclick="goSection('ledger', this)"><i data-lucide="list" class="w-4 h-4"></i> Ledger</a>
+        </nav>
+        <div class="glass-panel rounded-xl p-3 flex items-center gap-3">
+            <div id="engine-dot" class="status-dot offline"></div>
+            <div class="leading-tight">
+                <div class="text-[10px] uppercase tracking-wide text-[var(--ink-dim)] font-mono">Engine</div>
+                <div id="engine-status" class="text-xs font-bold font-mono text-[var(--ink-dim)]">CHECKING…</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main -->
+    <div class="main-wrap">
+    <div class="relative z-10 max-w-[1500px] mx-auto px-6 lg:px-10 py-10" id="top">
+
+        <!-- Header -->
+        <header class="flex justify-between items-center mb-10 flex-wrap gap-4">
+            <div>
+                <h1 class="text-3xl font-black tracking-tighter text-white flex items-center gap-3">
+                    <i data-lucide="activity" class="text-cyan-400"></i> QUANT DESK.
+                </h1>
+                <p class="text-sm text-[var(--ink-dim)] font-mono mt-1">Live Ledger Sync — {{ account|upper }} account</p>
+            </div>
+            <div class="flex gap-3">
+                <a href="?account=crypto" class="glass-panel px-4 py-2 rounded-xl text-sm font-semibold hover:bg-white/5 transition-colors flex items-center gap-2 {{ 'ring-1 ring-cyan-400/50' if account == 'crypto' else '' }}">
+                    <i data-lucide="bitcoin" class="w-4 h-4"></i> Crypto
+                </a>
+                <a href="?account=stock" class="glass-panel px-4 py-2 rounded-xl text-sm font-semibold hover:bg-white/5 transition-colors flex items-center gap-2 {{ 'ring-1 ring-cyan-400/50' if account == 'stock' else '' }}">
+                    <i data-lucide="landmark" class="w-4 h-4"></i> Stocks
+                </a>
+                <button onclick="location.reload()" class="glass-panel px-4 py-2 rounded-xl text-sm font-semibold hover:bg-white/5 transition-colors flex items-center gap-2">
+                    <i data-lucide="refresh-cw" class="w-4 h-4"></i> Sync
+                </button>
+            </div>
+        </header>
+
+        <!-- KPI Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-5 mb-6" id="kpi-container">
+            <!-- Populated by JS -->
+        </div>
+
+        <!-- Equity Curve -->
+        <div class="glass-panel rounded-3xl p-6 mb-6">
+            <h2 class="text-lg font-bold mb-4 flex items-center gap-2">
+                <i data-lucide="trending-up" class="w-5 h-5 text-cyan-400"></i> Equity Curve
+                <!-- Change vs the window's opening value, the way Robinhood anchors its
+                     green/red figure to the start of the selected period (not to zero). -->
+                <span id="equity-change" class="ml-3 text-sm font-mono font-bold"></span>
+                <span id="equity-range-note" class="ml-2 text-[11px] font-mono text-[var(--ink-dim)]"></span>
+                <!-- Ranges split across two data sources, the same way Robinhood does it:
+                     intraday ticks for <=1D, daily closes for anything longer. -->
+                <span class="ml-auto flex gap-1 flex-wrap" id="equity-range">
+                    <button class="range-btn" data-secs="3600">1H</button>
+                    <button class="range-btn" data-secs="21600">6H</button>
+                    <button class="range-btn active" data-secs="86400">1D</button>
+                    <button class="range-btn" data-secs="604800">1W</button>
+                    <button class="range-btn" data-secs="2592000">1M</button>
+                    <button class="range-btn" data-secs="15552000">6M</button>
+                    <button class="range-btn" data-secs="31536000">1Y</button>
+                    <button class="range-btn" data-secs="157680000">5Y</button>
+                    <button class="range-btn" data-secs="0">ALL</button>
+                </span>
+            </h2>
+            <div id="tv-chart" class="w-full h-[320px]"></div>
+        </div>
+
+        <!-- Analytics: Win/Loss donut + Daily P&L bar -->
+        <div id="analytics" class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+            <div class="glass-panel rounded-3xl p-6">
+                <h2 class="text-lg font-bold mb-4 flex items-center gap-2">
+                    <i data-lucide="pie-chart" class="w-5 h-5 text-purple-400"></i> Win / Loss
+                </h2>
+                <div class="relative h-[240px] flex items-center justify-center">
+                    <canvas id="donut-chart"></canvas>
+                    <div class="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                        <div id="donut-center-rate" class="text-3xl font-extrabold text-[var(--ink)]">—</div>
+                        <div class="text-[10px] uppercase tracking-wide text-[var(--ink-dim)] font-mono">Win Rate</div>
+                    </div>
+                </div>
+                <div id="donut-legend" class="flex flex-wrap justify-center gap-x-5 gap-y-1 mt-3 text-xs font-mono"></div>
+            </div>
+            <div class="glass-panel rounded-3xl p-6 lg:col-span-2">
+                <h2 class="text-lg font-bold mb-4 flex items-center gap-2">
+                    <i data-lucide="bar-chart-3" class="w-5 h-5 text-cyan-400"></i> Daily P&amp;L
+                </h2>
+                <div class="h-[240px]"><canvas id="bar-chart"></canvas></div>
+            </div>
+        </div>
+
+        <!-- Performance Calendar -->
+        <div id="calendar" class="glass-panel rounded-3xl p-6">
+            <div class="flex items-center justify-between mb-5 flex-wrap gap-3">
+                <h2 class="text-lg font-bold flex items-center gap-2">
+                    <i data-lucide="calendar" class="w-5 h-5 text-purple-400"></i> Performance Calendar
+                </h2>
+                <div class="flex items-center gap-1">
+                    <button onclick="navYear(-1)" title="Previous year" class="nav-btn p-2 rounded-lg"><i data-lucide="chevrons-left" class="w-4 h-4"></i></button>
+                    <button onclick="navMonth(-1)" title="Previous month" class="nav-btn p-2 rounded-lg"><i data-lucide="chevron-left" class="w-4 h-4"></i></button>
+                    <span id="cal-month-label" class="text-sm font-bold font-mono w-36 text-center select-none"></span>
+                    <button onclick="navMonth(1)" title="Next month" class="nav-btn p-2 rounded-lg"><i data-lucide="chevron-right" class="w-4 h-4"></i></button>
+                    <button onclick="navYear(1)" title="Next year" class="nav-btn p-2 rounded-lg"><i data-lucide="chevrons-right" class="w-4 h-4"></i></button>
+                    <button onclick="goToday()" class="ml-2 px-3 py-1.5 rounded-lg text-xs font-bold glass-panel hover:bg-white/10 transition-colors">Today</button>
+                </div>
+            </div>
+
+            <div id="cal-stats" class="grid grid-cols-4 md:grid-cols-8 gap-4 mb-5 pb-5 border-b border-white/5">
+                <!-- Populated by JS -->
+            </div>
+
+            <div class="overflow-x-auto">
+                <div class="min-w-[820px]">
+                    <div class="grid grid-cols-8 gap-2 mb-2 text-center text-xs font-mono text-[var(--ink-dim)] uppercase tracking-wide">
+                        <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div><div>Week</div>
+                    </div>
+                    <div id="calendar-grid" class="grid grid-cols-8 gap-2">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Trades Ledger -->
+        <div id="ledger" class="glass-panel rounded-3xl p-6 mt-6">
+            <h2 class="text-lg font-bold mb-4 flex items-center gap-2">
+                <i data-lucide="list" class="w-5 h-5 text-cyan-400"></i> Recent Trades
+            </h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm min-w-[760px]">
+                    <thead>
+                        <tr class="text-left text-xs uppercase tracking-wide text-[var(--ink-dim)] font-mono border-b border-white/10">
+                            <th class="py-2 pr-4">Time</th>
+                            <th class="py-2 pr-4">Ticker</th>
+                            <th class="py-2 pr-4">Side</th>
+                            <th class="py-2 pr-4">Strategy</th>
+                            <th class="py-2 pr-4 text-right">Risk</th>
+                            <th class="py-2 pr-4 text-right">R:R</th>
+                            <th class="py-2 pr-4 text-right">P&L</th>
+                            <th class="py-2 text-center">Chart</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ledger-tbody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    </div>
+
+    <!-- Trade Details Modal (Hidden by default) -->
+    <div id="trade-modal" class="fixed inset-0 z-50 hidden items-center justify-center p-4">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="closeModal()"></div>
+        <div class="glass-panel w-full max-w-5xl max-h-[85vh] rounded-3xl border border-white/10 shadow-2xl relative z-10 flex flex-col overflow-hidden">
+
+            <div class="p-6 border-b border-white/5 flex justify-between items-center bg-white/5">
+                <h3 id="modal-date" class="text-xl font-bold font-mono text-white">Date</h3>
+                <div id="modal-pnl" class="text-lg font-black px-3 py-1 rounded-lg border"></div>
+                <button onclick="closeModal()" class="p-2 hover:bg-white/10 rounded-full transition-colors">
+                    <i data-lucide="x" class="w-5 h-5 text-[var(--ink-dim)]"></i>
+                </button>
+            </div>
+
+            <div class="p-6 overflow-y-auto flex-1">
+                <div id="modal-trades-list" class="space-y-4">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize Icons
+        lucide.createIcons();
+
+        // --- DATA INJECTION FROM chart_server.py (Jinja2) ---
+        const rawMacroData = {{ macro_data | tojson | safe }};
+        const rawLedgerData = {{ ledger_data | tojson | safe }};
+
+        // --- LIVE (Robinhood-style) equity ticking state ---
+        // The displayed value the odometer animation last landed on, and the raw poll
+        // history — kept module-level so pollEngineStatus can tween FROM the previously
+        // shown number instead of jump-cutting on every 2s poll.
+        let liveEquityValue = null;
+
+        // A day whose net P&L exceeds ±BIG_DAY gets the intense heatmap tier (dark
+        // green / dark red); smaller days get the soft tier. Tune to your account size.
+        const BIG_DAY = 100;
+
+        // --- INITIALIZE EQUITY CHART ---
+        const chartContainer = document.getElementById('tv-chart');
+        const chart = LightweightCharts.createChart(chartContainer, {
+            layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#86868B' },
+            grid: { vertLines: { color: 'rgba(255, 255, 255, 0.05)' }, horzLines: { color: 'rgba(255, 255, 255, 0.05)' } },
+            rightPriceScale: { borderVisible: false },
+            timeScale: { borderVisible: false },
+            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        });
+
+        const lineSeries = chart.addAreaSeries({
+            lineColor: '#22d3ee',
+            topColor: 'rgba(34, 211, 238, 0.45)',
+            bottomColor: 'rgba(34, 211, 238, 0.0)',
+            lineWidth: 2,
+        });
+        // ONE series, ONE time format (unix seconds) for both intraday and daily data.
+        // Mixing formats — seconds for intraday, 'YYYY-MM-DD' for daily — across two
+        // swapped series corrupts the time axis: it retains the previous series' bar
+        // spacing, and neither fitContent() nor setVisibleLogicalRange() can recover it
+        // (observed live: the axis stuck at logical range -1625→26, squashing 29 daily
+        // points against the right edge). Normalising everything to epoch seconds keeps
+        // a single consistent axis and removes the need to swap series at all.
+        // fitContent() alone does NOT recover a squashed axis. When the series point count
+        // drops sharply — bucketing took 1D from ~17,280 raw 5s samples to 93 15-min
+        // buckets — the chart keeps the OLD bar spacing, pinned near minBarSpacing 0.5, so
+        // the new points render into ~5% of the width as a near-vertical "straight line".
+        // Observed: logical range -1561..90 for 93 points. Setting barSpacing explicitly
+        // DOES take effect where fitContent does not.
+        // NOTE: getVisibleLogicalRange() keeps reporting the stale range even after the
+        // render corrects, so never use it to verify this — look at the pixels.
+        const fitByBarSpacing = (n) => {
+            if (!n) return;
+            const w = chartContainer.clientWidth || 900;
+            // applyOptions ALONE fixes the render. Do NOT call fitContent() after it —
+            // fitContent re-applies the squashed spacing and undoes this, which is the
+            // whole reason the curve looked like a straight line.
+            // No upper cap: sparse ranges (1W = 7 daily points) need wide spacing to fill the
+            // pane. Capping at 24px left them occupying 18% of the width — the same
+            // crushed look, just against the other edge.
+            chart.applyOptions({ timeScale: { barSpacing: Math.max(0.5, w / n), rightOffset: 2 } });
+        };
+
+        const toEpoch = d => Math.floor(new Date(d + 'T00:00:00').getTime() / 1000);
+        const macroAsEpoch = () => rawMacroData.map(p => ({ time: toEpoch(p.time), value: Number(p.value) }));
+        if (rawMacroData.length) {
+            lineSeries.setData(macroAsEpoch());
+            fitByBarSpacing(rawMacroData.length);
+        }
+
+        new ResizeObserver(entries => {
+            if (entries.length === 0 || entries[0].target !== chartContainer) return;
+            const newRect = entries[0].contentRect;
+            chart.applyOptions({ height: newRect.height, width: newRect.width });
+        }).observe(chartContainer);
+
+        // --- CALENDAR: real month grid (leading/trailing days from adjacent months
+        // included, dimmed), a week-total column, and month/year navigation. All date
+        // math is in the VIEWER'S LOCAL time so "today" is the user's actual today —
+        // UTC would light up tomorrow's cell during their evening (e.g. 7pm PDT is
+        // already the next day in UTC). Trades are bucketed by the LOCAL date of their
+        // exit timestamp, and today/grid use local too, so a cell can never disagree
+        // with the trades shown inside it. ---
+
+        function fmtDate(d) {
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        }
+
+        // --- Odometer-style number tween (the Robinhood "spinning ticket" feel) ---
+        // Animates an element's displayed dollar value from `from` to `to` over `duration`
+        // ms (ease-out), so a value that only actually refreshes every couple seconds still
+        // reads as continuously live. Flashes green/red briefly in the direction of travel.
+        //
+        // Deliberately setInterval-driven, NOT requestAnimationFrame: rAF is tied to the
+        // page's paint/compositing cycle and gets fully SUSPENDED whenever the tab isn't the
+        // active/visible one (verified: a backgrounded tab never fires a single rAF callback,
+        // while setInterval keeps ticking regardless) — a dashboard like this is exactly the
+        // kind of page a user leaves open in a background tab, and a stuck-mid-animation
+        // number reading a stale value would be worse than no animation at all.
+        function animateValue(el, from, to, duration = 700) {
+            if (!el || from == null || to == null || from === to) {
+                if (el && to != null) el.textContent = money(to);
+                return;
+            }
+            const up = to >= from;
+            el.classList.remove('tick-up', 'tick-down');
+            void el.offsetWidth;   // restart the CSS animation even if the same class reapplies
+            el.classList.add(up ? 'tick-up' : 'tick-down');
+            if (el._tweenTimer) clearInterval(el._tweenTimer);   // supersede any in-flight tween
+            const t0 = Date.now();
+            const STEP_MS = 16;   // ~60fps when the tab is active; still correct, just chunkier, when backgrounded
+            el._tweenTimer = setInterval(() => {
+                const p = Math.min(1, (Date.now() - t0) / duration);
+                const eased = 1 - Math.pow(1 - p, 3);   // ease-out cubic
+                el.textContent = money(from + (to - from) * eased);
+                if (p >= 1) {
+                    clearInterval(el._tweenTimer);
+                    el._tweenTimer = null;
+                    el.textContent = money(to);
+                    setTimeout(() => el.classList.remove('tick-up', 'tick-down'), 500);
+                }
+            }, STEP_MS);
+        }
+        function money(n) {
+            return '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+        // Local calendar date of a trade from its exit timestamp (which carries a
+        // timezone). Falls back to the backend's date string if the timestamp is absent.
+        function tradeLocalDate(t) {
+            if (t.exitTime) {
+                const d = new Date(t.exitTime);
+                if (!isNaN(d)) return fmtDate(d);
+            }
+            return t.date;
+        }
+
+        const dailyPnL = {};
+        const tradesByDay = {};
+        rawLedgerData.forEach(t => {
+            const key = tradeLocalDate(t);
+            if (!dailyPnL[key]) { dailyPnL[key] = 0; tradesByDay[key] = []; }
+            dailyPnL[key] += t.pnl;
+            tradesByDay[key].push(t);
+        });
+
+        function buildMonthGrid(year, month) {
+            const firstOfMonth = new Date(year, month, 1);
+            const gridStart = new Date(firstOfMonth);
+            gridStart.setDate(1 - firstOfMonth.getDay());
+            const lastOfMonth = new Date(year, month + 1, 0);
+            const gridEnd = new Date(lastOfMonth);
+            gridEnd.setDate(lastOfMonth.getDate() + (6 - lastOfMonth.getDay()));
+            const days = [];
+            const cur = new Date(gridStart);
+            while (cur <= gridEnd) {
+                days.push(new Date(cur));
+                cur.setDate(cur.getDate() + 1);
+            }
+            return days;
+        }
+
+        // Default the view to the month of the most recent activity, so a quiet
+        // "today" doesn't open on an empty calendar.
+        let viewDate = (function () {
+            const keys = Object.keys(dailyPnL).sort();
+            const last = keys.length ? keys[keys.length - 1] : fmtDate(new Date());
+            const [y, m] = last.split('-').map(Number);
+            return { year: y, month: m - 1 };
+        })();
+
+        function statBlock(label, value, cls) {
+            return `
+                <div>
+                    <div class="text-[10px] uppercase tracking-wide text-[var(--ink-dim)] font-mono mb-1">${label}</div>
+                    <div class="text-sm font-bold font-mono ${cls || 'text-[var(--ink)]'}">${value}</div>
+                </div>`;
+        }
+
+        function renderMonthStats(monthDays) {
+            const dateStrs = monthDays.filter(d => d.getMonth() === viewDate.month).map(fmtDate);
+            const active = dateStrs.filter(ds => dailyPnL[ds] !== undefined);
+            const monthPnl = active.reduce((s, ds) => s + dailyPnL[ds], 0);
+            const totalTrades = active.reduce((s, ds) => s + tradesByDay[ds].length, 0);
+            let bestDay = null, worstDay = null, mostActive = null;
+            active.forEach(ds => {
+                if (!bestDay || dailyPnL[ds] > dailyPnL[bestDay]) bestDay = ds;
+                if (!worstDay || dailyPnL[ds] < dailyPnL[worstDay]) worstDay = ds;
+                if (!mostActive || tradesByDay[ds].length > tradesByDay[mostActive].length) mostActive = ds;
+            });
+            let wins = 0, losses = 0;
+            active.forEach(ds => tradesByDay[ds].forEach(t => { if (t.pnl > 0) wins++; else if (t.pnl < 0) losses++; }));
+            const winRate = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(0) + '%' : '—';
+            const avgDay = active.length > 0 ? monthPnl / active.length : 0;
+
+            document.getElementById('cal-stats').innerHTML = [
+                statBlock('Monthly P&L', (monthPnl >= 0 ? '+' : '') + '$' + monthPnl.toFixed(2), monthPnl >= 0 ? 'text-[var(--win)]' : 'text-[var(--loss)]'),
+                statBlock('Trading Days', active.length),
+                statBlock('Trades', totalTrades),
+                statBlock('Best Day', bestDay ? '+$' + dailyPnL[bestDay].toFixed(2) : '—', 'text-[var(--win)]'),
+                statBlock('Worst Day', (worstDay && dailyPnL[worstDay] < 0) ? '$' + dailyPnL[worstDay].toFixed(2) : '—', 'text-[var(--loss)]'),
+                statBlock('Most Active', mostActive ? mostActive.slice(8) + ' · ' + tradesByDay[mostActive].length : '—'),
+                statBlock('Avg / Day', '$' + avgDay.toFixed(2)),
+                statBlock('Win Rate', winRate),
+            ].join('');
+        }
+
+        function renderCalendar() {
+            const grid = document.getElementById('calendar-grid');
+            const label = document.getElementById('cal-month-label');
+            const days = buildMonthGrid(viewDate.year, viewDate.month);
+            const todayStr = fmtDate(new Date());
+
+            label.textContent = new Date(viewDate.year, viewDate.month, 1)
+                .toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+            let html = '';
+            for (let w = 0; w < days.length / 7; w++) {
+                let weekPnl = 0, weekTrades = 0;
+                let rowHtml = '';
+                for (let d = 0; d < 7; d++) {
+                    const day = days[w * 7 + d];
+                    const dateStr = fmtDate(day);
+                    const inMonth = day.getMonth() === viewDate.month;
+                    const pnl = dailyPnL[dateStr] || 0;
+                    const count = (tradesByDay[dateStr] || []).length;
+                    weekPnl += pnl; weekTrades += count;
+
+                    let cls = '';
+                    if (count > 0) {
+                        if (pnl >= BIG_DAY) cls = 'win-big';
+                        else if (pnl > 0) cls = 'win';
+                        else if (pnl <= -BIG_DAY) cls = 'loss-big';
+                        else if (pnl < 0) cls = 'loss';
+                    }
+                    const classes = ['cal-cell', cls, inMonth ? '' : 'out-of-month',
+                                      dateStr === todayStr ? 'is-today' : '', count > 0 ? 'has-trades' : ''].join(' ');
+
+                    rowHtml += `
+                        <div onclick="openModal('${dateStr}')" class="${classes}">
+                            <span class="text-sm font-semibold ${inMonth ? 'text-[var(--ink)]' : 'text-[var(--ink-dim)]'}">${day.getDate()}</span>
+                            ${count > 0 ? `
+                                <div>
+                                    <div class="text-sm font-mono font-bold ${pnl >= 0 ? 'text-[var(--win)]' : 'text-[var(--loss)]'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</div>
+                                    <div class="text-[10px] text-[var(--ink-dim)] font-mono">${count} trade${count > 1 ? 's' : ''}</div>
+                                </div>` : ''}
+                        </div>`;
+                }
+                rowHtml += `
+                    <div class="week-cell">
+                        <div class="text-[10px] uppercase tracking-wide text-[var(--ink-dim)] font-mono mb-1">Total</div>
+                        <div class="text-sm font-mono font-bold ${weekPnl >= 0 ? 'text-[var(--win)]' : 'text-[var(--loss)]'}">${weekTrades > 0 ? (weekPnl >= 0 ? '+' : '') + '$' + weekPnl.toFixed(2) : '—'}</div>
+                        ${weekTrades > 0 ? `<div class="text-[10px] text-[var(--ink-dim)] font-mono">${weekTrades} trades</div>` : ''}
+                    </div>`;
+                html += rowHtml;
+            }
+            grid.innerHTML = html;
+            renderMonthStats(days);
+        }
+
+        function navMonth(delta) {
+            viewDate.month += delta;
+            if (viewDate.month < 0) { viewDate.month = 11; viewDate.year--; }
+            if (viewDate.month > 11) { viewDate.month = 0; viewDate.year++; }
+            renderCalendar();
+        }
+        function navYear(delta) {
+            viewDate.year += delta;
+            renderCalendar();
+        }
+        function goToday() {
+            const now = new Date();
+            viewDate = { year: now.getFullYear(), month: now.getMonth() };
+            renderCalendar();
+        }
+
+        // --- RENDER KPIs ---
+        function renderKPIs() {
+            let wins = 0, losses = 0, totalPnl = 0, grossProfit = 0, grossLoss = 0;
+            rawLedgerData.forEach(t => {
+                totalPnl += t.pnl;
+                if (t.pnl > 0) { wins++; grossProfit += t.pnl; }
+                else if (t.pnl < 0) { losses++; grossLoss += Math.abs(t.pnl); }
+            });
+            const total = wins + losses;
+            const winRate = total > 0 ? ((wins / total) * 100).toFixed(1) : '0.0';
+            const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : (grossProfit > 0 ? '∞' : '—');
+            const avgWin = wins > 0 ? grossProfit / wins : 0;
+            const avgLoss = losses > 0 ? grossLoss / losses : 0;
+            // Portfolio Value = LIVE equity, polled from /api/botstatus (see pollEngineStatus).
+            // Falls back to the most recent Macro snapshot until the first live poll lands.
+            const portfolioValue = rawMacroData.length ? rawMacroData[rawMacroData.length - 1].value : null;
+
+            const card = (label, valueHtml) => `
+                <div class="glass-panel p-5 rounded-2xl">
+                    <div class="text-xs text-[var(--ink-dim)] font-mono mb-1 uppercase tracking-wide">${label}</div>
+                    ${valueHtml}
+                </div>`;
+            const big = (txt, cls) => `<div class="text-2xl font-extrabold ${cls || 'text-[var(--ink)]'}">${txt}</div>`;
+            // money() is the page-level odometer helper (shared with animateValue).
+
+            document.getElementById('kpi-container').innerHTML =
+                card('Portfolio Value', `<div id="kpi-portfolio" class="text-2xl font-extrabold text-[var(--ink)] tabular-nums">${portfolioValue != null ? money(portfolioValue) : '—'}</div>`) +
+                card('Net P&L (All-Time)', big((totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2), totalPnl >= 0 ? 'text-[var(--win)]' : 'text-[var(--loss)]')) +
+                card('Win Rate', big(winRate + '%')) +
+                card('Profit Factor', big(profitFactor)) +
+                card('Avg Win / Loss', `<div class="text-xl font-extrabold"><span class="text-[var(--win)]">+$${avgWin.toFixed(2)}</span> <span class="text-[var(--ink-dim)] font-normal">/</span> <span class="text-[var(--loss)]">-$${avgLoss.toFixed(2)}</span></div>`) +
+                card('Total Trades', big(String(total))) +
+                // Fees charged by PaperTrader. Shows "—" until the poll returns, and stays
+                // "—" if the bot never recorded any (stock bot models no fees at all) —
+                // a $0.00 there would read as "trading is free", which is the exact
+                // misreading the fee model exists to prevent.
+                card('Fees Paid', `<div id="kpi-fees" class="text-2xl font-extrabold text-[var(--loss)] tabular-nums">—</div>`);
+
+            liveEquityValue = portfolioValue;   // baseline for the first live-poll tween
+        }
+
+        // --- MODAL LOGIC ---
+        function fmtPrice(n) {
+            if (n === null || n === undefined) return '—';
+            const abs = Math.abs(n);
+            const dec = abs < 1 ? 5 : abs < 100 ? 4 : 2;
+            return n.toFixed(dec);
+        }
+        function fmtTime(iso) {
+            if (!iso || iso.length < 16) return '—';
+            return iso.slice(11, 16);
+        }
+        function detailStat(label, value, cls) {
+            return `
+                <div>
+                    <div class="text-[9px] uppercase tracking-wide text-[var(--ink-dim)] font-mono mb-0.5">${label}</div>
+                    <div class="text-xs font-mono font-semibold ${cls || 'text-[var(--ink)]'}">${value}</div>
+                </div>`;
+        }
+
+        function openModal(date) {
+            const trades = tradesByDay[date] || [];
+            if (trades.length === 0) return;
+
+            const totalPnl = trades.reduce((sum, t) => sum + t.pnl, 0);
+
+            document.getElementById('modal-date').innerText = date;
+            const pnlBadge = document.getElementById('modal-pnl');
+            pnlBadge.innerText = `${totalPnl > 0 ? '+' : ''}$${totalPnl.toFixed(2)}`;
+            pnlBadge.style.color = totalPnl >= 0 ? 'var(--win)' : 'var(--loss)';
+            pnlBadge.style.background = totalPnl >= 0 ? 'var(--win-soft)' : 'var(--loss-soft)';
+            pnlBadge.style.borderColor = totalPnl >= 0 ? 'var(--win-border)' : 'var(--loss-border)';
+
+            const list = document.getElementById('modal-trades-list');
+            list.innerHTML = trades.map(t => `
+                <div class="bg-black/50 border border-white/5 rounded-xl p-4">
+                    <div class="flex items-center gap-3 mb-4">
+                        <span class="px-2 py-0.5 bg-white/10 rounded text-xs font-bold text-white">${t.ticker}</span>
+                        <span class="px-2 py-0.5 rounded text-xs font-bold ${t.side === 'LONG' ? 'bg-cyan-500/20 text-cyan-400' : 'bg-purple-500/20 text-purple-400'}">${t.side}</span>
+                        <span class="text-sm font-mono font-bold" style="color:${t.pnl >= 0 ? 'var(--win)' : 'var(--loss)'}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</span>
+                        ${t.leverage > 1 ? `<span class="text-xs font-mono text-[var(--ink-dim)]">${t.leverage}x</span>` : ''}
+                        <span class="text-xs font-mono text-[var(--ink-dim)] ml-auto">${fmtTime(t.entryTime)} → ${fmtTime(t.exitTime)}</span>
+                    </div>
+                    <div class="flex gap-6">
+                        <div class="flex-1 grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-3 min-w-0">
+                            ${detailStat('Entry', fmtPrice(t.entry))}
+                            ${detailStat('Stop Loss', fmtPrice(t.stopLoss), 'text-[var(--loss)]')}
+                            ${detailStat('Take Profit', fmtPrice(t.takeProfit), 'text-[var(--win)]')}
+                            ${detailStat('Exit', fmtPrice(t.exit))}
+                            ${detailStat('Size', t.size != null ? t.size.toLocaleString(undefined, {maximumFractionDigits: 6}) : '—')}
+                            ${detailStat('Margin', t.margin != null ? '$' + t.margin.toFixed(2) : '—')}
+                            ${detailStat('Notional', t.notional != null ? '$' + t.notional.toFixed(2) : '—')}
+                            ${detailStat('Strategy', t.reason || '—')}
+                        </div>
+                        ${t.chartUrl ? `
+                        <div class="w-2/5 aspect-video bg-zinc-900 rounded-lg overflow-hidden border border-white/10 relative group flex-shrink-0">
+                            <div class="chart-fallback absolute inset-0 flex items-center justify-center text-xs text-[var(--ink-dim)]">Loading chart…</div>
+                            <img src="${t.chartUrl}" class="w-full h-full object-cover relative z-10"
+                                 onload="this.previousElementSibling.style.display='none'"
+                                 onerror="this.style.display='none'; this.previousElementSibling.innerText='Chart unavailable';" />
+                        </div>` : ''}
+                    </div>
+                </div>
+            `).join('');
+
+            document.getElementById('trade-modal').classList.remove('hidden');
+            document.getElementById('trade-modal').classList.add('flex');
+        }
+
+        function closeModal() {
+            document.getElementById('trade-modal').classList.add('hidden');
+            document.getElementById('trade-modal').classList.remove('flex');
+        }
+
+        // --- RECENT TRADES LEDGER TABLE ---
+        function renderLedgerTable() {
+            const tbody = document.getElementById('ledger-tbody');
+            const sorted = [...rawLedgerData].sort((a, b) => (b.exitTime || '').localeCompare(a.exitTime || ''));
+            tbody.innerHTML = sorted.slice(0, 100).map(t => {
+                // Risked $ = distance to stop × size; Realized R:R = outcome ÷ risk (in R).
+                const risk = (t.entry != null && t.stopLoss != null && t.size != null)
+                    ? Math.abs(t.entry - t.stopLoss) * t.size : null;
+                const realizedR = (risk && risk > 0) ? (t.pnl / risk) : null;
+                const when = (t.exitTime || '').slice(0, 16).replace('T', ' ');
+                return `
+                    <tr class="border-b border-white/5 hover:bg-white/5 transition-colors">
+                        <td class="py-2 pr-4 font-mono text-[var(--ink-dim)] whitespace-nowrap">${when || '—'}</td>
+                        <td class="py-2 pr-4 font-bold">${t.ticker}</td>
+                        <td class="py-2 pr-4"><span class="px-2 py-0.5 rounded text-xs font-bold ${t.side === 'LONG' ? 'bg-cyan-500/20 text-cyan-400' : 'bg-purple-500/20 text-purple-400'}">${t.side}</span></td>
+                        <td class="py-2 pr-4 font-mono text-xs text-[var(--ink-dim)]">${t.reason || '—'}</td>
+                        <td class="py-2 pr-4 text-right font-mono">${risk != null ? '$' + risk.toFixed(2) : '—'}</td>
+                        <td class="py-2 pr-4 text-right font-mono ${realizedR != null && realizedR >= 0 ? 'text-[var(--win)]' : 'text-[var(--loss)]'}">${realizedR != null ? (realizedR >= 0 ? '+' : '') + realizedR.toFixed(2) + 'R' : '—'}</td>
+                        <td class="py-2 pr-4 text-right font-mono font-bold" style="color:${t.pnl >= 0 ? 'var(--win)' : 'var(--loss)'}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</td>
+                        <td class="py-2 text-center">${t.chartUrl ? `<a href="${t.chartUrl}" target="_blank" rel="noopener" class="inline-flex text-cyan-400 hover:text-cyan-300"><i data-lucide="image" class="w-4 h-4"></i></a>` : '<span class="text-[var(--ink-dim)]">—</span>'}</td>
+                    </tr>`;
+            }).join('') || `<tr><td colspan="8" class="py-6 text-center text-[var(--ink-dim)] font-mono">No trades yet</td></tr>`;
+            if (window.lucide) lucide.createIcons();
+        }
+
+        // --- WIN/LOSS DONUT (Chart.js) ---
+        function renderDonut() {
+            let wins = 0, losses = 0, longWins = 0, longTot = 0, shortWins = 0, shortTot = 0;
+            rawLedgerData.forEach(t => {
+                if (t.pnl > 0) wins++; else if (t.pnl < 0) losses++;
+                if (t.side === 'LONG') { longTot++; if (t.pnl > 0) longWins++; }
+                else if (t.side === 'SHORT') { shortTot++; if (t.pnl > 0) shortWins++; }
+            });
+            const total = wins + losses;
+            document.getElementById('donut-center-rate').textContent =
+                total > 0 ? ((wins / total) * 100).toFixed(0) + '%' : '—';
+            const pct = (w, t) => t > 0 ? Math.round(w / t * 100) + '%' : '—';
+            document.getElementById('donut-legend').innerHTML =
+                `<span><span style="color:var(--win)">●</span> ${wins} wins</span>
+                 <span><span style="color:var(--loss)">●</span> ${losses} losses</span>
+                 <span class="text-[var(--ink-dim)]">Long ${pct(longWins, longTot)} · Short ${pct(shortWins, shortTot)}</span>`;
+            new Chart(document.getElementById('donut-chart'), {
+                type: 'doughnut',
+                data: { labels: ['Wins', 'Losses'], datasets: [{ data: [wins, losses],
+                    backgroundColor: ['#30D158', '#FF453A'], borderWidth: 0, hoverOffset: 6 }] },
+                options: { responsive: true, maintainAspectRatio: false, cutout: '72%',
+                    plugins: { legend: { display: false } } }
+            });
+        }
+
+        // --- DAILY P&L BAR (Chart.js) — last 30 active days ---
+        function renderDailyBar() {
+            const entries = Object.entries(dailyPnL).sort((a, b) => a[0].localeCompare(b[0])).slice(-30);
+            new Chart(document.getElementById('bar-chart'), {
+                type: 'bar',
+                data: { labels: entries.map(e => e[0].slice(5)), datasets: [{
+                    data: entries.map(e => e[1]),
+                    backgroundColor: entries.map(e => e[1] >= 0 ? 'rgba(48,209,88,0.75)' : 'rgba(255,69,58,0.75)'),
+                    borderRadius: 4 }] },
+                options: { responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false },
+                        tooltip: { callbacks: { label: c => (c.raw >= 0 ? '+$' : '-$') + Math.abs(c.raw).toFixed(2) } } },
+                    scales: {
+                        x: { grid: { display: false }, ticks: { color: '#86868B', font: { family: 'JetBrains Mono', size: 10 } } },
+                        y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#86868B', font: { family: 'JetBrains Mono', size: 10 },
+                            callback: v => '$' + v } } } }
+            });
+        }
+
+        // --- SIDEBAR NAV: smooth-scroll to a section, highlight the active link ---
+        function goSection(id, el) {
+            const target = document.getElementById(id);
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            document.querySelectorAll('.side-link').forEach(l => l.classList.remove('active'));
+            if (el) el.classList.add('active');
+        }
+
+        // --- LIVE BOT-STATUS INDICATOR: poll the server for state-file freshness ---
+        const ACCOUNT = '{{ account }}';
+        async function pollEngineStatus() {
+            const dot = document.getElementById('engine-dot');
+            const label = document.getElementById('engine-status');
+            try {
+                const r = await fetch('/api/botstatus?account=' + ACCOUNT, { cache: 'no-store' });
+                const s = await r.json();
+                // LIVE Portfolio Value — Robinhood-style: the number odometer-tweens from
+                // its last displayed value to the new one (rather than jump-cutting), and
+                // the equity chart's TODAY point is upserted in place so the line's tip
+                // visibly moves with the market too.
+                if (s.equity != null) {
+                    const newEquity = Number(s.equity);
+                    const pv = document.getElementById('kpi-portfolio');
+                    if (pv && newEquity !== liveEquityValue) {
+                        animateValue(pv, liveEquityValue, newEquity);
+                    }
+                    liveEquityValue = newEquity;
+
+                    const feeEl = document.getElementById('kpi-fees');
+                    if (feeEl) {
+                        if (s.totalFees === null || s.totalFees === undefined) {
+                            feeEl.textContent = '—';
+                            feeEl.title = 'This bot has never recorded trading costs.';
+                        } else {
+                            feeEl.textContent = '-$' + Number(s.totalFees).toFixed(2);
+                            feeEl.title = (s.feeRate != null
+                                ? `at ${(s.feeRate * 100).toFixed(2)}% per side, on notional. `
+                                : '') + 'Counts from when the fee model went live (2026-08-22), not lifetime.';
+                        }
+                    }
+
+                    if (intradayMode && intradaySeries) {
+                        // Snap the live tip to the CURRENT BUCKET, not the current second.
+                        // Stamping it with Date.now() made update() append a brand-new point
+                        // every poll, so the curve crawled forward continuously and a quiet
+                        // hour became 3600 points. Flooring to the bucket makes update()
+                        // overwrite the still-forming point instead: the value keeps moving
+                        // live, but the curve only STEPS when the interval rolls over —
+                        // which is how Robinhood behaves.
+                        const nowBucket = Math.floor(Date.now() / 1000 / intradayBucketSecs)
+                                          * intradayBucketSecs;
+                        intradaySeries.update({ time: nowBucket, value: newEquity });
+                        paintChange(newEquity, intradayBaseline);
+                    } else {
+                        // Daily view: upsert TODAY's point. Must use epoch seconds like
+                        // everything else — pushing a 'YYYY-MM-DD' string onto this
+                        // (now epoch-keyed) series is what corrupted the time axis, since
+                        // this poll runs every second and re-broke it after every fix.
+                        const todayStr = fmtDate(new Date());
+                        lineSeries.update({ time: toEpoch(todayStr), value: newEquity });
+                        if (!rawMacroData.length || rawMacroData[rawMacroData.length - 1].time !== todayStr) {
+                            rawMacroData.push({ time: todayStr, value: newEquity });
+                        } else {
+                            rawMacroData[rawMacroData.length - 1].value = newEquity;
+                        }
+                        paintChange(newEquity, intradayBaseline);
+                    }
+                }
+                if (s.online) {
+                    dot.className = 'status-dot online';
+                    label.textContent = 'ONLINE';
+                    label.className = 'text-xs font-bold font-mono text-[var(--win)]';
+                } else {
+                    dot.className = 'status-dot offline';
+                    label.textContent = 'OFFLINE';
+                    label.className = 'text-xs font-bold font-mono text-[var(--loss)]';
+                }
+            } catch (e) {
+                dot.className = 'status-dot offline';
+                label.textContent = 'NO SIGNAL';
+                label.className = 'text-xs font-bold font-mono text-[var(--ink-dim)]';
+            }
+        }
+
+        // ── INTRADAY (Robinhood-style) equity curve ───────────────────────────────
+        // The daily Macro series answers "how has the account done over weeks"; this
+        // answers "what is it doing right now". Two things make it read like Robinhood:
+        //   1. The y-axis is NOT zero-based — lightweight-charts autoscales to the visible
+        //      range, so a 0.2% intraday move is actually visible instead of a flat line.
+        //   2. Change is measured against the FIRST point of the window (the period's
+        //      baseline), never against zero — same as RH anchoring 1D to the prior close.
+        let intradayMode  = false;
+        let intradaySeries = null;
+        let intradayBaseline = null;
+        // Interval the intraday curve steps by, from /api/equity_series. The server
+        // owns this so the live tip lands on exactly the same grid as the history.
+        let intradayBucketSecs = 900;
+
+        // The baseline marker is RE-created on every reload; without removing the previous
+        // one they stack up (observed: four "open" labels piled on the axis after a few
+        // range switches), so keep a handle and clear it first.
+        let baselineLine = null;
+        function setBaselineLine(series, price) {
+            if (baselineLine) {
+                try { series.removePriceLine(baselineLine); } catch (e) { /* series swapped */ }
+                baselineLine = null;
+            }
+            if (price == null) return;
+            baselineLine = series.createPriceLine({
+                price, color: 'rgba(255,255,255,0.28)', lineWidth: 1,
+                lineStyle: 2, axisLabelVisible: true, title: 'open',
+            });
+        }
+
+        // Both modes draw on the SAME series (see the time-format note above) — this just
+        // keeps the old call sites working without a second series to keep in sync.
+        function ensureIntradaySeries() {
+            intradaySeries = lineSeries;
+            return lineSeries;
+        }
+
+        function paintChange(last, baseline) {
+            const el = document.getElementById('equity-change');
+            if (!el || baseline == null || last == null) return;
+            const d   = last - baseline;
+            const pct = baseline ? (d / baseline) * 100 : 0;
+            const up  = d >= 0;
+            el.textContent = `${up ? '+' : '−'}$${Math.abs(d).toFixed(2)} (${up ? '+' : '−'}${Math.abs(pct).toFixed(2)}%)`;
+            el.style.color = up ? 'var(--win)' : 'var(--loss)';
+            // Recolor the curve itself green/red against the baseline, like RH does.
+            if (intradaySeries) {
+                intradaySeries.applyOptions({
+                    lineColor:   up ? '#22c55e' : '#ef4444',
+                    topColor:    up ? 'rgba(34,197,94,0.35)'  : 'rgba(239,68,68,0.35)',
+                    bottomColor: up ? 'rgba(34,197,94,0.0)'   : 'rgba(239,68,68,0.0)',
+                });
+            }
+        }
+
+        // Ranges <= 1D come from the intraday sampler (5s resolution, 24h retention);
+        // anything longer comes from the daily Macro snapshots. Same split Robinhood uses:
+        // 1D is tick data, 1W+ are daily closes. Mixing them in one series is not possible
+        // anyway — lightweight-charts needs a consistent time format per series (unix
+        // seconds for intraday, 'YYYY-MM-DD' for daily).
+        const INTRADAY_MAX_SECS = 86400;
+
+        async function loadIntraday(windowSecs = 86400) {
+            try {
+                const r = await fetch(`/api/equity_series?account=${ACCOUNT}&window=${windowSecs}`,
+                                      { cache: 'no-store' });
+                const s = await r.json();
+                if (!s.points || !s.points.length) return false;
+                const series = ensureIntradaySeries();
+                // Chart.setData wants ascending, unique timestamps (seconds).
+                const seen = new Set();
+                const data = [];
+                for (const p of s.points) {
+                    if (seen.has(p.t)) continue;
+                    seen.add(p.t);
+                    data.push({ time: p.t, value: p.v });
+                }
+                intradayMode = true;
+                series.setData(data);
+                intradayBaseline = s.baseline;
+                if (s.bucket) intradayBucketSecs = s.bucket;
+                setBaselineLine(series, s.baseline);
+                fitByBarSpacing(data.length);
+                paintChange(s.last, s.baseline);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // Long ranges: daily equity closes, filtered to the window. windowSecs === 0 → ALL.
+        function loadDaily(windowSecs) {
+            if (!rawMacroData.length) return false;
+            const cutoff = windowSecs > 0 ? Date.now() - windowSecs * 1000 : -Infinity;
+            const data = macroAsEpoch().filter(p => p.time * 1000 >= cutoff);
+            if (!data.length) return false;
+
+            intradayMode = false;
+            lineSeries.setData(data);
+            const baseline = data[0].value;
+            const last     = data[data.length - 1].value;
+            intradayBaseline = baseline;
+            setBaselineLine(lineSeries, baseline);
+            lineSeries.applyOptions({
+                lineColor:   last >= baseline ? '#22c55e' : '#ef4444',
+                topColor:    last >= baseline ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)',
+                bottomColor: last >= baseline ? 'rgba(34,197,94,0.0)'  : 'rgba(239,68,68,0.0)',
+            });
+            fitByBarSpacing(data.length);
+            paintChange(last, baseline);
+
+            // Be honest when the requested range exceeds the history that actually exists —
+            // showing "5Y" over 33 days of data without saying so would misrepresent it.
+            const note = document.getElementById('equity-range-note');
+            if (note) {
+                const spanDays = Math.max(1, Math.round(
+                    (data[data.length - 1].time - data[0].time) / 86400));
+                const wantDays = windowSecs > 0 ? Math.round(windowSecs / 86400) : 0;
+                // ALL isn't a shortfall — it's the whole record, so state the span plainly.
+                // A bounded range that outruns the data IS a shortfall; say so, otherwise
+                // "5Y" over 33 days silently misrepresents the track record.
+                note.textContent = windowSecs === 0
+                    ? `${spanDays}d total`
+                    : (wantDays > spanDays ? `only ${spanDays}d of history` : '');
+            }
+            return true;
+        }
+
+        function loadRange(windowSecs) {
+            const note = document.getElementById('equity-range-note');
+            if (windowSecs > 0 && windowSecs <= INTRADAY_MAX_SECS) {
+                if (note) note.textContent = '';
+                return loadIntraday(windowSecs);
+            }
+            return loadDaily(windowSecs);
+        }
+
+        // Init
+        renderCalendar();
+        renderKPIs();
+        renderLedgerTable();
+        renderDonut();
+        renderDailyBar();
+        pollEngineStatus();
+        loadRange(86400);      // default view = 1D (intraday ticks)
+
+        // 1s cadence for the number + curve tip. NOTE: the underlying sources genuinely
+        // change slower than this (the bot rewrites its state every few seconds; Alpaca
+        // equity is cached ~10s server-side), so a faster poll does not create new
+        // information — what makes it read as continuous is the odometer tween between
+        // ticks, exactly how Robinhood feels smooth on irregular websocket updates.
+        setInterval(pollEngineStatus, 1000);
+        // Re-pull the full intraday shape less often — the tip is already updated live by
+        // pollEngineStatus; this just keeps the history/baseline honest and bounded.
+        let equityWindowSecs = 86400;
+        // Only the intraday windows need periodic re-pulling (their shape genuinely
+        // changes minute to minute). Daily ranges move once a day, and pollEngineStatus
+        // already keeps the live tip current.
+        setInterval(() => {
+            if (equityWindowSecs > 0 && equityWindowSecs <= INTRADAY_MAX_SECS) {
+                loadIntraday(equityWindowSecs);
+            }
+        }, 30000);
+
+        // Range switcher. Changing the window changes BOTH the shape and the baseline the
+        // change is measured from — same behaviour as switching 1D/1W/1M on Robinhood.
+        document.querySelectorAll('#equity-range .range-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('#equity-range .range-btn')
+                        .forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                equityWindowSecs = Number(btn.dataset.secs);
+                // No series juggling needed — one series, one time format; setData fully
+                // replaces the previous window's points.
+                loadRange(equityWindowSecs);
+            });
+        });
+    </script>
+</body>
+</html>

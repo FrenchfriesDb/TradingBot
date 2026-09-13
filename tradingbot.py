@@ -31,6 +31,12 @@ _NOISE = (
     "keepalive ping timeout",
     "ConnectionClosedError",
     "Error getting broker balances",
+    # alpaca-py's TradingStream reconnect loop (alpaca/trading/stream.py) logs this
+    # exact wrapper phrase via its own "alpaca.trading.stream" logger — a namespace
+    # this filter was never attached to before, so its full traceback (TimeoutError,
+    # DNS blips, CancelledError — whatever the underlying transient cause is) printed
+    # raw on every reconnect. Match the stable wrapper text, not the varying cause.
+    "error during websocket communication",
 )
 
 class _QuietFilter(logging.Filter):
@@ -80,12 +86,62 @@ class _DedupMalformedOrderFilter(logging.Filter):
 
 _DEDUP_MALFORMED = _DedupMalformedOrderFilter()
 
+# ── Collapse network-outage tracebacks to a single line ───────────────────────
+# When the Mac loses DNS (laptop sleeps, WiFi drops, network changes), EVERY Alpaca
+# call fails with `socket.gaierror: [Errno 8] nodename nor servname provided`. Lumibot
+# catches it, fires on_bot_crash, and recovers on its own — but not before dumping a
+# ~200-line nested traceback for each failed call. Four calls in a row and the log is a
+# 800-line wall that looks exactly like a fatal crash when it's really a WiFi blip.
+# Nothing is wrong with the bot in this state; it resumes with "Sleeping until the
+# market opens" once DNS returns. Collapse these to one honest line so a genuine
+# error stays visible instead of being buried in transient network noise.
+_NETWORK_ERROR_SIGNS = (
+    "nodename nor servname provided",   # macOS DNS failure (the common one here)
+    "Failed to establish a new connection",
+    "Max retries exceeded",
+    "NewConnectionError",
+    "Temporary failure in name resolution",
+    "Connection aborted",
+    "Read timed out",
+    "ReadTimeout",
+)
+
+class _CollapseNetworkTracebackFilter(logging.Filter):
+    """Keep ONE line per network outage; drop the traceback and the repeats."""
+    _last_seen = [0.0]          # list so it stays mutable across calls
+    _QUIET_WINDOW_SECS = 60     # one notice per minute of continuous outage
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if not any(s in msg for s in _NETWORK_ERROR_SIGNS):
+            return True
+        # A bare traceback continuation line (lumibot logs the trace as its own record)
+        # carries no new information once the outage is already reported — drop it.
+        import time as _t
+        now = _t.time()
+        if now - self._last_seen[0] < self._QUIET_WINDOW_SECS:
+            return False
+        self._last_seen[0] = now
+        record.msg = ("🌐 Network unreachable (DNS/connection failure) — Alpaca calls are "
+                      "failing. The bot recovers automatically once the connection is back; "
+                      "no action needed unless this persists. Further network errors "
+                      "suppressed for 60s.")
+        record.args = ()
+        record.exc_info = None      # this is what kills the 200-line traceback
+        record.exc_text = None
+        return True
+
+_COLLAPSE_NETWORK = _CollapseNetworkTracebackFilter()
+
 def _add_filters(logger_obj):
-    for f in (_QUIET, _DEDUP_MALFORMED):
+    for f in (_QUIET, _DEDUP_MALFORMED, _COLLAPSE_NETWORK):
         if f not in logger_obj.filters:
             logger_obj.addFilter(f)
     for h in logger_obj.handlers:
-        for f in (_QUIET, _DEDUP_MALFORMED):
+        for f in (_QUIET, _DEDUP_MALFORMED, _COLLAPSE_NETWORK):
             if f not in h.filters:
                 h.addFilter(f)
 
@@ -106,7 +162,7 @@ def quiet_logging():
     # not "lumibot"), which propagates straight to the true root. With no handler left
     # on root, Python's own logging.lastResort fallback prints it raw — no formatting,
     # and it never passes through either filter above. Filter that fallback directly.
-    for f in (_QUIET, _DEDUP_MALFORMED):
+    for f in (_QUIET, _DEDUP_MALFORMED, _COLLAPSE_NETWORK):
         if f not in logging.lastResort.filters:
             logging.lastResort.addFilter(f)
     # The big tracebacks come from these two loggers — mute them; auto-reconnect handles it.
@@ -273,7 +329,22 @@ if __name__ == "__main__":
     }
 
     if len(sys.argv) > 1 and sys.argv[1].lower() in modes:
-        modes[sys.argv[1].lower()]()
+        mode = sys.argv[1].lower()
+        if mode in ("live", "crypto"):
+            # Single-instance lock (per mode, not "backtest" which has no live state to
+            # corrupt) — duplicate tradingbot.py instances raced writing strategy_state.json
+            # this session, zeroing out real position tracking and silently losing a real
+            # ledger row. Refuse to start a second copy of the SAME mode.
+            import os as _os
+            from bot.single_instance_lock import acquire_single_instance_lock
+            _lock_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                        f".tradingbot_{mode}.lock")
+            if not acquire_single_instance_lock(_lock_path):
+                print(f"⛔ Another tradingbot.py {mode} instance is already running "
+                      f"(lock: {_lock_path}). Refusing to start a duplicate — kill the "
+                      f"other process first if you really want to restart.")
+                sys.exit(1)
+        modes[mode]()
     else:
         print("Usage: python tradingbot.py [live|crypto|backtest]")
         print("  live      — Stocks on Alpaca paper (AAPL, QQQ, SPY, NVDA, TSLA, GOOGL)")

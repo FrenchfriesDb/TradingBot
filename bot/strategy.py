@@ -5,15 +5,75 @@ from finbert_utils import estimate_sentiment
 from config import (NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALPACA_API_SECRET,
                     BASE_URL as ALPACA_BASE_URL, GOOGLE_SHEET_URL)
 from sheets_logger import (get_sheet_client, ensure_tabs, log_daily_snapshot, log_trade,
-                            MACRO_HEADER, LEDGER_HEADER)
+                            missing_snapshot_dates, MACRO_HEADER, LEDGER_HEADER)
 from chart_renderer import render_trade_chart, render_stock_tradingview, save_chart_locally
 from github_chart_uploader import upload_chart_to_github
 import json
 import os
 import re
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 STRATEGY_STATE_FILE = "strategy_state.json"
+LOGGED_CLOSES_FILE  = "stock_logged_closes.json"  # dedup keys for broker-side closes (survives restarts)
+
+_ET = ZoneInfo("America/New_York")   # US equities session clock
+# No NEW entries inside this many minutes of the 4:00 PM ET close. A position opened
+# at 3:59 PM can't be flattened by before_closing_bell in time and rides overnight
+# straight into a gap (exactly how QQQ got held) — so we simply don't open that late.
+ENTRY_CUTOFF_MIN = 30
+# Force-flatten any open position inside this window of the close. This runs from the
+# main loop (which we KNOW executes every iteration), not only Lumibot's
+# before_closing_bell hook — so an EOD flatten no longer depends on that single hook
+# firing at exactly the right minute. (If the process itself is asleep at the close,
+# nothing can run — keep the bot awake, e.g. `caffeinate -i`.)
+EOD_FLATTEN_MIN = 15
+
+# ── HTF trend filter (Lever #1) ───────────────────────────────────────────────
+# Only trade WITH the higher-timeframe trend: longs need a confirmed uptrend, shorts a
+# downtrend. Anchored on the reliable daily EMA20/50 (get_daily_trend), with a 4H EMA
+# stack as an additional veto. Closes the old loophole where a BOS on a choppy tape
+# (daily trend = None) still traded — the QQQ long that got taken with no clear trend.
+TREND_EMA_FAST = 20
+TREND_EMA_SLOW = 50
+
+# ── Structural stops & targets ────────────────────────────────────────────────
+# Stops anchor to the FVG/OB invalidation but are floored OUTSIDE the noise: at least
+# MIN_STOP_ATR_MULT × the 1H ATR, so a single 5m/15m wick can't tag them. Targets pin
+# to the nearest 4H liquidity pool that offers at least MIN_TP_RR, capped at MAX_TP_RR
+# so the target stays reachable within the session (the bot flattens at the close).
+# ── Displacement size gates (added 2026-08-22) ────────────────────────────────
+# The stock bot armed zones via detect_displacement_fvg's bare defaults: body >= 40% of
+# its OWN range and a close 0.15% past the swing — both SCALE-FREE. A tiny bar in dead
+# chop scored identically to a decisive one, and unlike binance_bot nothing downstream
+# rechecked size, so a junk zone could arm AND fill unopposed. Values mirror the crypto
+# bot, where this pairing is already proven.
+DISPLACEMENT_BODY_FRAC = 0.5   # displacement body must be >= 50% of its range
+# ...and >= max(ATR_MULT x ATR, MIN_PCT x price) -- see indicators.displacement_min_body.
+#
+# RAISED FROM 0.6 on 2026-09-04, in step with binance_bot.py. A multiple under 1.0 means
+# "smaller than an AVERAGE candle", so an ordinary bar cleared the momentum test. Caught
+# on the crypto side (POL/USD armed on a 1.07x-ATR bar) but the identical defect was here.
+# Keep the two bots on the same numbers -- they have silently diverged before.
+DISPLACEMENT_ATR_MULT  = float(os.getenv("DISPLACEMENT_ATR_MULT", "1.8"))
+DISPLACEMENT_MIN_PCT   = float(os.getenv("DISPLACEMENT_MIN_PCT", "0.0015"))
+# Minimum FVG width -- a thinner gap is a line, not a zone.
+MIN_FVG_PCT            = float(os.getenv("MIN_FVG_PCT", "0.0015"))
+# Targets beyond this x the HTF ATR cannot resolve before STALE_TRADE_HOURS / the EOD
+# flatten, whichever lands first, so they only ever exit on the clock.
+MAX_TARGET_ATR_MULT    = float(os.getenv("MAX_TARGET_ATR_MULT", "1.5"))
+
+MIN_STOP_ATR_MULT = 1.5
+MIN_TP_RR = 2.0
+MAX_TP_RR = 4.0
+
+# ── TEMPORARY risk throttle (while the new crypto logic is being proven) ──────────
+# Hard-cap the ACTUAL dollar loss at the stop — measured AFTER leverage, since sizing
+# multiplies qty by PAPER_LEVERAGE (so a "$X risk" becomes X×leverage at the stop). This
+# is a pure sizing throttle; strategy/entry logic is untouched. Keeps stock stop-outs to
+# ~$30 (like the crypto bot's $8-30) instead of $200-500 while we test. Raise/remove once
+# the edge is proven. Set to None to disable.
+MAX_STOCK_RISK_DOLLARS = 30.0
 
 MIN_AI_RR = 2.0   # hard floor — 1:2 minimum keeps TP reachable intraday on 15m entries
 MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
@@ -37,11 +97,16 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
     Asks Llama 3.3 70B (via NVIDIA API) whether this SMC setup is worth taking,
     and lets it pick the R:R target itself (we only enforce a 1:{MIN_AI_RR} floor).
     Returns (confirm: bool, rr: float, reason: str).
-    Defaults to (False, 0.0, ...) on any failure — no signal means no trade,
-    never a blind entry.
+
+    The AI is a SECONDARY confirmation — the setup already passed every technical
+    filter (BOS, sweep, FVG, R:R floor) before we get here. So an AI *failure*
+    (timeout, network error, missing key, unparseable reply) falls back to proceeding
+    on the technicals at the 1:{MIN_AI_RR} floor, rather than silently killing a valid
+    trade. Only an explicit AI "NO" vetoes. (Matches binance_bot — an API hiccup must
+    not cost a setup; the stock bot was skipping every timed-out trade "for safety".)
     """
     if not NVIDIA_API_KEY:
-        return False, 0.0, "no_nvidia_key — skipping trade for safety"
+        return True, MIN_AI_RR, "no AI key — proceeding on technicals"
 
     side = "LONG" if bos_dir == "bullish" else "SHORT"
     pool_line = (f"Nearest structural target: ${pool_tp:,.4f}  "
@@ -68,6 +133,17 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
         for _, r in ltf_recent.iterrows()
     )
 
+    # News CONTEXT for the model (policy: context only — never a hardcoded gate). This
+    # replaces the old direction-blind FinBERT veto, which blocked SHORTS on bad news —
+    # backwards, since bad news argues FOR a short. Fail-soft: any failure renders as
+    # "no fresh news" and the setup is judged on structure exactly as before.
+    try:
+        from bot.news import get_news_context
+        news_block, _nh, _ns, _np = get_news_context(
+            symbol, ALPACA_API_KEY, ALPACA_API_SECRET, sentiment_fn=estimate_sentiment)
+    except Exception:
+        news_block = "RECENT NEWS: unavailable (news lookup failed) — judge on structure alone."
+
     prompt = f"""You are an expert institutional SMC (Smart Money Concepts) trade analyst.
 
 {htf_block}
@@ -84,7 +160,13 @@ Stop Loss    : ${sl:,.4f}  (risk = ${risk_amt:,.4f} per share)
 {pool_line}
 Last 5 × 15m candles: {ltf_candles}
 
+{news_block}
+
 Using the full 4H chart above, analyze this SMC setup:
+- Weigh the news above as CONTEXT ONLY: does it support or contradict this {side}?
+  Structure decides the trade; news can raise or lower your confidence in it, and should
+  never be the sole reason to take or skip a setup. Note that bad news is an argument FOR
+  a short, not against one. If there is no fresh news, judge on structure alone.
 - Did a genuine liquidity sweep occur at the swept level?
 - Is the FVG/OB entry zone structurally valid?
 - Does AMD (Accumulation → Manipulation → Distribution) context support this {side}?
@@ -122,13 +204,14 @@ REASON: one concise sentence"""
         reason  = reason_m.group(1).strip() if reason_m else text
 
         if decision_m is None:
-            reason = f"(unparsed AI response, skipping) {text}"
-            confirm = False
-            rr = 0.0
+            # Couldn't read a clear YES/NO — treat as no-signal, fall back to technicals
+            # rather than dropping a setup that already passed every technical filter.
+            return True, MIN_AI_RR, f"AI reply unparsed — proceeding on technicals ({text[:80]})"
 
         return confirm, rr, reason
     except Exception as e:
-        return False, 0.0, f"API error ({e}) — no signal, skipping for safety"
+        # Timeout / network / API error — proceed on technicals, don't skip a valid setup.
+        return True, MIN_AI_RR, f"AI unavailable ({e}) — proceeding on technicals"
 
 STALE_TRADE_HOURS = 6   # intraday SMC: close stale positions that haven't resolved in 6h
 
@@ -182,6 +265,8 @@ class DebbieLaSMC(Strategy):
         self._sheet_log_date    = None    # UTC date of the last daily-snapshot row written
         self._daily_open_balance = None   # captured lazily on the first iteration
         self._daily_open_spy    = None    # captured lazily on the first iteration with a SPY price
+        self._eod_flattened_date = None   # ET date the EOD flatten last actually ran — lets
+        # needs_eod_catchup_flatten tell "haven't flattened today" apart from "already did"
 
     def on_bot_start(self):
         """Kill the two stale BRACKET orders that spam WARNING every iteration."""
@@ -202,9 +287,21 @@ class DebbieLaSMC(Strategy):
             self.log_message(f"Stale order cleanup skipped: {e}", color="yellow")
 
     def _save_state(self):
-        """Persist SL/TP for every open position so restarts don't lose protection."""
+        """Persist SL/TP for every open position so restarts don't lose protection.
+        Preserves the "_daily_snapshot" key (written by _save_daily_snapshot_flag)
+        across this rewrite — this function rebuilds `data` from scratch on every
+        call, so without carrying it over, the next position-state save would
+        silently erase today's once-per-day dedup flag."""
         try:
             data = {}
+            if os.path.exists(STRATEGY_STATE_FILE):
+                try:
+                    with open(STRATEGY_STATE_FILE) as f:
+                        _prev = json.load(f)
+                    if "_daily_snapshot" in _prev:
+                        data["_daily_snapshot"] = _prev["_daily_snapshot"]
+                except Exception:
+                    pass
             for s in self.symbols:
                 if self.state[s] == "POSITION_OPEN":
                     _qty   = self.entry_qty.get(s) or 0
@@ -226,6 +323,27 @@ class DebbieLaSMC(Strategy):
         except Exception as e:
             self.log_message(f"[STATE] save failed: {e}", color="red")
 
+    def _save_daily_snapshot_flag(self):
+        """Persist the once-per-day Stock Macro snapshot dedup tracker. Without this,
+        every restart resets self._sheet_log_date to None and re-logs "today" again
+        — seen live: two rows for the same date after a same-day restart. Merges into
+        the existing state file rather than calling _save_state() (which only writes
+        when a position is open and doesn't touch these fields itself)."""
+        try:
+            data = {}
+            if os.path.exists(STRATEGY_STATE_FILE):
+                with open(STRATEGY_STATE_FILE) as f:
+                    data = json.load(f)
+            data["_daily_snapshot"] = {
+                "date":         self._sheet_log_date.isoformat() if self._sheet_log_date else None,
+                "open_balance": self._daily_open_balance,
+                "open_spy":     self._daily_open_spy,
+            }
+            with open(STRATEGY_STATE_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.log_message(f"[STATE] daily-snapshot save failed: {e}", color="red")
+
     def _load_state(self):
         """Restore SL/TP from last save so Python-side monitoring resumes correctly."""
         if not os.path.exists(STRATEGY_STATE_FILE):
@@ -233,6 +351,17 @@ class DebbieLaSMC(Strategy):
         try:
             with open(STRATEGY_STATE_FILE) as f:
                 data = json.load(f)
+            ds = data.get("_daily_snapshot")
+            if ds:
+                if ds.get("date"):
+                    try:
+                        self._sheet_log_date = datetime.fromisoformat(ds["date"]).date()
+                    except Exception:
+                        pass
+                if ds.get("open_balance") is not None:
+                    self._daily_open_balance = ds["open_balance"]
+                if ds.get("open_spy") is not None:
+                    self._daily_open_spy = ds["open_spy"]
             for s, saved in data.items():
                 if s not in self.symbols:
                     continue
@@ -268,16 +397,63 @@ class DebbieLaSMC(Strategy):
             for symbol in self.symbols:
                 asset    = self._make_asset(symbol)
                 position = self.get_position(asset)
+                # ── Startup EOD safety net ──────────────────────────────────────
+                # The live EOD_FLATTEN_MIN guard only runs INSIDE on_trading_iteration's
+                # loop — it can't catch anything if the bot isn't actively running during
+                # that 15-min window. A restart landing outside market hours (e.g. the bot
+                # gets restarted in the evening — a completely normal, frequent event)
+                # silently skips it, so a position opened hours earlier rides overnight
+                # with nothing checking it. REAL INCIDENT: NVDA entered 10:19 AM ET,
+                # process restarted 5:53 PM ET — 2h after the close — and nothing flattened
+                # it. Close immediately at startup if the market isn't open RIGHT NOW,
+                # regardless of internal state tracking (broker position is ground truth).
+                if position is not None and abs(float(position.quantity)) > 0:
+                    now_et = datetime.now(_ET)
+                    if not indicators.is_regular_session(now_et.weekday(), now_et.hour, now_et.minute):
+                        self.log_message(
+                            f"[{symbol}] ⚠️ Startup: position found but market is CLOSED "
+                            f"(restarted outside regular hours) — flattening immediately "
+                            f"instead of holding it overnight/into the weekend.",
+                            color="red")
+                        self._cancel_oco(symbol)
+                        close_qty  = abs(float(position.quantity))
+                        close_side = (Order.OrderSide.BUY if float(position.quantity) < 0
+                                      else Order.OrderSide.SELL)
+                        submitted = self.submit_order(self.create_order(asset, close_qty, close_side))
+                        if submitted is not None:
+                            self._reset(symbol)
+                            continue
+                        else:
+                            self.log_message(
+                                f"[{symbol}] ⚠️ Startup flatten order submission failed — "
+                                f"will retry via the normal loop once market reopens.",
+                                color="red")
+
                 if position is not None and self.state[symbol] != "POSITION_OPEN":
-                    self.state[symbol]      = "POSITION_OPEN"
-                    self.entry_time[symbol] = datetime.now(timezone.utc)
+                    self.state[symbol] = "POSITION_OPEN"
+                    # Recover the REAL entry time from Alpaca, not "now" — otherwise a
+                    # restart makes a days-old leftover look freshly entered and the
+                    # overnight-leftover flatten below never fires.
+                    _real_et = self._broker_entry_time(symbol, float(position.quantity) > 0)
+                    try:
+                        self.entry_time[symbol] = (datetime.fromisoformat(_real_et.replace("Z", "+00:00"))
+                                                   if _real_et else datetime.now(timezone.utc))
+                    except Exception:
+                        self.entry_time[symbol] = datetime.now(timezone.utc)
                     self.log_message(
                         f"[{symbol}] Startup sync: live position found → POSITION_OPEN "
+                        f"(entered {self.entry_time[symbol]:%Y-%m-%d %H:%M}Z)  "
                         f"SL={self.stop_loss[symbol]}  TP={self.take_profit[symbol]}",
                         color="yellow"
                     )
                 elif position is None and self.state[symbol] == "POSITION_OPEN":
-                    # Position closed while bot was offline (broker stop fired) — clean up
+                    # Position closed while bot was offline (broker stop fired) — log the
+                    # round trip (snapped to SL/TP) before cleanup, then clean up.
+                    try:
+                        last = self.get_last_price(asset)
+                        self._log_broker_side_close(symbol, float(last) if last else None)
+                    except Exception:
+                        pass
                     self._reset(symbol)
                     continue
 
@@ -380,32 +556,89 @@ class DebbieLaSMC(Strategy):
             )
         self.oco_ids[symbol] = []
 
+    def _order_reached_broker(self, symbol):
+        """True if Alpaca already has a live order OR an open position for `symbol`.
+
+        Guards the bracket-fallback path. The POST can raise AFTER Alpaca accepted the
+        order — a read timeout, a connection reset, or an unparseable body all throw once
+        the request is already on the wire. The old code treated every exception as "the
+        order did not happen" and fired a second, naked market order. Real incident
+        2026-08-14: two MSFT entries at the IDENTICAL price 494.77, both closing near
+        -3R. Fail CLOSED — if we cannot prove the broker is clean, do not send another
+        order; the next iteration's _ensure_protection will attach protection.
+        """
+        hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_API_SECRET}
+        try:
+            import requests as _req
+            _LIVE = {"new", "held", "accepted", "pending_new", "accepted_for_bidding",
+                     "partially_filled", "calculated", "pending_replace", "filled"}
+            r = _req.get(f"{ALPACA_BASE_URL}/v2/orders",
+                         params={"status": "all", "symbols": symbol, "nested": "true", "limit": 20},
+                         headers=hdr, timeout=10)
+            has_order = (r.status_code == 200 and
+                         any(o.get("status") in _LIVE for o in (r.json() or [])))
+            p = _req.get(f"{ALPACA_BASE_URL}/v2/positions/{symbol}", headers=hdr, timeout=10)
+            has_pos = (p.status_code == 200 and
+                       abs(float((p.json() or {}).get("qty", 0) or 0)) > 0)
+            # Pure, unit-tested decision (tests/test_duplicate_fill_guard.py).
+            return not indicators.should_resend_entry_after_error(has_order, has_pos, True)
+        except Exception as e:
+            # Cannot verify -> assume it DID land. A duplicate live position is far worse
+            # than a missed entry; the setup will still be there next iteration.
+            self.log_message(f"[{symbol}] ⚠️ Could not verify broker state after a failed "
+                             f"bracket ({e}) — assuming the order landed, NOT re-sending.",
+                             color="red")
+            return True
+
     def _ensure_protection(self, symbol, position, is_long, sl, tp):
         """Guarantee a live position always has a broker-side stop. If none is found on the
         book (legs expired at the close, were cancelled, or lost across a restart), re-post a
         GTC OCO so the position is never left naked overnight."""
         if not (sl and tp):
+            # Previously a silent no-op — a position could sit naked indefinitely with zero
+            # trace of why. Real incident: after _reset() wiped self.stop_loss/take_profit
+            # to None (a false-negative close read), this guard had nothing to re-attach
+            # WITH and gave no signal that protection was missing.
+            self.log_message(f"[{symbol}] ⚠️ _ensure_protection has no sl/tp to work with "
+                             f"(self.stop_loss/take_profit is empty for this symbol) — "
+                             f"cannot verify or re-attach protection this iteration.", color="red")
             return
         hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_API_SECRET}
         try:
             import requests as _req
+            # status=open EXCLUDES a bracket's stop leg while it sits in "held" status —
+            # Alpaca keeps one OCO leg "held" until the other triggers. Querying only
+            # "open" made the bot see a fully-protected position as NAKED, then try to
+            # POST a duplicate OCO → 403 Forbidden (the 104 shares are already committed
+            # to the live bracket). Query "all" and count a stop only when its order/leg
+            # is in a LIVE (non-terminal) status.
             r = _req.get(f"{ALPACA_BASE_URL}/v2/orders",
-                         params={"status": "open", "symbols": symbol, "nested": "true"},
+                         params={"status": "all", "symbols": symbol, "nested": "true", "limit": 50},
                          headers=hdr, timeout=10)
             orders = r.json() if r.status_code == 200 else []
+            _LIVE = {"new", "held", "accepted", "pending_new", "accepted_for_bidding",
+                     "partially_filled", "calculated", "pending_replace"}
             def _has_stop(o):
-                return bool(o.get("stop_price")) or any(l.get("stop_price") for l in (o.get("legs") or []))
+                if o.get("stop_price") and o.get("status") in _LIVE:
+                    return True
+                return any(l.get("stop_price") and l.get("status") in _LIVE
+                           for l in (o.get("legs") or []))
             if any(_has_stop(o) for o in orders):
                 return  # already protected — nothing to do
 
-            qty = int(abs(position.quantity))
+            _is_crypto = self._make_asset(symbol).asset_type == Asset.AssetType.CRYPTO
+            # int() truncated any crypto qty < 1 (e.g. 0.149675 BTC) to 0, silently
+            # no-op'ing here with zero log — every fractional crypto position was
+            # unprotectable through this path regardless of the order-type fix below.
+            qty = abs(position.quantity) if _is_crypto else int(abs(position.quantity))
             if qty <= 0:
                 return
             body = {"symbol": symbol, "qty": str(qty),
                     "side": "sell" if is_long else "buy", "type": "limit",
                     "time_in_force": "gtc", "order_class": "oco",
-                    "take_profit": {"limit_price": str(round(tp, 2))},
-                    "stop_loss":   {"stop_price":  str(round(sl, 2))}}
+                    "take_profit": {"limit_price": str(round(tp, 2) if not _is_crypto else tp)},
+                    "stop_loss":   indicators.build_protective_leg(
+                                       round(sl, 2) if not _is_crypto else sl, _is_crypto, is_long)}
             resp = _req.post(f"{ALPACA_BASE_URL}/v2/orders", json=body, headers=hdr, timeout=10)
             resp.raise_for_status()
             data = resp.json() if resp.content else {}
@@ -418,7 +651,161 @@ class DebbieLaSMC(Strategy):
         except Exception as e:
             self.log_message(f"[{symbol}] ⚠️ Couldn't verify/re-attach protection: {e}", color="red")
 
-    def _log_trade_close_to_sheet(self, symbol, is_long, entry_price, exit_price, qty, pnl):
+    def _logged_close_ids(self):
+        """Set of Alpaca order-ids we've already written to the ledger as broker-side
+        closes. Persisted so a restart that re-detects the same already-closed
+        position can't log it a second time."""
+        try:
+            with open(LOGGED_CLOSES_FILE) as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+
+    def _mark_close_logged(self, close_id):
+        try:
+            ids = self._logged_close_ids()
+            ids.add(close_id)
+            with open(LOGGED_CLOSES_FILE, "w") as f:
+                json.dump(list(ids)[-300:], f)   # cap so the file can't grow forever
+        except Exception:
+            pass
+
+    def _broker_entry_time(self, symbol, is_long):
+        """Real opening-fill timestamp (ISO string) of the CURRENT open position, from
+        Alpaca — so a restart recovers the TRUE entry time instead of stamping 'now'.
+        Needed to detect a leftover/overnight hold (is_leftover_position). None on failure."""
+        try:
+            import requests as _req
+            hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_API_SECRET}
+            r = _req.get(f"{ALPACA_BASE_URL}/v2/orders",
+                         params={"status": "closed", "symbols": symbol,
+                                 "limit": 50, "direction": "desc"},
+                         headers=hdr, timeout=10)
+            open_side = "buy" if is_long else "sell"
+            for o in (r.json() if r.status_code == 200 else []):
+                if o.get("status") == "filled" and o.get("side") == open_side and o.get("filled_at"):
+                    return o.get("filled_at")   # most recent opening fill = this position's entry
+        except Exception:
+            pass
+        return None
+
+    def _real_round_trip(self, symbol, is_long):
+        """Reconstruct the ACTUAL round trip from Alpaca's filled orders so the ledger
+        reflects real fills — including gap slippage where a stop triggers at one price
+        but fills far worse (e.g. META's overnight gap: 619.31 stop, 607.74 fill).
+
+        `is_long` is used only as a SANITY CHECK, never to pick sides: entry/exit are
+        matched purely from the order sequence (match_last_round_trip), immune to a
+        stale self.bias. A real corrupted ledger row (SPY, 2026-07-23) came from the
+        old is_long-driven matcher: leftover POSITION_OPEN state from a much earlier
+        SPY position had bias="SHORT" sitting stale, which made it pick the sell-leg of
+        one real trade as "entry" and the buy-leg of a LATER, unrelated real trade as
+        "exit" — fabricating a -$916.90 round trip out of two real ones (-$47.94 and
+        -$185.42). If the matched exit's side disagrees with is_long, our tracked state
+        has drifted from the broker — log it and refuse rather than fabricate a row.
+        Returns {entry_price, entry_time, exit_price, exit_time, qty, close_id} or None."""
+        try:
+            import requests as _req
+            hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_API_SECRET}
+            r = _req.get(f"{ALPACA_BASE_URL}/v2/orders",
+                         params={"status": "closed", "symbols": symbol,
+                                 "limit": 50, "direction": "desc"},
+                         headers=hdr, timeout=10)
+            orders = r.json() if r.status_code == 200 else []
+            entry_o, exit_o = indicators.match_last_round_trip(orders)
+            if not exit_o:
+                return None
+            exit_is_long_close = exit_o.get("side") == "sell"   # a LONG closes by selling
+            if exit_is_long_close != is_long:
+                self.log_message(
+                    f"[{symbol}] ⚠️ Tracked bias ({'LONG' if is_long else 'SHORT'}) disagrees "
+                    f"with the actual closing fill side ({exit_o.get('side')}) — tracked "
+                    f"state has drifted from the broker. Not logging a possibly-fabricated "
+                    f"round trip.", color="red")
+                return None
+            return {
+                "entry_price": float(entry_o["filled_avg_price"]) if entry_o else None,
+                "entry_time":  entry_o.get("filled_at") if entry_o else None,
+                "exit_price":  float(exit_o["filled_avg_price"]),
+                "exit_time":   exit_o.get("filled_at"),
+                "qty":         abs(float(exit_o.get("filled_qty") or 0)) or None,
+                "close_id":    exit_o.get("id"),
+            }
+        except Exception:
+            return None
+
+    def _log_broker_side_close(self, symbol, current_price):
+        """Log a trade that Alpaca closed server-side via its bracket/OCO leg (the
+        common case — our Python SL/TP poll rarely beats the resting broker order).
+
+        Pulls the REAL closing fill from Alpaca (true price/time, so an overnight gap
+        that fills past the stop shows the real loss) instead of assuming the bracket
+        filled exactly at SL/TP. De-duplicated by the closing order id so a restart
+        that re-detects the same closed position can't double-log it. Falls back to the
+        old SL/TP snap only if Alpaca is unreachable. Fully fail-soft — any error here
+        must NOT block _reset (a naked position still has to be cleaned up)."""
+        try:
+            is_long = self.bias.get(symbol) == "BULLISH"
+            sl = self.stop_loss.get(symbol)
+            tp = self.take_profit.get(symbol)
+
+            # Pull the real round-trip FIRST, before checking local tracking — it's fully
+            # self-sufficient (only uses `is_long` as a sanity check against Alpaca's own
+            # order history, never derived from local entry_price/entry_qty), so it can
+            # recover a trustworthy close even when local tracking is corrupted. REAL
+            # INCIDENT 2026-07-30: a duplicate-process race zeroed self.entry_price for
+            # NVDA/GOOGL; the OLD code checked local tracking FIRST and silently returned
+            # before ever attempting this real lookup, permanently losing a real +$64.48
+            # GOOGL take-profit close (had to be manually backfilled).
+            rt = self._real_round_trip(symbol, is_long)
+
+            entry_p = self.entry_price.get(symbol)
+            qty     = self.entry_qty.get(symbol)
+
+            # De-dup: never write the same broker-side close twice (survives restarts).
+            close_id = rt.get("close_id") if rt else None
+            if close_id and close_id in self._logged_close_ids():
+                self.log_message(
+                    f"[{symbol}] Broker close {close_id[:8]} already in ledger — skipping duplicate.",
+                    color="cyan")
+                return
+
+            entry_iso = exit_iso = None
+            if rt and rt.get("exit_price"):
+                exit_p    = rt["exit_price"]
+                exit_iso  = rt.get("exit_time")
+                entry_iso = rt.get("entry_time")
+                if rt.get("entry_price"):
+                    entry_p = rt["entry_price"]   # true entry fill, not the intended price
+                if rt.get("qty"):
+                    qty = rt["qty"]
+            elif entry_p and qty:
+                # No real round-trip available (Alpaca unreachable) — fall back to local
+                # tracking + SL/TP-snap estimate, the old behaviour: an ESTIMATE that
+                # hides slippage but beats logging nothing.
+                if sl and tp and current_price:
+                    exit_p = sl if abs(current_price - sl) <= abs(current_price - tp) else tp
+                else:
+                    exit_p = current_price or entry_p
+            else:
+                # Neither a real round-trip NOR local tracking has anything trustworthy —
+                # genuinely nothing to log (this is the only case that should bail silently).
+                self.log_message(
+                    f"[{symbol}] Broker-side close detected but no real fills found AND "
+                    f"local tracking is empty — cannot log, needs manual reconcile.",
+                    color="red")
+                return
+
+            pnl = ((exit_p - entry_p) * qty if is_long else (entry_p - exit_p) * qty)
+            self._log_trade_close_to_sheet(symbol, is_long, entry_p, exit_p, qty, pnl,
+                                           entry_iso=entry_iso, exit_iso=exit_iso)
+            if close_id:
+                self._mark_close_logged(close_id)
+        except Exception as e:
+            self.log_message(f"[{symbol}] Broker-close logging skipped: {e}", color="red")
+
+    def _log_trade_close_to_sheet(self, symbol, is_long, entry_price, exit_price, qty, pnl,
+                                  entry_iso=None, exit_iso=None, exit_reason=None):
         """Fire-and-forget: append a completed round-trip row to the Stock Ledger tab,
         including a candlestick chart of the trade hosted on GitHub (Drive hosting
         isn't viable — service accounts have no storage quota and can't accept
@@ -433,6 +820,19 @@ class DebbieLaSMC(Strategy):
         entry_time = self.entry_time[symbol] or now
         sl = self.stop_loss[symbol]
         tp = self.take_profit[symbol]
+
+        # Timestamps written to the sheet: prefer the REAL Alpaca fill times (passed in
+        # for broker-side closes) so a position held overnight shows its true entry/exit
+        # times — not "now". Fall back to tracked entry_time / now for manual exits.
+        def _sheet_ts(iso, fallback_dt):
+            if iso:
+                try:
+                    return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().isoformat()
+                except Exception:
+                    pass
+            return fallback_dt.astimezone().isoformat()
+        entry_time_str = _sheet_ts(entry_iso, entry_time)
+        exit_time_str  = _sheet_ts(exit_iso, now)
 
         chart_ref = None
         try:
@@ -462,9 +862,15 @@ class DebbieLaSMC(Strategy):
         margin   = qty * entry_price / PAPER_LEVERAGE
         notional = qty * entry_price
         log_trade(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Ledger",
-                  entry_time.isoformat(), now.isoformat(), symbol,
+                  entry_time_str, exit_time_str, symbol,
                   "LONG" if is_long else "SHORT", entry_price, sl, tp, exit_price, qty,
-                  margin, notional, PAPER_LEVERAGE, pnl, reason, chart_ref)
+                  margin, notional, PAPER_LEVERAGE, pnl, reason, chart_ref,
+                  # Exits here fire at the BROKER (bracket OCO legs), so there is no label
+                  # to read — infer from which leg the fill landed on. No breakeven_moved
+                  # argument: unlike the crypto bot, this strategy has no break-even trail,
+                  # so that bucket cannot occur. Callers that DO know (the stale exit, the
+                  # EOD flatten) pass exit_reason explicitly and win over the inference.
+                  exit_reason=exit_reason or indicators.infer_exit_reason(exit_price, sl, tp))
 
     def _reset(self, symbol):
         # Cancel the broker-side OCO/bracket legs (TP/SL) so they don't linger as orphans
@@ -505,6 +911,20 @@ class DebbieLaSMC(Strategy):
         """Override in subclasses to change asset type (e.g. CRYPTO)."""
         return Asset(symbol, asset_type=Asset.AssetType.STOCK)
 
+    def _minutes_to_close(self):
+        """Minutes until the 4:00 PM ET regular-session close, or None when it's not a
+        normal weekday session (weekend / already closed). Half-days aren't special-cased
+        — those are rare and before_closing_bell still catches the real bell. Crypto
+        subclasses trade 24/7 and override this to always return None (never cut off)."""
+        now = datetime.now(_ET)
+        if now.weekday() >= 5:                      # Sat / Sun
+            return None
+        close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        if now >= close:                            # after the bell — session's done
+            return None
+        mins = (close - now).total_seconds() / 60.0
+        return mins if mins <= 390 else None        # only meaningful within the 6.5h RTH
+
     def position_sizing(self, symbol, sl_price=None):
         """
         Risk-based sizing: risk exactly cash_at_risk_per_symbol of account on this trade.
@@ -530,6 +950,20 @@ class DebbieLaSMC(Strategy):
         max_qty  = (cash * 0.20) / last_price   # 20% of cash as margin per trade
         quantity = max(0, round(min(quantity, max_qty), 0))
         quantity = int(quantity * PAPER_LEVERAGE)
+
+        # TEMPORARY throttle: cap the LEVERAGED qty so the real loss at the stop
+        # (qty × sl_distance) can't exceed MAX_STOCK_RISK_DOLLARS. Applied last, after
+        # leverage, so it governs the actual dollar hit. A setup whose stop is so wide
+        # that even 1 share exceeds the cap is skipped (qty → 0) — fine while testing.
+        if MAX_STOCK_RISK_DOLLARS and sl_price and abs(last_price - sl_price) > 0:
+            _max_risk_qty = int(MAX_STOCK_RISK_DOLLARS / abs(last_price - sl_price))
+            if quantity > _max_risk_qty:
+                self.log_message(
+                    f"[{symbol}] 🔒 Risk throttle: {quantity}→{_max_risk_qty} sh "
+                    f"(cap stop loss at ${MAX_STOCK_RISK_DOLLARS:.0f} while testing crypto).",
+                    color="yellow")
+                quantity = _max_risk_qty
+
         if PAPER_LEVERAGE > 1 and quantity > 0:
             margin    = quantity * last_price / PAPER_LEVERAGE
             self.log_message(
@@ -550,6 +984,43 @@ class DebbieLaSMC(Strategy):
         except Exception as e:
             self.log_message(f"[{symbol}] Daily trend error: {e}")
             return None
+
+    def _ema_trend_4h(self, htf):
+        """4H EMA-stack trend read: 'bullish' / 'bearish' / 'neutral'. Reuses the 4H df
+        already fetched for SMC (no extra API call). Neutral when there aren't enough
+        4H bars for a stable EMA50 — so on thin data it simply doesn't veto."""
+        try:
+            df = (htf or {}).get("df")
+            if df is None or len(df) < TREND_EMA_SLOW + 2:
+                return "neutral"
+            close = df["close"]
+            ef = close.ewm(span=TREND_EMA_FAST, adjust=False).mean()
+            es = close.ewm(span=TREND_EMA_SLOW, adjust=False).mean()
+            c, efl, esl = float(close.iloc[-1]), float(ef.iloc[-1]), float(es.iloc[-1])
+            es_prev = float(es.iloc[-6])
+            if c > esl and efl > esl and esl >= es_prev:
+                return "bullish"
+            if c < esl and efl < esl and esl <= es_prev:
+                return "bearish"
+            return "neutral"
+        except Exception:
+            return "neutral"
+
+    def _htf_trend(self, symbol, htf=None, daily_trend=None):
+        """Combined higher-timeframe trend gate (Lever #1). Returns the direction a NEW
+        trade is allowed to take — 'bullish', 'bearish', or 'neutral' (block both sides).
+
+        The reliable daily EMA20/50 is the anchor (plentiful daily data): if it can't
+        confirm a trend, we stand down — no more trading a BOS on a choppy tape. The 4H
+        EMA stack can VETO (downgrade to neutral) if it actively opposes the daily trend,
+        but never overrides it. This trades WITH the trend and never against it."""
+        daily = daily_trend if daily_trend in ("bullish", "bearish") else None
+        if daily is None:
+            return "neutral"                       # no confirmed daily trend → don't trade
+        h4 = self._ema_trend_4h(htf)
+        if h4 != "neutral" and h4 != daily:
+            return "neutral"                       # 4H opposes the daily trend → stand down
+        return daily
 
     def get_htf_bias(self, symbol):
         asset = self._make_asset(symbol)
@@ -599,6 +1070,12 @@ class DebbieLaSMC(Strategy):
             atr_14  = (df['high'] - df['low']).rolling(14).mean().iloc[-1]
             atr_pct = float(atr_14 / df['close'].iloc[-1]) if df['close'].iloc[-1] else 0.0
 
+            # 1H ATR — the noise floor for structural stops (a stop tighter than this sits
+            # inside intraday noise on a liquid stock and gets tagged by a random wick).
+            atr_1h = None
+            if df_1h is not None and len(df_1h) >= 15:
+                atr_1h = float((df_1h['high'] - df_1h['low']).rolling(14).mean().iloc[-1])
+
             return {
                 "consolidating":  is_consolidating,
                 "bos":            is_bos,
@@ -621,6 +1098,7 @@ class DebbieLaSMC(Strategy):
                 "channel":        channel,
                 "channel_slope":  channel_slope,
                 "atr_pct":        atr_pct,
+                "atr_1h":         atr_1h,
                 "df":             df,
             }
         except Exception as e:
@@ -656,7 +1134,14 @@ class DebbieLaSMC(Strategy):
     def _get_sentiment(self, symbol):
         """
         Returns (confirm: bool, label: str, prob: float).
-        Always returns True if no news is available — avoids the "no news = no trade" trap.
+
+        `confirm` is now ALWAYS True — news no longer vetoes anything here. It used to
+        return `not (sentiment == "negative" and probability >= 0.60)`, which was
+        direction-blind: strongly negative news blocked SHORTS as readily as longs, when
+        bad news is an argument FOR a short. Per the 2026-08-13 policy decision, news is
+        context handed to the AI (see get_ai_confirmation's news_block), and the AI —
+        which already holds veto power over every entry — decides. The label/probability
+        are still returned for logging so the read stays visible in the log.
         """
         try:
             news_items = self.get_news(symbol)
@@ -666,9 +1151,11 @@ class DebbieLaSMC(Strategy):
         if not news_items:
             return True, "no_news", 0.0
 
-        probability, sentiment = estimate_sentiment(news_items)
-        confirm = not (sentiment == "negative" and probability >= 0.60)
-        return confirm, sentiment, probability
+        try:
+            probability, sentiment = estimate_sentiment(news_items)
+        except Exception:
+            return True, "no_news", 0.0
+        return True, sentiment, probability
 
     def _reconcile_position(self, symbol, position, current_price=None):
         """Broker truth wins. If Alpaca shows a real position but our internal state
@@ -700,12 +1187,35 @@ class DebbieLaSMC(Strategy):
         self.entry_qty[symbol]   = abs(position.quantity)
         self.entry_time[symbol]  = datetime.now(timezone.utc)
         if not self.stop_loss[symbol] or not self.take_profit[symbol]:
-            # No known risk plan for an adopted position — fall back to a conservative
-            # 1% stop distance at this file's own existing MIN_AI_RR floor, rather than
-            # leaving it with no SL/TP (which would make _ensure_protection a no-op).
-            risk = entry * 0.01
-            self.stop_loss[symbol]   = entry - risk if is_long else entry + risk
-            self.take_profit[symbol] = entry + risk * MIN_AI_RR if is_long else entry - risk * MIN_AI_RR
+            # No known risk plan for an adopted position. Previously fell back to a
+            # blind 1%-of-price stop — completely disconnected from real volatility or
+            # structure (the exact "338.31/328.26 looks arbitrary" complaint: GOOGL's
+            # real ATR-based risk was ~$8, this fallback silently replaced it with a
+            # flat $3.35 box). Compute a REAL structural stop the same way a fresh
+            # entry does — floored at 1.5×1H-ATR — instead of an arbitrary percentage.
+            # No known zone to anchor to (that's exactly what got lost), so the ATR
+            # floor alone sets the distance; still far better than a blind guess.
+            try:
+                htf = self.get_htf_bias(symbol)
+                _atr_1h = max(htf.get("atr_1h") or entry * 0.01, 0.01)
+                sl = indicators.structural_stop_price(
+                    entry, None, _atr_1h, is_long, MIN_STOP_ATR_MULT, None)
+                risk_amt = abs(entry - sl)
+                bias_str = "bullish" if is_long else "bearish"
+                _min_tp_lvl = entry + MIN_TP_RR * risk_amt if is_long else entry - MIN_TP_RR * risk_amt
+                pool_tp = indicators.find_next_liquidity_target(htf["df"], _min_tp_lvl, bias_str)
+                tp = indicators.structural_take_profit(
+                    entry, risk_amt, pool_tp, is_long, MIN_TP_RR, MAX_TP_RR)
+                self.stop_loss[symbol]   = round(sl, 2)
+                self.take_profit[symbol] = round(tp, 2)
+            except Exception as e:
+                # Real market data unavailable — fall back to the old blind 1% box
+                # rather than leaving the position with no SL/TP at all.
+                self.log_message(f"[{symbol}] ⚠️ Structural fallback failed ({e}) — "
+                                 f"using blind 1% box as a last resort.", color="red")
+                risk = entry * 0.01
+                self.stop_loss[symbol]   = entry - risk if is_long else entry + risk
+                self.take_profit[symbol] = entry + risk * MIN_AI_RR if is_long else entry - risk * MIN_AI_RR
         self.state[symbol] = "POSITION_OPEN"
         self.log_message(
             f"[{symbol}] ⚠️ Orphaned position detected — broker shows "
@@ -727,9 +1237,29 @@ class DebbieLaSMC(Strategy):
         # Check this first so we don't re-enter while a trade is live.
         if self.state[symbol] == "POSITION_OPEN":
             if position is None:
-                self.log_message(f"[{symbol}] Position closed. Resetting.", color="cyan")
-                self._reset(symbol)
-                return
+                # Re-verify with a FRESH read before trusting this — a single get_position()
+                # miss (transient broker-side lag/hiccup) previously went straight to _reset(),
+                # which unconditionally cancels the OCO/bracket legs. REAL INCIDENT 2026-07-28:
+                # NVDA + GOOGL were still genuinely open (confirmed via Alpaca's real order
+                # history — no close order was ever submitted in that window) but got stripped
+                # of all protection anyway and sat naked for ~6 hours because this branch never
+                # double-checked before tearing it down.
+                position = self.get_position(asset)
+                if position is not None:
+                    self.log_message(
+                        f"[{symbol}] Position read returned None once but is confirmed still "
+                        f"OPEN on re-check — treating as a transient miss, NOT resetting.",
+                        color="yellow")
+                else:
+                    # The position went flat without our Python SL/TP check firing — i.e.
+                    # Alpaca's resting bracket/OCO leg filled server-side (the NORMAL way a
+                    # stock trade closes). This path used to just reset, so those closes
+                    # never reached the Stock Ledger — that's why it looked empty. Log the
+                    # round trip here before cleaning up.
+                    self._log_broker_side_close(symbol, current_price)
+                    self.log_message(f"[{symbol}] Position closed (broker fill). Resetting.", color="cyan")
+                    self._reset(symbol)
+                    return
 
             is_long = self.bias[symbol] == "BULLISH"
             sl = self.stop_loss[symbol]
@@ -809,8 +1339,10 @@ class DebbieLaSMC(Strategy):
                     )
                     # Same guard as the manual SL/TP exit above — see comment there.
                     if submitted is not None:
+                        # Explicit: a stale exit fills mid-range, so infer_exit_reason would
+                        # correctly refuse to guess and return OTHER. We know better here.
                         self._log_trade_close_to_sheet(symbol, is_long, entry_p, current_price,
-                                                        close_qty, pnl)
+                                                        close_qty, pnl, exit_reason="STALE")
                         self._reset(symbol)
                     else:
                         self.log_message(
@@ -897,7 +1429,10 @@ class DebbieLaSMC(Strategy):
                             if htf.get("bos_near_sr") else "")
                 ch_tag   = f"  [{htf['channel']} channel]" if htf.get("channel") else ""
                 color    = "green" if direction == "bullish" else "red"
-                d_found, d_dir, d_lo, d_hi, _ = indicators.detect_displacement_fvg(htf["df"])
+                d_found, d_dir, d_lo, d_hi, _ = indicators.detect_displacement_fvg(
+                    htf["df"],
+                    **indicators.displacement_gates(htf["df"], DISPLACEMENT_ATR_MULT,
+                                                    DISPLACEMENT_MIN_PCT, MIN_FVG_PCT))
                 if d_found and d_dir == direction:
                     self.fvg_low[symbol]       = d_lo
                     self.fvg_high[symbol]      = d_hi
@@ -1046,7 +1581,10 @@ class DebbieLaSMC(Strategy):
             # Prefer the post-sweep displacement FVG (the CHoCH gap) — that's the gap the
             # reversal left behind. Fall back to a generic FVG/OB only with no clean gap.
             want = "bullish" if self.bias[symbol] == "BULLISH" else "bearish"
-            d_found, d_dir, d_lo, d_hi, _ = indicators.detect_displacement_fvg(ltf["df"])
+            d_found, d_dir, d_lo, d_hi, _ = indicators.detect_displacement_fvg(
+                ltf["df"],
+                **indicators.displacement_gates(ltf["df"], DISPLACEMENT_ATR_MULT,
+                                                DISPLACEMENT_MIN_PCT, MIN_FVG_PCT))
             if d_found and d_dir == want:
                 self.fvg_low[symbol]       = d_lo
                 self.fvg_high[symbol]      = d_hi
@@ -1169,6 +1707,37 @@ class DebbieLaSMC(Strategy):
                     color="cyan"
                 )
 
+                # ── Fresh-momentum gate at the tap (added 2026-08-22) ─────────────────
+                # binance_bot has demanded this since the 'armed long ago, entered on
+                # nothing' incidents; the stock bot never had it. Nothing here rechecked
+                # that the bar actually filling the zone is decisive, so a zone armed on
+                # thin structure could fill into chop with no opposition. Same thresholds
+                # as the crypto path: body >= 50% of range AND >= 0.6x ATR of this
+                # timeframe, in the trade direction, within the last 3 bars.
+                try:
+                    _ltf_atr  = indicators.range_atr(ltf["df"])
+                    _ltf_px   = float(ltf["df"]["close"].iloc[-1])
+                    _fresh    = indicators.has_displacement(
+                        ltf["df"].tail(3)[["open", "high", "low", "close"]].values.tolist(),
+                        is_long=_is_long,
+                        min_body_frac=DISPLACEMENT_BODY_FRAC,
+                        min_body_abs=indicators.displacement_min_body(
+                            _ltf_atr, _ltf_px, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT))
+                except Exception as _e:
+                    # Fail CLOSED, matching the crypto sniper: an unverifiable momentum
+                    # read must not become a free pass to enter.
+                    self.log_message(f"[{symbol}] ⚠️ Could not verify tap momentum ({_e}) "
+                                     f"— standing aside.", color="red")
+                    return
+                if not _fresh:
+                    self.log_message(
+                        f"[{symbol}] 🚫 No fresh displacement at tap — needs a body ≥"
+                        f"{DISPLACEMENT_BODY_FRAC:.0%} of range AND ≥{DISPLACEMENT_ATR_MULT}×ATR "
+                        f"(${indicators.displacement_min_body(_ltf_atr, _ltf_px, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT):.2f})"
+                        f" in the last 3 bars. Standing aside.",
+                        color="yellow")
+                    return
+
                 # S/R confluence at the entry zone
                 sr_near, sr_level = indicators.is_near_sr_level(
                     current_price,
@@ -1183,62 +1752,92 @@ class DebbieLaSMC(Strategy):
                         f"[{symbol}] ⚠️ No S/R confluence at tap (nearest S/R may be far)", color="yellow"
                     )
 
+                # Informational only — this read no longer gates anything (see
+                # _get_sentiment). The actual news weighing happens inside
+                # get_ai_confirmation, which receives the headlines as context.
                 confirm, sentiment, prob = self._get_sentiment(symbol)
                 if prob > 0:
                     self.log_message(
-                        f"[{symbol}] AI: {sentiment.upper()} ({prob*100:.1f}%) → {'✅' if confirm else '❌'}",
+                        f"[{symbol}] 📰 FinBERT: {sentiment.upper()} ({prob*100:.1f}%) "
+                        f"— context for AI, not a gate",
                         color="magenta"
                     )
                 else:
-                    self.log_message(f"[{symbol}] No news — proceeding on technicals.", color="magenta")
+                    self.log_message(f"[{symbol}] 📰 No news — proceeding on technicals.", color="magenta")
 
                 if confirm:
                     is_long = self.bias[symbol] == "BULLISH"
                     side    = Order.OrderSide.BUY if is_long else Order.OrderSide.SELL
 
-                    # SL at the structural invalidation point (OB/FVG boundary).
-                    # Cap at 3× LTF (15m) ATR: the HTF zone can be many ATRs wide which
-                    # makes the stop swing-sized on a day-trade timeframe.
-                    _ltf_rng = ltf["df"]["high"] - ltf["df"]["low"]
-                    _ltf_atr = float(_ltf_rng.rolling(14).mean().iloc[-1])
-                    _max_sl_dist = 3.0 * _ltf_atr
-                    if is_long:
-                        sl = float(f"{self.fvg_low[symbol] * 0.997:.2f}")
-                        if current_price - sl > _max_sl_dist:
-                            sl = round(current_price - _max_sl_dist, 2)
-                            self.log_message(
-                                f"[{symbol}] 📏 SL capped at 3×15m ATR (${_ltf_atr:.2f}) → SL ${sl:.2f}",
-                                color="yellow")
-                    else:
-                        sl = float(f"{self.fvg_high[symbol] * 1.003:.2f}")
-                        if sl - current_price > _max_sl_dist:
-                            sl = round(current_price + _max_sl_dist, 2)
-                            self.log_message(
-                                f"[{symbol}] 📏 SL capped at 3×15m ATR (${_ltf_atr:.2f}) → SL ${sl:.2f}",
-                                color="yellow")
+                    # ── HTF TREND FILTER (Lever #1) — trade WITH the trend, never against ──
+                    # Longs only in a confirmed uptrend, shorts only in a downtrend. This is
+                    # the single gate every entry path funnels through (BOS, AMD, trend-zone),
+                    # so it can't be bypassed. It closes the loophole that let a BOS long
+                    # through on a no-trend tape (the QQQ entry). Placed before SL/AI work so
+                    # a counter-trend setup is dropped cheaply.
+                    _need  = "bullish" if is_long else "bearish"
+                    _trend = self._htf_trend(symbol, htf, daily_trend)
+                    if _trend != _need:
+                        self.log_message(
+                            f"[{symbol}] 🚫 Trend filter: {'LONG' if is_long else 'SHORT'} "
+                            f"blocked — HTF trend is {_trend.upper()} (need {_need.upper()}). "
+                            f"Not fighting the tape.", color="yellow")
+                        return
 
-                    # Liquidation guard: at PAPER_LEVERAGE x, a 1/L adverse move
-                    # wipes the margin. Cap SL inside 90% of that distance.
-                    if PAPER_LEVERAGE > 1:
-                        _liq_dist = current_price / PAPER_LEVERAGE
-                        if is_long and (current_price - sl) >= _liq_dist:
-                            sl = round(current_price - _liq_dist * 0.90, 2)
-                            self.log_message(
-                                f"[{symbol}] ⚡ SL auto-capped at 90% liq distance "
-                                f"({PAPER_LEVERAGE}x → liq in {1/PAPER_LEVERAGE:.0%}) → SL ${sl:.2f}",
-                                color="yellow")
-                        elif not is_long and (sl - current_price) >= _liq_dist:
-                            sl = round(current_price + _liq_dist * 0.90, 2)
-                            self.log_message(
-                                f"[{symbol}] ⚡ SL auto-capped at 90% liq distance "
-                                f"({PAPER_LEVERAGE}x → liq in {1/PAPER_LEVERAGE:.0%}) → SL ${sl:.2f}",
-                                color="yellow")
-
+                    # ── STRUCTURAL STOP ────────────────────────────────────────────
+                    # Anchor to the FVG/OB invalidation, but keep the stop OUTSIDE 1H-ATR
+                    # noise so a single 5m/15m wick can't tag it. (The OLD code *capped*
+                    # the stop at 3×15m ATR, which crushed it onto liquid stocks — e.g.
+                    # NVDA to ~$1 — right into the noise. structural_stop_price FLOORS it
+                    # instead.) Still capped at 90% of the liquidation distance.
+                    _atr_1h = htf.get("atr_1h") or (
+                        2.0 * float((ltf["df"]["high"] - ltf["df"]["low"]).rolling(14).mean().iloc[-1]))
+                    _atr_1h = max(_atr_1h, 0.01)
+                    _zone = ((self.fvg_low[symbol] * 0.997) if (is_long and self.fvg_low[symbol])
+                             else (self.fvg_high[symbol] * 1.003) if (not is_long and self.fvg_high[symbol])
+                             else None)
+                    _liq_cap = (current_price / PAPER_LEVERAGE) * 0.90 if PAPER_LEVERAGE > 1 else None
+                    sl = round(indicators.structural_stop_price(
+                        current_price, _zone, _atr_1h, is_long, MIN_STOP_ATR_MULT, _liq_cap), 2)
                     risk_amt = abs(current_price - sl)
                     bias_str = "bullish" if is_long else "bearish"
-                    pool_tp  = indicators.find_next_liquidity_target(htf["df"], current_price, bias_str)
 
-                    ai_confirm, rr_actual, ai_reason = get_ai_confirmation(
+                    # ── STRUCTURAL TARGET ──────────────────────────────────────────
+                    # Pin TP to the nearest 4H liquidity pool that offers at least
+                    # MIN_TP_RR (a REAL breaker/pool, not a multiple of a tiny stop),
+                    # capped at MAX_TP_RR so it stays reachable before the EOD flatten.
+                    _min_tp_lvl = (current_price + MIN_TP_RR * risk_amt if is_long
+                                   else current_price - MIN_TP_RR * risk_amt)
+                    pool_tp = indicators.find_next_liquidity_target(htf["df"], _min_tp_lvl, bias_str)
+                    tp_planned = round(indicators.structural_take_profit(
+                        current_price, risk_amt, pool_tp, is_long, MIN_TP_RR, MAX_TP_RR), 2)
+                    # Reachability: MAX_TP_RR caps the target in units of RISK, which says
+                    # nothing about whether price can TRAVEL that far before the position is
+                    # force-closed (STALE_TRADE_HOURS, or the EOD flatten, whichever lands
+                    # first). A wide stop turns a "4R cap" into a distance no session can
+                    # cover, and the trade can then only exit on the clock while showing a
+                    # flattering R:R on entry. Caught on the crypto side (POL/USD 2026-09-04,
+                    # target 13.3% away vs a 2.755% HTF ATR); same exposure existed here.
+                    _htf_atr_reach = indicators.range_atr(htf["df"])
+                    tp_planned, _rr_reach, _reach_ok = indicators.reachable_target(
+                        current_price, sl, tp_planned, _htf_atr_reach,
+                        MAX_TARGET_ATR_MULT, MIN_TP_RR)
+                    tp_planned = round(tp_planned, 2)
+                    if not _reach_ok:
+                        self.log_message(
+                            f"[{symbol}] 🚫 Reachability gate — only "
+                            f"{MAX_TARGET_ATR_MULT:g}× the HTF ATR (${_htf_atr_reach:.2f}) is "
+                            f"reachable before the close, paying 1:{_rr_reach:.1f} "
+                            f"< 1:{MIN_TP_RR:g}. Standing aside.", color="yellow")
+                        return
+                    rr_actual = abs(tp_planned - current_price) / risk_amt if risk_amt else 0.0
+                    _tp_src = "@4H pool" if (pool_tp and abs(tp_planned - pool_tp) < 0.01) else f"{rr_actual:.1f}R cap"
+                    self.log_message(
+                        f"[{symbol}] 🎯 Structural: SL ${sl:.2f} (risk {risk_amt:.2f} = "
+                        f"{risk_amt / _atr_1h:.1f}×1hATR) → TP ${tp_planned:.2f} [{_tp_src}] "
+                        f"| R:R 1:{rr_actual:.1f}", color="cyan")
+
+                    ai_confirm, _ai_rr, ai_reason = get_ai_confirmation(
                         symbol, current_price, daily_trend, bias_str,
                         self.fvg_low[symbol], self.fvg_high[symbol],
                         self.sweep_low[symbol] or 0, sl, risk_amt, pool_tp,
@@ -1253,6 +1852,20 @@ class DebbieLaSMC(Strategy):
                     )
 
                     if ai_confirm:
+                        # ── Close-of-session cutoff ────────────────────────────────
+                        # Don't open a NEW position in the last ENTRY_CUTOFF_MIN minutes.
+                        # before_closing_bell can't reliably flatten a 3:59 PM fill, and a
+                        # position carried into the close rides straight into the overnight
+                        # gap (how QQQ was held 7/22→7/23). Managing/exiting live positions
+                        # is unaffected — this only blocks fresh entries.
+                        _mtc = self._minutes_to_close()
+                        if _mtc is not None and _mtc <= ENTRY_CUTOFF_MIN:
+                            self.log_message(
+                                f"[{symbol}] ⏰ {_mtc:.0f}m to close (≤{ENTRY_CUTOFF_MIN}m) — "
+                                f"skipping new entry to avoid an overnight-gap hold.",
+                                color="yellow")
+                            return
+
                         cash, last_price, quantity = self.position_sizing(symbol, sl_price=sl)
                         if self.ranging_mode[symbol]:
                             quantity = max(1, round(quantity * 0.5))
@@ -1280,10 +1893,7 @@ class DebbieLaSMC(Strategy):
                                 return
 
                             self.stop_loss[symbol]   = sl
-                            self.take_profit[symbol] = round(
-                                current_price + risk_amt * rr_actual if is_long
-                                else current_price - risk_amt * rr_actual, 2
-                            )
+                            self.take_profit[symbol] = tp_planned   # structural target (nearest 4H pool, ≤MAX_TP_RR)
                             tp = self.take_profit[symbol]
 
                             # Try a BRACKET order first — Alpaca/TradingView render its legs
@@ -1293,19 +1903,26 @@ class DebbieLaSMC(Strategy):
                             # TIF=day is fine: the bot flattens at the close (before_closing_bell),
                             # so the protective legs only need to last the session.
                             self.bracket_active[symbol] = False
+                            _is_crypto = self._make_asset(symbol).asset_type == Asset.AssetType.CRYPTO
                             try:
                                 import requests as _req
                                 _resp = _req.post(
                                     f"{ALPACA_BASE_URL}/v2/orders",
                                     json={
                                         "symbol":        symbol,
-                                        "qty":           str(int(quantity)),
+                                        "qty":           str(int(quantity)) if not _is_crypto else str(quantity),
                                         "side":          "buy" if is_long else "sell",
                                         "type":          "market",
                                         "time_in_force": "gtc",   # GTC so the SL/TP legs DON'T expire at the close (a held position must stay protected overnight)
                                         "order_class":   "bracket",
-                                        "take_profit":   {"limit_price": str(round(tp, 2))},
-                                        "stop_loss":     {"stop_price":  str(round(sl, 2))},
+                                        "take_profit":   {"limit_price": str(round(tp, 2) if not _is_crypto else tp)},
+                                        # Crypto rejects a bare stop_price leg (422 "invalid order
+                                        # type for crypto order") — real incident: BTCUSD never had
+                                        # a stop-loss since its first fill because of exactly this,
+                                        # silently caught below and falling back to a naked entry.
+                                        "stop_loss":     indicators.build_protective_leg(
+                                                              round(sl, 2) if not _is_crypto else sl,
+                                                              _is_crypto, is_long),
                                     },
                                     headers={
                                         "APCA-API-KEY-ID":     ALPACA_API_KEY,
@@ -1332,14 +1949,25 @@ class DebbieLaSMC(Strategy):
                                     f"TP {tp:.2f} / SL {sl:.2f} | R:R 1:{rr_actual:.1f}", color="green"
                                 )
                             except Exception as e:
-                                # Fallback: plain market entry; OCO attaches in on_filled_order
-                                self.log_message(
-                                    f"[{symbol}] Bracket rejected ({e}) — falling back to market + OCO",
-                                    color="yellow"
-                                )
-                                order = self.create_order(asset, quantity, side)
-                                self.entry_order[symbol] = order
-                                self.submit_order(order)
+                                # The POST may have raised AFTER Alpaca accepted it (read
+                                # timeout / reset / bad body). Blindly re-sending here is how
+                                # two MSFT entries landed at the same price on 2026-08-14.
+                                if self._order_reached_broker(symbol):
+                                    self.log_message(
+                                        f"[{symbol}] ⚠️ Bracket POST raised ({e}) but the order "
+                                        f"IS live at Alpaca — NOT sending a duplicate. Syncing to "
+                                        f"POSITION_OPEN; _ensure_protection will attach the stop.",
+                                        color="red"
+                                    )
+                                else:
+                                    # Broker is provably clean — safe to place the entry.
+                                    self.log_message(
+                                        f"[{symbol}] Bracket rejected ({e}) — falling back to market + OCO",
+                                        color="yellow"
+                                    )
+                                    order = self.create_order(asset, quantity, side)
+                                    self.entry_order[symbol] = order
+                                    self.submit_order(order)
 
                             self.state[symbol]       = "POSITION_OPEN"
                             self.entry_price[symbol] = current_price
@@ -1446,6 +2074,53 @@ class DebbieLaSMC(Strategy):
 
     def on_trading_iteration(self):
         self._iter_count += 1
+
+        # ── Leftover-overnight guard (stocks only) ──────────────────────────────
+        # A position entered on a PRIOR session that somehow survived (bot was down at
+        # the close, then the market was shut over the weekend so the flatten couldn't
+        # fill) must be closed at the NEXT open, not held another whole day. The startup
+        # is_regular_session check + the EOD window can't catch this specific Fri→Mon
+        # case; this per-iteration check does, using the real entry time recovered at
+        # startup. Crypto trades 24/7 (_minutes_to_close is None) → skip entirely.
+        now_et = datetime.now(_ET)   # computed once, reused by the catch-up check below too
+        if self._minutes_to_close() is not None:   # None only for crypto/24-7 subclass
+            for symbol in self.symbols:
+                if self.state.get(symbol) != "POSITION_OPEN":
+                    continue
+                et = self.entry_time.get(symbol)
+                if et and indicators.is_leftover_position(et.isoformat(), now_et):
+                    self.log_message(
+                        f"[{symbol}] 🌙 Leftover from a prior session (entered "
+                        f"{et:%Y-%m-%d}) — flattening at the open, not holding another day.",
+                        color="red")
+                    self._flatten_one(symbol)
+
+        # EOD guard (stocks only — crypto overrides _minutes_to_close to None): inside the
+        # flatten window, go flat and skip trading. Runs from the loop we KNOW executes, so
+        # the end-of-day flatten no longer hinges on the before_closing_bell hook alone.
+        _mtc = self._minutes_to_close()
+        if _mtc is not None and _mtc <= EOD_FLATTEN_MIN:
+            self._flatten_all(reason=f"EOD {_mtc:.0f}m-to-close")
+            self._eod_flattened_date = now_et.date()
+            self._log_daily_snapshot_if_new_day()
+            return
+
+        # Catch-up safety net: if a single iteration overran past the ENTIRE pre-close
+        # window (EOD_FLATTEN_MIN sits exactly at the loop's execution interval — real
+        # incident 2026-07-28, NVDA+GOOGL held 5.5h past close because _minutes_to_close
+        # jumped straight from "not yet" to None with zero catch-up), this fires on the
+        # next iteration regardless of exactly when it lands.
+        if indicators.needs_eod_catchup_flatten(
+                now_et, self._eod_flattened_date == now_et.date()):
+            self.log_message(
+                "⚠️ EOD catch-up flatten — the normal pre-close window was missed "
+                "(iteration ran long); flattening now instead of holding overnight.",
+                color="red")
+            self._flatten_all(reason="EOD catch-up (missed pre-close window)")
+            self._eod_flattened_date = now_et.date()
+            self._log_daily_snapshot_if_new_day()
+            return
+
         for symbol in self.symbols:
             self._process_symbol(symbol)
         self._log_daily_snapshot_if_new_day()
@@ -1455,7 +2130,7 @@ class DebbieLaSMC(Strategy):
         get_portfolio_value() (cash + open positions), not get_cash() — a large open
         position deducting from cash must not read as a loss, same fix as test_bot.py's
         equity display. SPY is already in the watchlist so this costs no extra fetch."""
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now().astimezone().date()   # LOCAL day — Macro rows dated by your date
         if self._sheet_log_date == today:
             return
         balance = self.get_portfolio_value()
@@ -1468,27 +2143,54 @@ class DebbieLaSMC(Strategy):
                              if self._daily_open_balance else 0.0)
         spy_return_pct = (((spy_price - self._daily_open_spy) / self._daily_open_spy * 100)
                            if spy_price and self._daily_open_spy else 0.0)
+        # Backfill days the bot was down across midnight — this rollover check otherwise
+        # writes ONLY the current day and silently swallows the gap, leaving holes in the
+        # Quant Desk equity curve (hit for real on the crypto side: Aug 13 -> Aug 15).
+        # Missed days carry forward the last known balance at 0% — the bot wasn't running,
+        # so nothing could have traded, and a flat carry-forward beats inventing a value.
+        # This also fills weekends/holidays — CONFIRMED WANTED by the user 2026-08-16.
+        # Correct for an equity CURVE: the account genuinely held that value on those
+        # days, so a flat Sat/Sun point is the truth, not noise. Do not "optimise" this
+        # into skipping non-trading days.
+        for _gap_day in missing_snapshot_dates(self._sheet_log_date, today):
+            self.log_message(f"[SHEETS] Backfilling missed Stock Macro row for {_gap_day} "
+                             f"@ ${self._daily_open_balance:,.2f}", color="yellow")
+            log_daily_snapshot(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Macro",
+                                _gap_day.isoformat(), self._daily_open_balance, 0.0,
+                                spy_price or 0.0, 0.0)
         log_daily_snapshot(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Macro",
                             today.isoformat(), balance, daily_return_pct,
                             spy_price or 0.0, spy_return_pct)
         self._sheet_log_date     = today
         self._daily_open_balance = balance
         self._daily_open_spy     = spy_price
+        self._save_daily_snapshot_flag()   # persist immediately — a restart before the
+        # next position-state save must still see "today already logged"
+
+    def _flatten_one(self, symbol, reason="flatten"):
+        """Cancel protection + market-close a SINGLE symbol's position (if any)."""
+        asset = self._make_asset(symbol)
+        position = self.get_position(asset)
+        if position is not None and abs(position.quantity) > 0:
+            # Cancel OCO FIRST so the TP/SL legs don't race the closing market order
+            # and cause a wash-trade or an orphan fill on the wrong side.
+            self._cancel_oco(symbol)
+            close_qty  = abs(position.quantity)
+            close_side = (Order.OrderSide.BUY if position.quantity < 0
+                          else Order.OrderSide.SELL)
+            order = self.create_order(asset, close_qty, close_side)
+            self.submit_order(order)
+            self.log_message(
+                f"[{symbol}] {reason} close: cancelled OCO + submitted market close "
+                f"({close_qty} shares).", color="cyan")
+            self._reset(symbol)
+
+    def _flatten_all(self, reason="EOD"):
+        """Cancel protection and market-close every open position. Shared by the
+        before_closing_bell hook and the main-loop EOD guard so a flatten fires
+        whichever path runs first."""
+        for symbol in self.symbols:
+            self._flatten_one(symbol, reason=reason)
 
     def before_closing_bell(self):
-        for symbol in self.symbols:
-            asset = self._make_asset(symbol)
-            position = self.get_position(asset)
-            if position is not None:
-                # Cancel OCO FIRST so the TP/SL legs don't race the closing market order
-                # and cause a wash-trade or an orphan fill on the wrong side.
-                self._cancel_oco(symbol)
-                close_qty  = abs(position.quantity)
-                close_side = (Order.OrderSide.BUY if position.quantity < 0
-                              else Order.OrderSide.SELL)
-                order = self.create_order(asset, close_qty, close_side)
-                self.submit_order(order)
-                self.log_message(
-                    f"[{symbol}] EOD close: cancelled OCO + submitted market close "
-                    f"({close_qty} shares).", color="cyan")
-                self._reset(symbol)
+        self._flatten_all(reason="EOD bell")

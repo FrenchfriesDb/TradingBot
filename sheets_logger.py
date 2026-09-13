@@ -25,6 +25,17 @@ MACRO_HEADER = ["Date", "Balance", "Daily Return %", "Benchmark Price", "Benchma
 LEDGER_HEADER = [
     "Entry Time", "Exit Time", "Ticker", "Side", "Entry", "Stop Loss", "Take Profit", "Exit",
     "Size", "Margin Invested ($)", "Notional Value ($)", "Leverage", "P&L", "Reason", "Chart",
+    # Fees is APPENDED, not inserted next to P&L where it reads better, because ~177 rows
+    # of history already have their chart in column O. Inserting ahead of Chart would put
+    # every new row's chart one column right of every old one. P&L became NET of fees on
+    # 2026-09-04; rows written before that date are GROSS and overstate by roughly this
+    # column's value.
+    "Fees ($)",
+    # Likewise appended. Distinct from "Reason" above, which records the strategy that
+    # OPENED the trade ("BOS LONG"); this records why it CLOSED. Canonical tokens only
+    # (TARGET / STOP / BREAKEVEN / STALE / OTHER) so the column can be grouped — the
+    # BREAKEVEN vs STOP split is the one that shows where the money actually goes.
+    "Exit Reason",
 ]
 
 _client_cache = None
@@ -65,6 +76,38 @@ def _get_spreadsheet(client, spreadsheet_url):
         return None
 
 
+def _col_letter(idx):
+    """0-based column index -> A1 letter. 0->A, 25->Z, 26->AA."""
+    idx = int(idx)
+    out = ""
+    while True:
+        idx, rem = divmod(idx, 26)
+        out = chr(65 + rem) + out
+        if idx == 0:
+            break
+        idx -= 1
+    return out
+
+
+def missing_header_cells(existing_header, header):
+    """Which trailing header labels a live tab is missing — (a1_range, [values]) or None.
+
+    ensure_tabs only ever CREATES tabs, so a column appended to LEDGER_HEADER after a tab
+    already exists leaves the live sheet writing data under a blank heading. That happened
+    twice on 2026-09-04 (Fees, then Exit Reason) against a ledger with ~177 rows.
+
+    Only ever fills cells PAST the end of the existing header. Never rewrites a label that
+    is already there — someone may have renamed a heading by hand, and clobbering that
+    would be a destructive surprise for a cosmetic gain.
+    """
+    existing_header = list(existing_header or [])
+    if len(existing_header) >= len(header):
+        return None
+    start = len(existing_header)
+    rng = f"{_col_letter(start)}1:{_col_letter(len(header) - 1)}1"
+    return rng, [header[start:]]
+
+
 def ensure_tabs(client, spreadsheet_url, tab_specs: dict):
     """tab_specs maps tab name -> header row, e.g. {"Crypto Macro": MACRO_HEADER}.
     Creates any tab that doesn't exist yet with its header row. Idempotent — safe to
@@ -82,6 +125,22 @@ def ensure_tabs(client, spreadsheet_url, tab_specs: dict):
                 ws = sh.add_worksheet(title=tab_name, rows=1000, cols=max(len(header), 1))
                 ws.append_row(header)
                 print(f"[SHEETS] Created tab '{tab_name}'")
+            else:
+                # Backfill headings for columns appended since this tab was created,
+                # so new data never lands under a blank heading. Fill-only — see
+                # missing_header_cells. Wrapped: a header cosmetic must never stop a
+                # bot from starting.
+                try:
+                    ws = sh.worksheet(tab_name)
+                    todo = missing_header_cells(ws.row_values(1), header)
+                    if todo:
+                        rng, values = todo
+                        if ws.col_count < len(header):
+                            ws.add_cols(len(header) - ws.col_count)
+                        ws.update(rng, values)
+                        print(f"[SHEETS] Extended '{tab_name}' header: {', '.join(values[0])}")
+                except Exception as e:
+                    print(f"[SHEETS] Could not extend '{tab_name}' header: {e}")
         return sh
     except Exception as e:
         print(f"[SHEETS] ensure_tabs failed: {e}")
@@ -94,9 +153,34 @@ def build_macro_row(date_str, balance, daily_return_pct, bench_price, bench_retu
             round(bench_price, 4), round(bench_return_pct, 3)]
 
 
+def missing_snapshot_dates(last_snapshot_date, today, max_backfill=30):
+    """Days between the last Macro row and today that never got one, oldest first.
+
+    The daily snapshot only fires when a RUNNING bot notices a day rollover, so any day
+    the bot was down/restarting across midnight silently gets no row — and the next start
+    writes only the current day, swallowing the gap. REAL INCIDENT 2026-08-15: Crypto
+    Macro jumped Aug 13 -> Aug 15, leaving a hole in the Quant Desk equity curve.
+
+    Returns [] when there's nothing to fill, when there's no prior snapshot (inventing
+    history backwards would be fabricating data), or when the clock moved backwards.
+    Bounded by max_backfill so a months-long gap can't spam thousands of rows."""
+    if last_snapshot_date is None or today is None:
+        return []
+    if today <= last_snapshot_date:
+        return []
+    from datetime import timedelta
+    gap = (today - last_snapshot_date).days - 1
+    if gap <= 0:
+        return []
+    gap = min(gap, max_backfill)
+    # Anchor to `today` so a bounded window keeps the MOST RECENT missing days — the ones
+    # adjacent to live data — rather than the oldest, least useful ones.
+    return [today - timedelta(days=n) for n in range(gap, 0, -1)]
+
+
 def build_ledger_row(entry_time_str, exit_time_str, ticker, side, entry_price, stop_loss,
                       take_profit, exit_price, size, margin, notional, leverage, pnl, reason,
-                      chart_url=None):
+                      chart_url=None, fees=0.0, exit_reason=""):
     """Pure row-building for the Ledger tabs — no network call, unit-testable in isolation.
     An http(s) chart_url becomes a clickable Sheets image — =HYPERLINK(url, IMAGE(url))
     renders the thumbnail in-cell AND opens the full-resolution PNG on click, since the
@@ -112,7 +196,8 @@ def build_ledger_row(entry_time_str, exit_time_str, ticker, side, entry_price, s
     return [entry_time_str, exit_time_str, ticker, side, round(entry_price, 6),
             round(stop_loss, 6), round(take_profit, 6), round(exit_price, 6),
             round(size, 6), round(margin, 2), round(notional, 2), leverage,
-            round(pnl, 2), reason, chart_cell]
+            round(pnl, 2), reason, chart_cell, round(fees or 0.0, 2),
+            exit_reason or ""]
 
 
 def log_daily_snapshot(client, spreadsheet_url, tab_name, date_str,
@@ -134,7 +219,7 @@ def log_daily_snapshot(client, spreadsheet_url, tab_name, date_str,
 
 def log_trade(client, spreadsheet_url, tab_name, entry_time_str, exit_time_str, ticker, side,
               entry_price, stop_loss, take_profit, exit_price, size, margin, notional,
-              leverage, pnl, reason, chart_url=None):
+              leverage, pnl, reason, chart_url=None, fees=0.0, exit_reason=""):
     """Appends one row to a Ledger tab. Never raises — logs a warning and returns on
     any failure (client is None, sheet unreachable, tab missing, network error)."""
     if client is None:
@@ -157,7 +242,8 @@ def log_trade(client, spreadsheet_url, tab_name, entry_time_str, exit_time_str, 
             pass
         row = build_ledger_row(entry_time_str, exit_time_str, ticker, side, entry_price,
                                 stop_loss, take_profit, exit_price, size, margin, notional,
-                                leverage, pnl, reason, chart_url)
+                                leverage, pnl, reason, chart_url, fees=fees,
+                                exit_reason=exit_reason)
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         print(f"[SHEETS] log_trade to '{tab_name}' failed: {e}")

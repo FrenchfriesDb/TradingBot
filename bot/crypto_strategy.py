@@ -24,6 +24,10 @@ class DebbieLaCrypto(DebbieLaSMC):
     def _make_asset(self, symbol):
         return Asset(symbol, asset_type=Asset.AssetType.CRYPTO)
 
+    def _minutes_to_close(self):
+        # Crypto trades 24/7 — there is no session close, so never gate entries.
+        return None
+
     def before_closing_bell(self):
         # Crypto trades 24/7 — no EOD forced close
         pass

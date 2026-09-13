@@ -24,3 +24,16 @@ test_state.json
 
 # macOS Finder duplicates ("foo 2.py")
 * 2.*
+
+# ── runtime artefacts (added 2026-09-13) ──────────────────────────────────────
+# Single-instance lock files: they hold a live PID, so committing one means a fresh
+# clone starts life refusing to run because it "sees" a process that never existed.
+*.lock
+.binance_bot.lock
+.test_bot.lock
+.tradingbot_live.lock
+# Bot-written state and logs — machine-specific, rewritten every cycle, and noisy in diffs.
+equity_history.json
+stock_logged_closes.json
+logs/
+*.log
