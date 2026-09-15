@@ -1,6 +1,7 @@
 from lumibot.strategies import Strategy
 from lumibot.entities import Asset, Order
 from bot import indicators
+from bot import ai_model as _ai_model
 from finbert_utils import estimate_sentiment
 from config import (NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALPACA_API_SECRET,
                     BASE_URL as ALPACA_BASE_URL, GOOGLE_SHEET_URL)
@@ -186,7 +187,10 @@ REASON: one concise sentence"""
             api_key=NVIDIA_API_KEY,
         )
         resp = client.chat.completions.create(
-            model="meta/llama-3.3-70b-instruct",
+            # Shared resolver — see bot/ai_model.py. The hardcoded id was
+            # decommissioned by NVIDIA and this bot, like the crypto one, fails
+            # OPEN, so it logged approvals no model ever gave.
+            model=(_ai_model.resolve(NVIDIA_API_KEY) or _ai_model.DEFAULT_MODEL),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=120,
@@ -1558,6 +1562,26 @@ class DebbieLaSMC(Strategy):
         if self.state[symbol] == "SWEEP_HUNT" and position is None:
             iters_hunting = self._iter_count - self.sweep_hunt_iter[symbol]
 
+            # Re-check chop WHILE hunting. These guards ran only from IDLE (line ~1391),
+            # so once a symbol left IDLE it was never re-checked: it rode a days-old
+            # directional read into a flat tape and took the retest late — the "only
+            # enters after the big move" complaint. htf already carries both readings, so
+            # this costs nothing. Bail for this iteration rather than resetting; the sweep
+            # may still come, and sweep_hunt_expired() owns the age question.
+            if htf.get("amd_phase") == "accumulation":
+                if iters_hunting % 12 == 1:          # periodic, not every iteration
+                    self.log_message(
+                        f"[{symbol}] 📦 Still hunting but HTF is accumulating — "
+                        f"not arming into chop.", color="yellow")
+                return
+            if htf.get("atr_pct", 1.0) < MIN_ATR_PCT:
+                if iters_hunting % 12 == 1:
+                    self.log_message(
+                        f"[{symbol}] ⏸ Still hunting but 4H ATR "
+                        f"{htf.get('atr_pct', 0):.2%} < {MIN_ATR_PCT:.2%} floor — "
+                        f"market too dead to arm a zone.", color="yellow")
+                return
+
             if ltf["sweep"] and ltf["sweep_wick_low"]:
                 self.sweep_low[symbol] = ltf["sweep_wick_low"]
                 self.log_message(
@@ -1566,11 +1590,15 @@ class DebbieLaSMC(Strategy):
                 )
 
             # Expire the BOS signal if no sweep in SWEEP_PATIENCE iterations
-            if iters_hunting > SWEEP_PATIENCE and not self.sweep_low[symbol]:
-                self.log_message(
-                    f"[{symbol}] No sweep after {SWEEP_PATIENCE} iters — BOS stale. Resetting.",
-                    color="yellow"
-                )
+            # `and not self.sweep_low[symbol]` made this unreachable: sweep_low is set
+            # on the FIRST sweep and only cleared on reset, so one sweep disabled the
+            # expiry forever. Same defect as binance_bot.py — on the crypto side BTC then
+            # held SWEEP_HUNT for ~62h on a three-day-old BOS. Two limits now: no sweep
+            # after SWEEP_PATIENCE, and a hard ceiling at 2x regardless.
+            _expired, _why = indicators.sweep_hunt_expired(
+                iters_hunting, SWEEP_PATIENCE, bool(self.sweep_low[symbol]))
+            if _expired:
+                self.log_message(f"[{symbol}] 💀 {_why}. Resetting to IDLE.", color="yellow")
                 self._reset(symbol)
                 return
 
@@ -1797,8 +1825,19 @@ class DebbieLaSMC(Strategy):
                              else (self.fvg_high[symbol] * 1.003) if (not is_long and self.fvg_high[symbol])
                              else None)
                     _liq_cap = (current_price / PAPER_LEVERAGE) * 0.90 if PAPER_LEVERAGE > 1 else None
+                    # Anchor to the ZONE EDGE, not the live price. structural_stop_price
+                    # returns `entry - dist`, so passing current_price let the stop SLIDE
+                    # ALONG WITH THE FILL — risk stayed pinned near the ATR floor however
+                    # far past the zone price had run, and R:R became incapable of
+                    # degrading with fill quality. Measured on the crypto side, same zone /
+                    # same fill / same target: 1:1.69 refused by one path, 1:2.20 taken by
+                    # the other. Risk is still measured from the ACTUAL fill below, so a
+                    # worse fill now costs more risk instead of dragging the stop behind it.
+                    _anchor = (self.fvg_low[symbol] if (is_long and self.fvg_low[symbol])
+                               else self.fvg_high[symbol] if (not is_long and self.fvg_high[symbol])
+                               else current_price)
                     sl = round(indicators.structural_stop_price(
-                        current_price, _zone, _atr_1h, is_long, MIN_STOP_ATR_MULT, _liq_cap), 2)
+                        _anchor, _zone, _atr_1h, is_long, MIN_STOP_ATR_MULT, _liq_cap), 2)
                     risk_amt = abs(current_price - sl)
                     bias_str = "bullish" if is_long else "bearish"
 

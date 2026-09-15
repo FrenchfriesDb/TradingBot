@@ -1131,53 +1131,12 @@ def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, 
 # A hardcoded id will rot again, and the /v1/models listing CANNOT be trusted to prevent
 # it: probed on 2026-09-15 that endpoint returned 81 models while only 4 of 14 tried were
 # actually callable (the rest 404/410/503). So resolve by PROBING, not by listing.
-NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b")
-# Walked in order if the configured model is dead. All verified callable 2026-09-15.
-NVIDIA_MODEL_FALLBACKS = [
-    "nvidia/nemotron-3-super-120b-a12b",
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
-]
-_AI_MODEL_RESOLVED = None     # set once at startup by resolve_ai_model()
-
-
+# AI model resolution lives in bot/ai_model.py so BOTH bots share one definition —
+# the hardcoded `meta/llama-3.3-70b-instruct` was duplicated here and in bot/strategy.py,
+# and NVIDIA decommissioned it under both. See that module for why probing beats listing.
 def resolve_ai_model(timeout=20):
-    """Probe NVIDIA for a model that actually answers; return its id or None.
-
-    Returns None when nothing works, which is the honest state — the caller then stops
-    claiming an approval instead of printing ✅ YES off a fail-open.
-    """
-    global _AI_MODEL_RESOLVED
-    if _AI_MODEL_RESOLVED is not None:
-        return _AI_MODEL_RESOLVED or None
-    if not NVIDIA_API_KEY:
-        _AI_MODEL_RESOLVED = ""
-        print("🤖 AI disabled — no NVIDIA_API_KEY. Trading on technicals only.", flush=True)
-        return None
-    import json as _json, urllib.request as _ur
-    tried = []
-    for model in [NVIDIA_MODEL] + [m for m in NVIDIA_MODEL_FALLBACKS if m != NVIDIA_MODEL]:
-        body = _json.dumps({"model": model,
-                            "messages": [{"role": "user", "content": "ok"}],
-                            "max_tokens": 4, "temperature": 0}).encode()
-        req = _ur.Request("https://integrate.api.nvidia.com/v1/chat/completions", data=body,
-                          headers={"Authorization": f"Bearer {NVIDIA_API_KEY}",
-                                   "Content-Type": "application/json"})
-        try:
-            _ur.urlopen(req, timeout=timeout).read(1)
-            _AI_MODEL_RESOLVED = model
-            if model != NVIDIA_MODEL:
-                print(f"⚠️  AI model '{NVIDIA_MODEL}' is dead — fell back to '{model}'. "
-                      f"Set NVIDIA_MODEL in .env to make this permanent.", flush=True)
-            else:
-                print(f"🤖 AI model live: {model}", flush=True)
-            return model
-        except Exception as e:
-            tried.append(f"{model} ({getattr(e, 'code', None) or type(e).__name__})")
-    _AI_MODEL_RESOLVED = ""
-    print("⛔ AI UNAVAILABLE — no model answered. Trading on technicals only; the log will "
-          "say SKIPPED, not approved.\n     tried: " + "; ".join(tried), flush=True)
-    return None
+    from bot import ai_model as _ai
+    return _ai.resolve(NVIDIA_API_KEY, timeout=timeout)
 
 
 NEWS_CONTEXT_TIMEOUT_SECS = 20
@@ -1392,7 +1351,7 @@ REASON: one concise sentence"""
             api_key=NVIDIA_API_KEY,
         )
         resp = client.chat.completions.create(
-            model=(resolve_ai_model() or "nvidia/nemotron-3-super-120b-a12b"),
+            model=(resolve_ai_model() or __import__("bot.ai_model", fromlist=["x"]).DEFAULT_MODEL),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=120,
