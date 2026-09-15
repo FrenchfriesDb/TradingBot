@@ -190,7 +190,7 @@ REASON: one concise sentence"""
             # Shared resolver — see bot/ai_model.py. The hardcoded id was
             # decommissioned by NVIDIA and this bot, like the crypto one, fails
             # OPEN, so it logged approvals no model ever gave.
-            model=(_ai_model.resolve(NVIDIA_API_KEY) or _ai_model.DEFAULT_MODEL),
+            model=(_ai_model.resolve(NVIDIA_API_KEY) or _ai_model.configured_model()),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=120,

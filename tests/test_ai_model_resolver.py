@@ -36,15 +36,21 @@ def test_the_first_working_model_wins():
     ai_model._probe = fake
     got = ai_model.resolve("key", log=lambda m: None)
     assert got == ai_model.FALLBACKS[-1]
-    assert len(tried) > 1, "it must walk the chain, not give up on the first failure"
+    assert len(set(tried)) > 1, "it must walk the chain, not give up on the first failure"
 
 
 def test_a_dead_default_is_reported_not_silently_swapped():
+    """A PERMANENT failure (410) demotes, and the operator is told how to pin the
+    replacement — a silent swap would hide that their configured model is gone."""
     logs = []
-    ai_model._probe = lambda m, k, t: (_ for _ in ()).throw(RuntimeError("410")) \
-        if m == ai_model.DEFAULT_MODEL else None
+    class Gone(Exception):
+        code = 410
+    def fake(m, k, t):
+        if m == ai_model.configured_model():
+            raise Gone()
+    ai_model._probe = fake
     ai_model.resolve("key", log=logs.append)
-    assert any("is dead" in m and "NVIDIA_MODEL" in m for m in logs), \
+    assert any("unavailable" in m and "NVIDIA_MODEL" in m for m in logs), \
         "the operator must be told to pin the working one"
 
 
@@ -89,4 +95,46 @@ def test_reset_cache_allows_a_key_change_without_a_restart():
 
 def test_the_dead_model_is_not_in_the_fallback_chain():
     assert "meta/llama-3.3-70b-instruct" not in ai_model.FALLBACKS
-    assert "meta/llama-3.3-70b-instruct" != ai_model.DEFAULT_MODEL
+    assert "meta/llama-3.3-70b-instruct" != ai_model.configured_model()
+
+
+# ── the two defects found on the first live key change ──
+
+def test_a_transient_failure_does_not_permanently_demote_the_preferred_model():
+    """Measured live: the preferred model answered 503 on one probe and worked on the
+    next. The first version cached that blip as "dead" for the whole process lifetime,
+    pinning the bot to a lesser model until someone restarted it."""
+    calls = []
+    def flaky(model, key, timeout):
+        calls.append(model)
+        if model == ai_model.configured_model() and len(calls) == 1:
+            raise RuntimeError("503 busy")      # transient, no .code attribute
+    ai_model._probe = flaky
+    got = ai_model.resolve("key", log=lambda m: None)
+    assert got == ai_model.configured_model(), "one blip must not demote it"
+
+
+def test_a_permanent_404_demotes_immediately_without_retrying():
+    calls = []
+    class Gone(Exception):
+        code = 404
+    def fake(model, key, timeout):
+        calls.append(model)
+        if model == ai_model.configured_model():
+            raise Gone()
+    ai_model._probe = fake
+    ai_model.resolve("key", log=lambda m: None)
+    assert calls.count(ai_model.configured_model()) == 1, \
+        "404 means gone — retrying it wastes a 20s probe per attempt"
+
+
+def test_nvidia_model_is_read_lazily_not_at_import(monkeypatch):
+    """config.py calls load_dotenv() at ITS module level and this module can import
+    first, so reading os.getenv at import time silently ignores .env."""
+    monkeypatch.setenv("NVIDIA_MODEL", "some/other-model")
+    assert ai_model.configured_model() == "some/other-model"
+
+
+def test_an_unset_nvidia_model_falls_back_to_the_preferred_default(monkeypatch):
+    monkeypatch.delenv("NVIDIA_MODEL", raising=False)
+    assert ai_model.configured_model() == ai_model.PREFERRED_DEFAULT

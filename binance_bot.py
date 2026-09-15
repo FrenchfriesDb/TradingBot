@@ -1351,7 +1351,7 @@ REASON: one concise sentence"""
             api_key=NVIDIA_API_KEY,
         )
         resp = client.chat.completions.create(
-            model=(resolve_ai_model() or __import__("bot.ai_model", fromlist=["x"]).DEFAULT_MODEL),
+            model=(resolve_ai_model() or __import__("bot.ai_model", fromlist=["x"]).configured_model()),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=120,
