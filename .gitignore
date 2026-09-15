@@ -37,3 +37,10 @@ equity_history.json
 stock_logged_closes.json
 logs/
 *.log
+
+# iCloud Drive conflict copies. Desktop is iCloud-synced, so editing a file while sync
+# is mid-flight spawns "name 2.py" / "name 3.json" duplicates. They are stale snapshots,
+# never the working file — committing one would resurrect old code silently.
+*[0-9].json
+* [0-9].py
+* [0-9].log

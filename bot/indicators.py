@@ -1345,6 +1345,68 @@ def price_in_entry_zone(price, zone_lo, zone_hi, is_long, tol_pct=0.0015):
     return zone_lo <= price <= (zone_hi + tol)
 
 
+def tap_candle_opposes_bias(candle_type, bias):
+    """True when the tap bar is a decisive move AGAINST the trade.
+
+    A veto, deliberately — not a confirmation requirement.
+
+    The choch_fvg direct tap exists on a real premise: the displacement that left the gap
+    already broke structure, so it IS the change of character and a quick retest is
+    self-confirming. Demanding a second confirmation would discard that, and on a tape
+    that mostly consolidates it would cut trade count hard for little gain.
+
+    But "no confirmation needed" was implemented as "no check at all", and the two are not
+    the same. POL/USD 2026-09-14 tapped a LONG zone on a `marubozu_bear` — a full-bodied
+    DOWN candle — with the bot printing '⚠️ marubozu_bear (no candle confirm)' and entering
+    anyway. That is not an unconfirmed tap, it is an actively contradicted one.
+
+    So this blocks only the decisive opposing bar and stays silent on everything else:
+    a `normal` or `doji` tap still passes (XRP, which won, tapped on `normal`).
+    """
+    opposes_long = {"shooting_star", "gravestone_doji", "bearish_engulfing",
+                    "hanging_man", "marubozu_bear"}
+    opposes_short = {"hammer", "dragonfly_doji", "bullish_engulfing",
+                     "inverted_hammer", "marubozu_bull"}
+    if bias == "BULLISH":
+        return candle_type in opposes_long
+    if bias == "BEARISH":
+        return candle_type in opposes_short
+    return False
+
+
+def sweep_hunt_expired(sweep_hunt_bar, patience, has_sweep, hard_ceiling_mult=2):
+    """Has a SWEEP_HUNT sat so long that the BOS driving it is no longer worth trading?
+
+    The original guard was `sweep_hunt_bar > patience and not has_sweep`. Because
+    `sweep_low` is set on the FIRST sweep and only cleared by reset(), that `and not`
+    made the expiry unreachable the moment any sweep printed — the 4-hour limit became
+    infinite.
+
+    Measured on the live log: BTC held SWEEP_HUNT for 373 consecutive cycles (~62h50m) on
+    a 1H BOS from three days earlier, surviving a bot restart because sweep_hunt_bar is
+    persisted. POL's was ~34h. The sweep level itself drifted $76,030 -> $77,455 (1.9%)
+    across that window without ever being treated as a new setup.
+
+    Two expiries now:
+      - no sweep at all after `patience` bars  -> the BOS never produced its setup
+      - any state older than `patience * hard_ceiling_mult` -> the BOS is simply too old,
+        sweep or not. A directional read from three days ago is not a read on now.
+    """
+    try:
+        bars = int(sweep_hunt_bar or 0)
+        patience = int(patience or 0)
+    except (TypeError, ValueError):
+        return False, ""
+    if patience <= 0:
+        return False, ""
+    if bars > patience * hard_ceiling_mult:
+        return True, (f"BOS is {bars} bars old (>{patience * hard_ceiling_mult}) — too stale "
+                      f"to trade off, re-hunting from IDLE")
+    if bars > patience and not has_sweep:
+        return True, f"no sweep in {bars} bars — BOS stale"
+    return False, ""
+
+
 def sniper_entry_allowed(zone_type, is_stale, has_momentum,
                          candle_confirms, choch_aligned):
     """(ok, reason) — may the 10-second sniper fire on this tap?
@@ -1375,6 +1437,45 @@ def sniper_entry_allowed(zone_type, is_stale, has_momentum,
     if candle_confirms or choch_aligned:
         return True, "fresh zone, tap confirmed"
     return False, "fresh zone but the tap candle does not confirm the bias"
+
+
+def wick_fill_cutoff_ms(entry_ms, stop_moved_ms=0):
+    """Earliest candle a resting stop could legitimately fill on.
+
+    A stop can only fill on price action that happened WHILE THAT STOP EXISTED. The
+    watcher already knew half of this — it skipped candles opened before ENTRY, with the
+    comment "candle opened pre-entry — wick untrustworthy", added after a live trade
+    logged "TP hit" one second after entry off a pre-fill wick.
+
+    The identical bug sits one level up and is far more expensive: when the break-even
+    trail MOVES the stop, every candle from before the move is still in the window.
+
+    The arithmetic makes it fire every single time. Break-even arms at +1.25R and places
+    the stop at entry x (1 + ROUND_TRIP_COST x 1.5) — BELOW the trigger. On the same
+    10-second tick:
+
+        cur <= stop        -> impossible, cur just cleared a HIGHER bar
+        candle_low <= stop -> certain, because price had to rise THROUGH the stop level
+                              to reach +1.25R in the first place
+
+    Real case (BTC 2026-09-14): entry $77,587.61, +1.25R at $78,227.65, stop placed at
+    $78,169.52, closed at $78,169.5171 on the same tick. The target was reached 6.5h
+    later and the original stop was never within $395 of being hit.
+
+    Consequence: EVERY position reaching +1.25R is force-closed at roughly +1.14R while
+    every loser still takes a full 1.00R. That caps realized R:R at 1:1.14 against a 1:2
+    design — measured at 1:0.98 over 36 closes, with only 4 of 35 exits ever reaching
+    target.
+    """
+    try:
+        entry_ms = int(entry_ms or 0)
+    except (TypeError, ValueError):
+        entry_ms = 0
+    try:
+        stop_moved_ms = int(stop_moved_ms or 0)
+    except (TypeError, ValueError):
+        stop_moved_ms = 0
+    return max(entry_ms, stop_moved_ms)
 
 
 def first_protective_breach(candles, stop, target, is_long, since_ms=0):

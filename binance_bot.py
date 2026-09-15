@@ -712,6 +712,7 @@ def save_crypto_state(paper: "PaperTrader", states: dict, symbols: list, prices:
                 "partial_taken":      st.partial_taken,
                 "banked_pnl":         st.banked_pnl,
                 "breakeven_moved":    st.breakeven_moved,
+                "stop_moved_ms":      st.stop_moved_ms,
                 "zone_set_price":     st.zone_set_price,
                 "eql_level":          st.eql_level,
                 "eql_touch":          st.eql_touch,
@@ -849,6 +850,7 @@ def load_crypto_state(paper: "PaperTrader", states: dict, symbols: list, daily_s
             st.partial_taken      = saved.get("partial_taken", False)
             st.banked_pnl         = saved.get("banked_pnl", 0.0)
             st.breakeven_moved    = saved.get("breakeven_moved", False)
+            st.stop_moved_ms      = saved.get("stop_moved_ms", 0)
             st.zone_set_price     = saved.get("zone_set_price")
             raw_time              = saved.get("entry_time")
             st.entry_time         = (datetime.fromisoformat(raw_time).replace(tzinfo=timezone.utc)
@@ -938,6 +940,8 @@ class SymbolState:
         self.banked_pnl = 0.0         # profit realized by the scale-out leg — added to the
                                       # final ledger row so the sheet shows the trade's TRUE total
         self.breakeven_moved = False  # True after SL trailed to +0.5R profit lock
+        self.stop_moved_ms = 0        # when the stop was last MOVED (ms epoch). A stop
+                                      # cannot fill on a candle older than itself.
         self.zone_set_price = None    # price when a trend_follow zone was armed (for stale-zone invalidation)
         self.eql_level = None; self.eql_touch = 0   # latest equal-lows pool (for chart overlay)
         self.eqh_level = None; self.eqh_touch = 0   # latest equal-highs pool (for chart overlay)
@@ -1022,6 +1026,10 @@ def manage_open_trade(paper, state, symbol, cur_price, base):
         fee_buffer = entry * ROUND_TRIP_COST * 1.5
         state.stop_loss = entry + fee_buffer if is_long else entry - fee_buffer
         state.breakeven_moved = True
+        # Stamp the move. The watcher's wick check must not fill this stop on candles that
+        # printed BEFORE it existed — and to reach +1.25R price had to rise THROUGH this
+        # level, so those candles always contain a qualifying low.
+        state.stop_moved_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         print(f"[{base}] 🛡 +1.25R reached — SL moved to break-even ${state.stop_loss:,.4f} "
               f"(trade can no longer lose; still riding for the full target)")
 
@@ -1115,6 +1123,63 @@ def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, 
 
 # Deadline for the news/FinBERT context fetch inside get_ai_confirmation. Kept well
 # under the 5m loop so a wedged HuggingFace download can never stall a cycle.
+# ── AI model resolution (fixed 2026-09-15) ────────────────────────────────────────
+# The model id was hardcoded to `meta/llama-3.3-70b-instruct`, which NVIDIA
+# decommissioned. get_ai_confirmation fails OPEN, so for weeks every trade logged
+# "🤖 AI Bot Approval: ✅ YES" from an exception handler — a verdict no model ever gave.
+#
+# A hardcoded id will rot again, and the /v1/models listing CANNOT be trusted to prevent
+# it: probed on 2026-09-15 that endpoint returned 81 models while only 4 of 14 tried were
+# actually callable (the rest 404/410/503). So resolve by PROBING, not by listing.
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+# Walked in order if the configured model is dead. All verified callable 2026-09-15.
+NVIDIA_MODEL_FALLBACKS = [
+    "nvidia/nemotron-3-super-120b-a12b",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+]
+_AI_MODEL_RESOLVED = None     # set once at startup by resolve_ai_model()
+
+
+def resolve_ai_model(timeout=20):
+    """Probe NVIDIA for a model that actually answers; return its id or None.
+
+    Returns None when nothing works, which is the honest state — the caller then stops
+    claiming an approval instead of printing ✅ YES off a fail-open.
+    """
+    global _AI_MODEL_RESOLVED
+    if _AI_MODEL_RESOLVED is not None:
+        return _AI_MODEL_RESOLVED or None
+    if not NVIDIA_API_KEY:
+        _AI_MODEL_RESOLVED = ""
+        print("🤖 AI disabled — no NVIDIA_API_KEY. Trading on technicals only.", flush=True)
+        return None
+    import json as _json, urllib.request as _ur
+    tried = []
+    for model in [NVIDIA_MODEL] + [m for m in NVIDIA_MODEL_FALLBACKS if m != NVIDIA_MODEL]:
+        body = _json.dumps({"model": model,
+                            "messages": [{"role": "user", "content": "ok"}],
+                            "max_tokens": 4, "temperature": 0}).encode()
+        req = _ur.Request("https://integrate.api.nvidia.com/v1/chat/completions", data=body,
+                          headers={"Authorization": f"Bearer {NVIDIA_API_KEY}",
+                                   "Content-Type": "application/json"})
+        try:
+            _ur.urlopen(req, timeout=timeout).read(1)
+            _AI_MODEL_RESOLVED = model
+            if model != NVIDIA_MODEL:
+                print(f"⚠️  AI model '{NVIDIA_MODEL}' is dead — fell back to '{model}'. "
+                      f"Set NVIDIA_MODEL in .env to make this permanent.", flush=True)
+            else:
+                print(f"🤖 AI model live: {model}", flush=True)
+            return model
+        except Exception as e:
+            tried.append(f"{model} ({getattr(e, 'code', None) or type(e).__name__})")
+    _AI_MODEL_RESOLVED = ""
+    print("⛔ AI UNAVAILABLE — no model answered. Trading on technicals only; the log will "
+          "say SKIPPED, not approved.\n     tried: " + "; ".join(tried), flush=True)
+    return None
+
+
 NEWS_CONTEXT_TIMEOUT_SECS = 20
 MIN_AI_RR = 2.0   # hard floor — 1:2 minimum. Was 3.0, but ledger data showed ZERO trades
                   # ever reached a 3R target before scale-out/trail/stale-exit clipped them;
@@ -1327,7 +1392,7 @@ REASON: one concise sentence"""
             api_key=NVIDIA_API_KEY,
         )
         resp = client.chat.completions.create(
-            model="meta/llama-3.3-70b-instruct",
+            model=(resolve_ai_model() or "nvidia/nemotron-3-super-120b-a12b"),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=120,
@@ -1363,7 +1428,10 @@ REASON: one concise sentence"""
         return True, MIN_AI_RR, "AI timeout (25s) — proceeding on technicals"
     except Exception as e:
         _executor.shutdown(wait=False)
-        return True, MIN_AI_RR, f"AI unavailable ({e}) — proceeding on technicals"
+        # Fail OPEN, but do not CLAIM an approval. The NVIDIA model id is retired
+        # (HTTP 410 Gone), so every trade in the log carries "🤖 AI Bot Approval:
+        # ✅ YES" from this handler — a verdict no model ever gave.
+        return True, MIN_AI_RR, f"⚠️ AI SKIPPED — unavailable ({e}); technicals only, NOT an approval"
 
 
 def check_chase_continuation(df_ltf, bias, min_body_abs=0.0):
@@ -1505,7 +1573,11 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
     max_offset  = max(0.0, reward - min_reward)
     tp_offset   = min(0.05 * entry_atr, 0.25 * reward, max_offset)
     state.take_profit = (tp_planned - tp_offset if is_long else tp_planned + tp_offset)
-    icon    = "✅ YES" if confirm else "❌ NO"
+    # `confirm` is True even when the AI never answered — get_ai_confirmation fails
+    # OPEN. Printing ✅ YES there asserts a verdict no model gave. Fixing the reason
+    # string alone was not enough: this icon is what the eye actually reads.
+    _ai_dead = "AI SKIPPED" in (ai_reason or "") or "unavailable" in (ai_reason or "")
+    icon    = ("⚠️ SKIPPED" if _ai_dead else "✅ YES") if confirm else "❌ NO"
     _tp_src = "@4H pool" if (pool_tp and abs(tp_planned - pool_tp) < 1e-9) else f"{MAX_AI_RR:.0f}R cap"
     print(f"[{base}] 🤖 AI Bot Approval: {icon}  Structural R:R=1:{rr_actual:.1f} [{_tp_src}] "
           f"(AI suggested 1:{_ai_rr:.1f})  {ai_reason[:140]}")
@@ -1875,10 +1947,17 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             direction_label = "LONG" if is_long else "SHORT"
             lev_tag = f"[{PAPER_LEVERAGE}x]" if PAPER_LEVERAGE > 1 else ""
             won = pnl >= 0
+            # Label the alert by CAUSE, not by outcome sign. This said "🟢 TP" for any
+            # close that happened to end green — including a 6h STALE timeout, which is a
+            # completely different event. It made the log actively misleading: counting
+            # alerts gave 13 "targets" when only 4 real TP HITs existed, so any analysis
+            # built on them (including a diagnosis run on 2026-09-14) started out wrong.
+            _icon = {"TARGET": "🟢 TP", "STOP": "🔴 SL", "BREAKEVEN": "🛡 BREAK-EVEN",
+                     "STALE": "⏰ STALE"}.get(_exit_reason, "⏹ CLOSED")
             trade_print(f"{base} {direction_label}", f"{reason}",
                         price, pnl=pnl, balance=paper.balance,
                         extra=lev_tag)
-            alert(f"{'🟢 TP' if won else '🔴 SL'} — {base} {direction_label} closed",
+            alert(f"{_icon} — {base} {direction_label} closed",
                   f"P&L ${pnl:+.2f}  Balance ${paper.balance:,.2f}",
                   sound="Glass" if won else "Basso",
                   speak=f"{base} closed. {'Profit' if won else 'Loss'} {abs(pnl):.0f} dollars")
@@ -1914,21 +1993,27 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     # won't sustain it. Only enter when daily and 4H agree on direction.
     # Exception: when daily is unclear/choppy (None), follow the 4H alone at
     # half position size — ranging markets still have tradeable SMC setups.
-    if state.state == "IDLE" and not has_position:
-        # ATR filter shared by all entry paths — dead/ranging markets produce false signals.
-        # Use max(14-bar average, recent 3-bar) so a FRESH impulse (a sharp move the slow
-        # 14-bar average hasn't caught up to yet) isn't mislabeled "consolidating" and skipped.
-        rng     = df_htf['high'] - df_htf['low']
-        atr_14  = rng.rolling(14).mean().iloc[-1]
-        atr_3   = rng.rolling(3).mean().iloc[-1]
-        atr_pct = max(atr_14, atr_3) / price
-        atr_min = atr_gate_for(symbol)
+    # ── Chop measurements: computed for EVERY state, not only IDLE (fixed 2026-09-14) ──
+    # These used to live inside the `state == "IDLE"` block below, so once a symbol left
+    # IDLE it was never re-checked for chop again — it rode a stale directional read into
+    # a flat tape and took the retest late. That is the "bot only enters after the big
+    # move" complaint: POL sat in SWEEP_HUNT for ~34h and BTC for ~62h, and the
+    # SWEEP_HUNT→ENTRY_WAIT arming block had neither an ATR gate nor an accumulation check
+    # of its own.
+    rng     = df_htf['high'] - df_htf['low']
+    atr_14  = rng.rolling(14).mean().iloc[-1]
+    atr_3   = rng.rolling(3).mean().iloc[-1]
+    # max(14-bar, recent 3-bar) so a FRESH impulse the slow average hasn't caught up to
+    # yet isn't mislabeled "consolidating" and skipped.
+    atr_pct = max(atr_14, atr_3) / price
+    atr_min = atr_gate_for(symbol)
+    amd_phase_now, amd_info_now = indicators.detect_amd_phase(df_htf)
 
-        # ── FIX #2: Accumulation guard runs FIRST, gating every path below ────────
+    if state.state == "IDLE" and not has_position:
+        # ── Accumulation guard runs FIRST, gating every path below ────────────────
         # A tight HTF range = chop / institutions still accumulating. Don't trade
         # EITHER side until it breaks. Without this first, a 15-bar "BOS" printed
         # inside a 25-bar range whipsaws us. Log the range and bail for this cycle.
-        amd_phase_now, amd_info_now = indicators.detect_amd_phase(df_htf)
         if amd_phase_now == 'accumulation':
             print(f"[{base}] 📦 Accumulation: range ${amd_info_now['range_low']:,.2f}–"
                   f"${amd_info_now['range_high']:,.2f} ({amd_info_now['range_pct']:.1%} wide) "
@@ -2065,6 +2150,23 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     if state.state == "SWEEP_HUNT" and not has_position:
         state.sweep_hunt_bar += 1
 
+        # Re-check chop while hunting, not only on the way in. A BOS gets a symbol into
+        # SWEEP_HUNT and the bias then sticks; without this the market can collapse into
+        # accumulation underneath a days-old directional read and the bot still arms a
+        # zone off it. Bail for this cycle rather than resetting — the sweep may still
+        # come, and sweep_hunt_expired() above owns the age question.
+        if amd_phase_now == 'accumulation':
+            if state.sweep_hunt_bar % 12 == 1:      # ~hourly, not every 5-min tick
+                print(f"[{base}] 📦 Still hunting but HTF is accumulating "
+                      f"(${amd_info_now['range_low']:,.4f}–${amd_info_now['range_high']:,.4f}, "
+                      f"{amd_info_now['range_pct']:.1%} wide) — not arming into chop.")
+            return price
+        if atr_pct < atr_min:
+            if state.sweep_hunt_bar % 12 == 1:
+                print(f"[{base}] ⏸ Still hunting but HTF ATR {atr_pct:.2%} < "
+                      f"{atr_min:.2%} floor — market too dead to arm a zone.")
+            return price
+
         # Direction-aware sweep: a SHORT wants buy-side liquidity (highs) swept,
         # a LONG wants sell-side liquidity (lows) swept. Matching the sweep to the
         # bias filters out the wrong-side grab that precedes the opposite move.
@@ -2077,8 +2179,15 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             state.sweep_low = sweep_lvl
             print(f"[{base}] Sweep confirmed [{sweep_src}] @ ${sweep_lvl:,.4f} — hunting FVG/OB.")
 
-        if state.sweep_hunt_bar > SWEEP_PATIENCE and not state.sweep_low:
-            print(f"[{base}] No sweep in {SWEEP_PATIENCE} bars — BOS stale. Resetting.")
+        # `and not state.sweep_low` made this unreachable: sweep_low is set on the FIRST
+        # sweep and only cleared by reset(), so a single sweep disabled the 4h limit
+        # forever. BTC then held SWEEP_HUNT for 373 cycles (~62h50m) on a 1H BOS from three
+        # days earlier, surviving a restart because sweep_hunt_bar is persisted; POL's was
+        # ~34h. A directional read from three days ago is not a read on now.
+        _expired, _why = indicators.sweep_hunt_expired(
+            state.sweep_hunt_bar, SWEEP_PATIENCE, bool(state.sweep_low))
+        if _expired:
+            print(f"[{base}] 💀 {_why}. Resetting to IDLE.")
             state.reset()
             return price
 
@@ -2419,6 +2528,19 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             rebounce = confirms or choch_aligned
 
             if state.amd_zone_type == "choch_fvg" and is_fresh:
+                # The displacement gap IS the change of character, so no positive
+                # confirmation is demanded — but "no confirmation needed" had been
+                # implemented as "no check at all". POL/USD 2026-09-14 tapped this LONG
+                # zone on a marubozu_bear, the bot printed '⚠️ marubozu_bear (no candle
+                # confirm)', and entered anyway. That is not an unconfirmed tap, it is an
+                # actively contradicted one. A VETO, not a requirement: only a decisive
+                # opposing bar blocks it, so `normal` and `doji` taps still enter (XRP,
+                # the one winner in this sample, tapped on `normal`).
+                if indicators.tap_candle_opposes_bias(tap_candle, state.bias):
+                    if _tap_changed:
+                        print(f"[{base}] 🚫 Direct tap vetoed — tap bar is {tap_candle}, "
+                              f"a decisive move AGAINST a {state.bias} entry. Waiting.")
+                    return price
                 print(f"[{base}] ⚡ Fresh displacement FVG retest — DIRECT TAP entry (no CHoCH needed)")
             elif is_fresh:
                 if not rebounce:
@@ -2462,8 +2584,21 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             _zone_edge = state.fvg_low if is_long else state.fvg_high
             _zone_lvl  = indicators.crypto_zone_stop_level(
                 price, is_long, _zone_edge, SL_ATR_MULT * _ltf_atr, _swing)
+            # Anchor to the ZONE EDGE, not the live fill — matching the sniper at
+            # binance_bot.py:2298 (`structural_stop_price(_fill_s, ...)` with
+            # _fill_s = state.fvg_low). structural_stop_price returns `entry - dist`, so
+            # passing the live `price` let the stop SLIDE ALONG WITH THE FILL: risk stayed
+            # pinned at ~1.5x 1H-ATR no matter how far past the zone price had already run,
+            # and R:R on this path became structurally incapable of degrading with fill
+            # quality. Measured on two live trades, same zone / same fill / same target:
+            #   POL  sniper risk 0.0013 (1:1.69, REFUSED)  ->  5m risk 0.0010 (1:2.20, TAKEN)
+            #   XRP  sniper risk 0.0268 (1:1.66, REFUSED)  ->  5m risk 0.0209 (1:2.12, TAKEN)
+            # A 22-23% smaller denominator bought with nothing but a different anchor.
             state.stop_loss = indicators.structural_stop_price(
-                price, _zone_lvl, atr_1h or _ltf_atr, is_long, MIN_STOP_ATR_MULT_HTF)
+                _zone_edge, _zone_lvl, atr_1h or _ltf_atr, is_long, MIN_STOP_ATR_MULT_HTF)
+            # ...but risk is still measured from the price we ACTUALLY fill at, so a worse
+            # fill now costs MORE risk instead of dragging the stop up behind it. That is
+            # what makes MIN_AI_RR a real filter on this path rather than an output.
             risk_amt = abs(price - state.stop_loss)
             print(f"[{base}] 📏 Structural SL ${state.stop_loss:,.4f}  "
                   f"(risk ${risk_amt:,.4f} = {risk_amt / (atr_1h or _ltf_atr):.1f}×1H-ATR)")
@@ -2569,7 +2704,8 @@ def run():
             if _gap_hit:
                 _kind, fill, _ts = _gap_hit
                 sl_hit, tp_hit = _kind == "STOP", _kind == "TARGET"
-                label = "🔴 SL" if sl_hit else "🟢 TP"
+                label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
+                          else "🔴 SL") if sl_hit else "🟢 TP")
                 print(f"  ⏮ {base}: {_kind} was breached at "
                       f"{datetime.fromtimestamp(_ts/1000, timezone.utc):%Y-%m-%d %H:%M UTC} "
                       f"while the bot was DOWN — honouring it at ${fill:,.6g} "
@@ -2578,7 +2714,8 @@ def run():
                 sl_hit = (is_long and _cur <= st.stop_loss) or (not is_long and _cur >= st.stop_loss)
                 tp_hit = (is_long and _cur >= st.take_profit) or (not is_long and _cur <= st.take_profit)
                 fill  = st.stop_loss if sl_hit else st.take_profit
-                label = "🔴 SL" if sl_hit else "🟢 TP"
+                label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
+                          else "🔴 SL") if sl_hit else "🟢 TP")
             if sl_hit or tp_hit:
                 close_qty = abs(held)
                 if is_long:
@@ -2703,10 +2840,19 @@ def run():
                     try:
                         _t      = exchange.fetch_ticker(sym)
                         _cur    = float(_t["last"])
-                        _tol    = _cur * 0.0015
-                        _in     = st.fvg_low - _tol <= _cur <= st.fvg_high + _tol
+                        _is_long = st.bias == "BULLISH"
+                        # Use the SAME zone test as the 5m cycle. This was the old
+                        # symmetric +/-0.15% band that price_in_entry_zone was written to
+                        # kill: it let a LONG fill ABOVE the top of its own demand zone
+                        # (HYPE 2026-09-14 filled $78.99 against a $78.60-$78.95 zone).
+                        # Because the sniper freezes SL/TP to the zone edge but measures
+                        # risk at the live fill, an out-of-zone fill manufactures a FALSE
+                        # R:R decay — HYPE's "1:1.69" was a measurement artefact, not a
+                        # verdict on the setup. Tolerance must apply only on the far side,
+                        # where overshooting improves the fill.
+                        _in     = indicators.price_in_entry_zone(
+                            _cur, st.fvg_low, st.fvg_high, _is_long)
                         if _in:
-                            _is_long = st.bias == "BULLISH"
                             _base    = sym.split("/")[0]
 
                             # Stale-zone gate — this watcher previously fired on PURE price-in-
@@ -2831,10 +2977,19 @@ def run():
                             _rr_at_fill = (abs(st.sniper_tp - _fill) / _risk_at_fill
                                            if _risk_at_fill > 0 else 0.0)
                             if _rr_at_fill < MIN_AI_RR:
-                                print(f"[{_base}] 🚫 Sniper stood down — R:R decayed to "
+                                # RESET, don't merely disarm. R:R is a property of the
+                                # SETUP (zone, stop, target) — not of which engine is
+                                # looking at it. Clearing only `sniper_armed` left the zone
+                                # live in ENTRY_WAIT, so the 5m cycle inherited a tap the
+                                # bot had just rejected and took it minutes later (POL and
+                                # XRP both did exactly this). carried_zone_age means a
+                                # legitimate re-arm still reads as correctly aged rather
+                                # than brand-new, which is what makes this safe.
+                                print(f"[{_base}] 🚫 Setup rejected — R:R decayed to "
                                       f"1:{_rr_at_fill:.2f} at the fill (${_fill:,.4f} vs armed "
-                                      f"zone), under the 1:{MIN_AI_RR:g} floor.", flush=True)
-                                st.sniper_armed = False
+                                      f"zone), under the 1:{MIN_AI_RR:g} floor. Zone dropped so "
+                                      f"the 5m cycle cannot re-take it.", flush=True)
+                                st.reset()
                                 continue
 
                             _min_a, _min_c = exchange_minimums(exchange, sym)
@@ -2932,9 +3087,16 @@ def run():
                         candle_high  = cur
                         candle_low   = cur
                         entry_ms = int(st.entry_time.timestamp() * 1000) if st.entry_time else 0
+                        # ...and not before the STOP itself. Same reasoning as pre-entry
+                        # wicks, one level up: the break-even trail places the stop BELOW
+                        # the price that triggered it, so every candle from before the
+                        # move carries a low under the new stop and closes the trade on
+                        # the same tick. See indicators.wick_fill_cutoff_ms.
+                        _cutoff = indicators.wick_fill_cutoff_ms(
+                            entry_ms, getattr(st, "stop_moved_ms", 0))
                         for c in (m1 or []):
-                            if c[0] < entry_ms:
-                                continue   # candle opened pre-entry — wick untrustworthy
+                            if c[0] < _cutoff:
+                                continue   # predates the entry OR the current stop
                             candle_high = max(candle_high, float(c[2]))
                             candle_low  = min(candle_low,  float(c[3]))
                     except Exception:
@@ -2954,7 +3116,12 @@ def run():
                         fill = st.stop_loss
                     else:
                         fill = st.take_profit
-                    label = "🔴 SL" if sl_hit else "🟢 TP"
+                    # A trailed stop is a BREAK-EVEN exit, not a stop-out. Labelling
+                    # both "🔴 SL" is what made BTC (+$4.85, a trailed winner) get
+                    # triaged as a "big SL loss" — normalize_exit_reason already
+                    # draws the distinction two lines later for the ledger.
+                    label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
+                              else "🔴 SL") if sl_hit else "🟢 TP")
                     if is_long:
                         paper.sell(sym, close_qty, fill)
                         pnl = (fill - st.entry_price) * close_qty
