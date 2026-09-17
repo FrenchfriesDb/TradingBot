@@ -8,6 +8,22 @@ import os
 os.environ.setdefault("LUMIBOT_TELEMETRY", "false")
 os.environ.setdefault("LUMIBOT_LOG_LEVEL", "ERROR")
 
+# ── Make this run explainable no matter how it was launched ───────────────────
+# scripts/start_stock_bot.sh redirects stdout into logs/stock_bot.log, so a supervised
+# bot is always recorded. A bare `python3 tradingbot.py live` in a Terminal is not — its
+# output goes to the tty and dies with the window. That is not hypothetical: on
+# 2026-09-16 a four-hour DNS outage, and every entry decision around it, existed only in
+# scrollback, because bot/tee_logging.py had been wired into binance_bot.py alone.
+# Runs before anything prints so the startup banner is captured too. should_tee() makes
+# this a no-op when stdout is already a file, so a script launch never double-writes.
+if __name__ == "__main__":
+    from bot.tee_logging import tee_stdout_to
+    _TEED = tee_stdout_to(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "logs", "stock_bot.log"))
+    if _TEED:
+        print(f"📝 Also logging to {_TEED} (started from a terminal — teeing so this "
+              f"session is still explainable afterwards)")
+
 import logging
 import warnings
 
@@ -87,54 +103,13 @@ class _DedupMalformedOrderFilter(logging.Filter):
 _DEDUP_MALFORMED = _DedupMalformedOrderFilter()
 
 # ── Collapse network-outage tracebacks to a single line ───────────────────────
-# When the Mac loses DNS (laptop sleeps, WiFi drops, network changes), EVERY Alpaca
-# call fails with `socket.gaierror: [Errno 8] nodename nor servname provided`. Lumibot
-# catches it, fires on_bot_crash, and recovers on its own — but not before dumping a
-# ~200-line nested traceback for each failed call. Four calls in a row and the log is a
-# 800-line wall that looks exactly like a fatal crash when it's really a WiFi blip.
-# Nothing is wrong with the bot in this state; it resumes with "Sleeping until the
-# market opens" once DNS returns. Collapse these to one honest line so a genuine
-# error stays visible instead of being buried in transient network noise.
-_NETWORK_ERROR_SIGNS = (
-    "nodename nor servname provided",   # macOS DNS failure (the common one here)
-    "Failed to establish a new connection",
-    "Max retries exceeded",
-    "NewConnectionError",
-    "Temporary failure in name resolution",
-    "Connection aborted",
-    "Read timed out",
-    "ReadTimeout",
-)
+# Lives in bot/log_filters.py — shared, and tested in tests/test_network_outage_logging.py
+# against the two floods that actually got through the old inline version: APScheduler's
+# `Job "..." raised an exception` (outage hidden in exc_info, not in the message) and
+# lumibot's backoff-free `Executing the on_bot_crash event method` retry spin.
+from bot.log_filters import CollapseNetworkTracebackFilter
 
-class _CollapseNetworkTracebackFilter(logging.Filter):
-    """Keep ONE line per network outage; drop the traceback and the repeats."""
-    _last_seen = [0.0]          # list so it stays mutable across calls
-    _QUIET_WINDOW_SECS = 60     # one notice per minute of continuous outage
-
-    def filter(self, record):
-        try:
-            msg = record.getMessage()
-        except Exception:
-            return True
-        if not any(s in msg for s in _NETWORK_ERROR_SIGNS):
-            return True
-        # A bare traceback continuation line (lumibot logs the trace as its own record)
-        # carries no new information once the outage is already reported — drop it.
-        import time as _t
-        now = _t.time()
-        if now - self._last_seen[0] < self._QUIET_WINDOW_SECS:
-            return False
-        self._last_seen[0] = now
-        record.msg = ("🌐 Network unreachable (DNS/connection failure) — Alpaca calls are "
-                      "failing. The bot recovers automatically once the connection is back; "
-                      "no action needed unless this persists. Further network errors "
-                      "suppressed for 60s.")
-        record.args = ()
-        record.exc_info = None      # this is what kills the 200-line traceback
-        record.exc_text = None
-        return True
-
-_COLLAPSE_NETWORK = _CollapseNetworkTracebackFilter()
+_COLLAPSE_NETWORK = CollapseNetworkTracebackFilter()
 
 def _add_filters(logger_obj):
     for f in (_QUIET, _DEDUP_MALFORMED, _COLLAPSE_NETWORK):

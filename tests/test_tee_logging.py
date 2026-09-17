@@ -81,3 +81,87 @@ def test_appends_rather_than_truncating(tmp_path):
 def test_unwritable_path_returns_none_instead_of_raising(tmp_path):
     def _boom(*a, **k): raise PermissionError("nope")
     assert tee_stdout_to(str(tmp_path / "x.log"), stream=_Tty(), opener=_boom) is None
+
+
+# ── the wiring, not just the mechanism ────────────────────────────────────────
+#
+# Everything above tests tee_stdout_to() itself. None of it tested whether any bot
+# actually CALLS it — and for two weeks tradingbot.py did not. The function worked
+# perfectly and the stock bot still wrote no file log at all, because the wiring was
+# only ever added to binance_bot.py. On 2026-09-17 a bare-tty `tradingbot.py live`
+# (PID 90132, fds 1 and 2 both on /dev/ttys002) was confirmed writing nowhere, four
+# hours of DNS-outage diagnosis surviving only in terminal scrollback.
+#
+# So the wiring is the thing under test here: called at all, with the right log name,
+# early enough to catch the startup banner, and guarded so importing the module in a
+# test suite never tees.
+import ast
+import pathlib
+
+import pytest
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+
+# a call before these land is a call before the bot can print anything interesting
+HEAVY = ("lumibot", "ccxt", "pandas", "config", "sheets_logger", "chart_renderer",
+         "bot.strategy", "bot.crypto_strategy")
+
+
+def _tee_calls(tree):
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", getattr(n.func, "attr", None)) == "tee_stdout_to"]
+
+
+def _first_heavy_import_line(tree):
+    lines = []
+    for n in ast.walk(tree):
+        mod = None
+        if isinstance(n, ast.ImportFrom):
+            mod = n.module or ""
+        elif isinstance(n, ast.Import):
+            mod = n.names[0].name
+        if mod and any(mod == h or mod.startswith(h + ".") for h in HEAVY):
+            lines.append(n.lineno)
+    return min(lines) if lines else None
+
+
+@pytest.mark.parametrize("script,logname", [
+    ("binance_bot.py", "binance_bot.log"),
+    ("tradingbot.py", "stock_bot.log"),
+])
+def test_each_bot_tees_its_own_stdout(script, logname):
+    tree = ast.parse((REPO / script).read_text(encoding="utf-8"))
+    calls = _tee_calls(tree)
+    assert calls, f"{script} never calls tee_stdout_to — a bare launch would log nowhere"
+
+    consts = [c.value for call in calls for c in ast.walk(call)
+              if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+    assert logname in consts, f"{script} tees somewhere other than logs/{logname}: {consts}"
+    assert "logs" in consts, f"{script} does not tee into the logs/ directory"
+
+    heavy = _first_heavy_import_line(tree)
+    if heavy is not None:
+        assert calls[0].lineno < heavy, (
+            f"{script} tees at line {calls[0].lineno}, after its first heavy import at "
+            f"line {heavy} — the startup banner would be lost")
+
+
+@pytest.mark.parametrize("script", ["binance_bot.py", "tradingbot.py"])
+def test_teeing_is_guarded_so_importing_the_module_never_tees(script):
+    """pytest imports these modules; an unguarded tee would spray the suite into a log."""
+    tree = ast.parse((REPO / script).read_text(encoding="utf-8"))
+    guarded = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        t = node.test
+        if (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name)
+                and t.left.id == "__name__"):
+            guarded.update(c.lineno for b in node.body for c in _tee_calls(ast.Module(
+                body=[b], type_ignores=[])))
+    calls = _tee_calls(tree)
+    assert calls, f"{script} never calls tee_stdout_to"
+    for call in calls:
+        assert call.lineno in guarded, (
+            f'{script}:{call.lineno} tees outside an `if __name__ == "__main__"` guard')
