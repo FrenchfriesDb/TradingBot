@@ -63,6 +63,10 @@ MIN_FVG_PCT            = float(os.getenv("MIN_FVG_PCT", "0.0015"))
 # Targets beyond this x the HTF ATR cannot resolve before STALE_TRADE_HOURS / the EOD
 # flatten, whichever lands first, so they only ever exit on the clock.
 MAX_TARGET_ATR_MULT    = float(os.getenv("MAX_TARGET_ATR_MULT", "1.5"))
+# How far a swept level may sit from price and still count as THIS move's inducement.
+# Same gate and same defaults as binance_bot.py — see bot/indicators.sweep_within_reach.
+SWEEP_MAX_ATR_MULT     = float(os.getenv("SWEEP_MAX_ATR_MULT", "2.5"))
+SWEEP_MAX_PCT          = float(os.getenv("SWEEP_MAX_PCT", "0.02"))
 
 MIN_STOP_ATR_MULT = 1.5
 MIN_TP_RR = 2.0
@@ -1606,6 +1610,23 @@ class DebbieLaSMC(Strategy):
             if not self.sweep_low[symbol]:
                 return
 
+            # ...and once that sweep is still near the market. sweep_hunt_expired() above
+            # bounds how LONG a hunt may run; nothing bounded how FAR the liquidity was.
+            # The crypto bot armed three trades on 2026-09-17 off sweeps 5.7-6.3% away;
+            # this side runs the identical SWEEP_HUNT -> ENTRY_WAIT shape. Drop the stale
+            # level and keep hunting — the BOS read may still be good, it is only this
+            # particular grab that has gone out of date.
+            _reach_ok, _reach_why = indicators.sweep_within_reach(
+                self.sweep_low[symbol], current_price,
+                indicators.range_atr(ltf["df"]),
+                SWEEP_MAX_ATR_MULT, SWEEP_MAX_PCT)
+            if not _reach_ok:
+                self.log_message(
+                    f"[{symbol}] 🥀 {_reach_why} — dropping it and hunting a fresh sweep.",
+                    color="yellow")
+                self.sweep_low[symbol] = None
+                return
+
             # Prefer the post-sweep displacement FVG (the CHoCH gap) — that's the gap the
             # reversal left behind. Fall back to a generic FVG/OB only with no clean gap.
             want = "bullish" if self.bias[symbol] == "BULLISH" else "bearish"
@@ -1626,6 +1647,10 @@ class DebbieLaSMC(Strategy):
                 )
 
             elif self.bias[symbol] == "BULLISH" and ltf["fvg_bull"]:
+                # A generic gap, NOT the displacement that broke structure. Left
+                # unset this reached get_ai_confirmation(zone_type=None) — asking
+                # the model to grade a setup without telling it what the zone is.
+                self.amd_zone_type[symbol] = "bullish_fvg"
                 self.fvg_low[symbol]      = ltf["fvg_bottom"]
                 self.fvg_high[symbol]     = ltf["fvg_top"]
                 self.fvg_set_iter[symbol] = self._iter_count
@@ -1638,6 +1663,10 @@ class DebbieLaSMC(Strategy):
                 )
 
             elif self.bias[symbol] == "BEARISH" and ltf["fvg_bear"]:
+                # A generic gap, NOT the displacement that broke structure. Left
+                # unset this reached get_ai_confirmation(zone_type=None) — asking
+                # the model to grade a setup without telling it what the zone is.
+                self.amd_zone_type[symbol] = "bearish_fvg"
                 self.fvg_low[symbol]      = ltf["fvg_bear_bottom"]
                 self.fvg_high[symbol]     = ltf["fvg_bear_top"]
                 self.fvg_set_iter[symbol] = self._iter_count

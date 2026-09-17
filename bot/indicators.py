@@ -1428,15 +1428,65 @@ def sniper_entry_allowed(zone_type, is_stale, has_momentum,
     callers pass choch_aligned=False. That makes it STRICTER than the 5m path, never
     looser — a tap it declines is simply picked up by the next 5m cycle, which does have
     the 15m read. Declining late is recoverable; entering wrongly is not.
+
+    2026-09-17 — the FRESH branch was still too loose, and it cost three trades in one
+    morning (AVAX, SEI, ADA, all long into a sideways drift). has_momentum was consulted
+    ONLY on the stale branch, so a fresh zone whose type was None fell straight through
+    to `candle_confirms or choch_aligned`: one ordinary green candle was the entire entry
+    requirement. The AVAX log is the whole story — eleven refusals in a row, then a single
+    confirming candle and it fired, with bos_dir, choch_dir, disp_high, disp_low and
+    amd_zone_type ALL None.
+
+    So displacement is now required on every zone except choch_fvg, fresh or stale.
+    choch_fvg keeps its direct tap because there the displacement IS the zone; demanding
+    it again would be circular, and that path's entries were never the ones complained
+    about. Everything else must show a real impulse at the tap AND a confirming candle.
     """
     if is_stale:
         return (True, "stale zone, fresh momentum confirmed") if has_momentum else \
                (False, "stale zone with no fresh displacement")
     if zone_type == "choch_fvg":
         return True, "fresh displacement FVG — direct tap"
+    if not has_momentum:
+        return False, ("fresh zone with no displacement at the tap — needs a real "
+                       "impulse, not just a confirming candle")
     if candle_confirms or choch_aligned:
-        return True, "fresh zone, tap confirmed"
-    return False, "fresh zone but the tap candle does not confirm the bias"
+        return True, "fresh zone, displacement and tap both confirmed"
+    return False, "displacement present but the tap candle does not confirm the bias"
+
+
+def sweep_within_reach(sweep_level, price, atr, max_atr_mult=2.5, max_pct=0.02):
+    """(ok, why) — is the swept level still close enough to price to mean anything?
+
+    sweep_hunt_expired() caps how LONG a hunt may run. Nothing capped how FAR the
+    liquidity was. On 2026-09-17 all three bad entries armed off sweeps nowhere near the
+    market: AVAX swept $7.17 and armed a zone at $7.61 (5.7% away), SEI 6.3%, ADA 5.8%.
+    A grab that far below price is not the inducement for THIS move; it is a different
+    piece of history that happens to still be sitting in a variable.
+
+    The limit is volatility-relative, because a flat percentage is wrong in both
+    directions — 5.7% is absurd on a quiet chart and unremarkable on a violent one. The
+    percentage acts only as a floor, so a dead ATR reading tightens the gate to a sane
+    constant instead of collapsing it to zero (refuse everything) or to infinity.
+
+    A missing sweep is NOT reported as a reach failure: "there was no sweep" is a
+    different question, owned by the caller's own `if not state.sweep_low` guard.
+    """
+    if not sweep_level:
+        return True, "no sweep level to judge"
+    try:
+        price, sweep_level, atr = float(price), float(sweep_level), float(atr or 0.0)
+    except (TypeError, ValueError):
+        return False, "unreadable sweep level or price"
+    if price <= 0:
+        return False, "no usable price to measure the sweep against"
+    distance = abs(price - sweep_level)
+    limit = max(max_atr_mult * max(atr, 0.0), max_pct * price)
+    pct, limit_pct = distance / price, limit / price
+    if distance > limit:
+        return False, (f"swept level ${sweep_level:,.4f} is {pct:.1%} from ${price:,.4f}"
+                       f" — beyond the {limit_pct:.1%} reach limit")
+    return True, f"swept level {pct:.1%} away, within the {limit_pct:.1%} limit"
 
 
 def wick_fill_cutoff_ms(entry_ms, stop_moved_ms=0):

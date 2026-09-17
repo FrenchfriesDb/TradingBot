@@ -277,6 +277,12 @@ MIN_FVG_PCT            = float(os.getenv("MIN_FVG_PCT", "0.0015"))
 # inside the span of one. It cannot resolve — it just prints a flattering R:R on the way
 # in and exits on the timer. POL: target 13.3% away vs a 2.755% 6H ATR, reported 1:9.4.
 MAX_TARGET_ATR_MULT    = float(os.getenv("MAX_TARGET_ATR_MULT", "1.5"))
+# How far a swept level may sit from price and still be treated as THIS move's
+# inducement. Volatility-relative, with the percentage as a floor so a dead ATR read
+# tightens the gate rather than opening it. 2.5x/2% refuses the 2026-09-17 entries
+# (AVAX 5.7% away, SEI 6.3%, ADA 5.8%) while leaving a normal post-sweep retest alone.
+SWEEP_MAX_ATR_MULT     = float(os.getenv("SWEEP_MAX_ATR_MULT", "2.5"))
+SWEEP_MAX_PCT          = float(os.getenv("SWEEP_MAX_PCT", "0.02"))
 STALE_ZONE_BARS        = 6     # ~30 min on 5m — a zone armed longer than this needs FRESH
                                 # displacement at tap time, not just a technically-qualifying
                                 # signal from a dead tape. Shared by the main 5m cycle AND the
@@ -2154,6 +2160,20 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         if not state.sweep_low:
             return price
 
+        # ...and once that sweep is still anywhere near the market. sweep_hunt_expired()
+        # above caps how LONG a hunt may run; nothing capped how FAR the liquidity was.
+        # On 2026-09-17 all three bad entries armed off sweeps nowhere near price — AVAX
+        # swept $7.17 and armed a zone at $7.61, 5.7% away, with SEI and ADA the same.
+        # Drop the stale level and keep hunting rather than resetting: the BOS read may
+        # still be good, it is only this particular grab that has gone out of date.
+        _reach_ok, _reach_why = indicators.sweep_within_reach(
+            state.sweep_low, price, atr_pct * price,
+            SWEEP_MAX_ATR_MULT, SWEEP_MAX_PCT)
+        if not _reach_ok:
+            print(f"[{base}] 🥀 {_reach_why} — dropping it and hunting a fresh sweep.")
+            state.sweep_low = None
+            return price
+
         # Preferred: the FVG left by the post-sweep displacement that broke structure.
         # That gap IS the CHoCH — we trade its retest. Falls back to a generic FVG/OB
         # only if no clean displacement gap exists yet.
@@ -2171,6 +2191,10 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                   f"sweep=${state.sweep_low:,.4f} — waiting for retest/refill")
 
         elif state.bias == "BULLISH" and is_fvg_bull:
+            # A generic gap, NOT the displacement that broke structure — say so.
+            # Leaving this unset left amd_zone_type None, and None took the one
+            # branch of sniper_entry_allowed() that never checked displacement.
+            state.amd_zone_type = "bullish_fvg"
             state.state    = "ENTRY_WAIT"
             state.arm_zone(fvg_bot, fvg_top)
             print(f"[{base}] STEP 2: Bullish OB/FVG locked  "
@@ -2178,6 +2202,10 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                   f"sweep=${state.sweep_low:,.4f}")
 
         elif state.bias == "BEARISH" and is_fvg_bear:
+            # A generic gap, NOT the displacement that broke structure — say so.
+            # Leaving this unset left amd_zone_type None, and None took the one
+            # branch of sniper_entry_allowed() that never checked displacement.
+            state.amd_zone_type = "bearish_fvg"
             state.state    = "ENTRY_WAIT"
             state.arm_zone(fvg_bear_bot, fvg_bear_top)
             print(f"[{base}] STEP 2: Bearish OB/FVG locked  "

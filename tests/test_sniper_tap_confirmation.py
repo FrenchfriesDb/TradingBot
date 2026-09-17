@@ -25,10 +25,25 @@ import pytest
 from bot.indicators import sniper_entry_allowed
 
 
-def _call(zone_type="bullish_ob", is_stale=False, has_momentum=False,
+def _call(zone_type="bullish_ob", is_stale=False, has_momentum=True,
           candle_confirms=False, choch_aligned=False):
+    """has_momentum defaults TRUE so each test below isolates the CANDLE dimension.
+
+    It defaulted False until 2026-09-17, which was fine while displacement was checked
+    only on the stale branch. It is not fine now: displacement is required on every
+    fresh non-choch_fvg zone too (see tests/test_zone_type_and_sweep_reach.py for why —
+    three live trades), so leaving it False would make every test here pass or fail on
+    the displacement gate and never reach the candle logic this file exists to pin.
+    """
     return sniper_entry_allowed(zone_type, is_stale, has_momentum,
                                 candle_confirms, choch_aligned)
+
+
+def test_displacement_is_required_before_the_candle_question_is_even_asked():
+    """The 2026-09-17 hole: a fresh generic zone with a confirming candle and no
+    impulse behind it used to be enough on its own."""
+    ok, why = _call(has_momentum=False, candle_confirms=True)
+    assert not ok and "displacement" in why
 
 
 # ── the real taps this fixes ──
