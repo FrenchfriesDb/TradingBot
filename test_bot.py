@@ -64,9 +64,18 @@ MAX_MARGIN_PCT       = 1.00      # backstop only, not a routine ceiling: the pur
                                  # ≥50% of price ever fell under it), silently shrinking every
                                  # position to a few dollars of real risk regardless of setup
                                  # quality, e.g. a real 5% stop that should risk $50 on $5k was
-                                 # actually risking ~$5. See DAILY_ACCOUNT_PCT below for the
+                                 # actually risking ~$5. See DAILY_RISK_PCT below for the
                                  # separate, still-active daily aggregate cap across all trades.
-DAILY_ACCOUNT_PCT    = 0.10      # max 10% of the account deployed per UTC day TOTAL, across all trades
+# A daily cap is worth having — it stops one bad session compounding — but it has to be
+# denominated in the SAME unit the sizing measures. This was DAILY_ACCOUNT_PCT = 0.10:
+# 10% of the account of NOTIONAL per day, summed across all trades, never released on
+# close. On the $5,000 paper balance that $500/day ceiling silently undid risk-based
+# sizing — a 1%-risk trade actually risked $4.00 behind a 0.8% stop and $25 behind a 5%
+# stop, so the TIGHTER and better the stop, the LESS money was at risk. That is the exact
+# inversion risk-based sizing exists to prevent, and it is what made 1% behave like
+# "what you put in" rather than "what you can lose".
+# 3% = three full-size 1% trades per day, whatever their stops happen to be.
+DAILY_RISK_PCT       = 0.03      # max % of the account that may be LOST per day, all trades
 # Sizing (user-specified 2026-07-20): no leverage; each trade deploys at most 2% of
 # the account (~$100 on $5k), and at most 10% (~$500) may be put to work across the
 # whole UTC day combined — so ~5 trades/day before the daily budget is spent. The
@@ -233,32 +242,32 @@ class PaperTrader:
         self.entry_prices  = {}
         self.margin_used   = {}   # symbol -> cash locked as margin while open
         self.trade_count   = 0
-        self.daily_notional = 0.0   # total margin $ deployed today, across ALL symbols (resets each UTC day)
+        self.daily_risked   = 0.0   # total $ of RISK committed today, across ALL symbols (resets daily)
         self.daily_date     = None
 
     def get_position(self, symbol):
         return self.positions.get(symbol, 0.0)
 
     def _roll_daily_window(self):
-        """Reset the daily notional counter on a UTC day change. Both check_daily_cap
-        and record_notional call this independently — neither may assume the other
-        ran first, or a record-before-check call order silently loses the day's total."""
+        """Reset the daily risk counter on a day change. Both risk_remaining and
+        record_risk call this independently — neither may assume the other ran first,
+        or a record-before-check call order silently loses the day's total."""
         today = datetime.now().astimezone().date()   # LOCAL day boundary
         if self.daily_date != today:
-            self.daily_notional = 0.0
-            self.daily_date     = today
+            self.daily_risked = 0.0
+            self.daily_date   = today
 
-    def check_daily_cap(self, notional_needed: float, daily_cap_dollars: float) -> float:
-        """Returns how much notional is still available today under the fixed dollar
-        cap — NOT released when a trade closes, matches binance_bot.py's PaperTrader:
-        this limits how much NEW capital gets deployed per day, not concurrent exposure."""
+    def risk_remaining(self, balance: float, daily_risk_pct: float) -> float:
+        """Dollars of RISK still available today — NOT released when a trade closes.
+        This bounds how much can be LOST in a day, and deliberately says nothing about
+        position size; the stop distance decides that. See indicators.daily_risk_remaining."""
         self._roll_daily_window()
-        return max(0.0, daily_cap_dollars - self.daily_notional)
+        return indicators.daily_risk_remaining(self.daily_risked, balance, daily_risk_pct)
 
-    def record_notional(self, notional: float):
-        """Call after an entry is confirmed to count it against today's cap."""
+    def record_risk(self, risk_dollars: float):
+        """Call after an entry is confirmed to count it against today's risk budget."""
         self._roll_daily_window()
-        self.daily_notional += notional
+        self.daily_risked += max(0.0, float(risk_dollars))
 
     def _release_margin(self, symbol, closed_qty, held_qty):
         """Return the proportional slice of locked margin for a partial/full close."""
@@ -364,9 +373,12 @@ def _restore_daily_budget(paper):
         saved_date = saved.get("daily_date")
         today = datetime.now().astimezone().date().isoformat()
         if saved_date == today:
-            paper.daily_notional = float(saved.get("daily_deployed", 0.0))
+            # "daily_deployed" was notional; it means nothing under a risk budget and
+            # resets daily anyway, so an old file starts the day at zero rather than
+            # importing a number in the wrong unit.
+            paper.daily_risked = float(saved.get("daily_risked", 0.0))
             paper.daily_date     = datetime.now().astimezone().date()
-            print(f"[STATE] Resumed today's deployed budget: ${paper.daily_notional:,.2f} "
+            print(f"[STATE] Resumed today's risk budget used: ${paper.daily_risked:,.2f} "
                   f"already used of the daily cap")
     except FileNotFoundError:
         pass
@@ -431,7 +443,7 @@ def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states, st
             # survives restarts. Without this, every restart reset the counter to
             # $0 and handed out a fresh full budget (seen live: two same-UTC-day
             # trades totalling $700 against a $500 cap).
-            "daily_deployed": paper.daily_notional,
+            "daily_risked": paper.daily_risked,
             "daily_date": paper.daily_date.isoformat() if paper.daily_date else None,
             "positions": positions,
             "pools": pool_data,
@@ -833,34 +845,33 @@ def run_crypto_sweep():
                     print(f"[{base}] ⏭ Sweep {direction} skipped — position size rounds to zero")
                     continue
 
-                # Daily deployment cap: at most DAILY_ACCOUNT_PCT (10%) of the account
-                # may be put to work per UTC day, summed across ALL trades — not
-                # released when a trade closes. Trim to whatever's left rather than
-                # skipping outright, so a smaller trade can still use the day's budget.
-                notional  = qty * price
-                margin    = notional / TEST_LEVERAGE
-                daily_cap = paper.balance * DAILY_ACCOUNT_PCT
-                daily_remaining = paper.check_daily_cap(margin, daily_cap)
+                # Daily RISK budget: at most DAILY_RISK_PCT of the account may be LOST
+                # per day across all trades, not released when a trade closes. This caps
+                # the same thing the sizing measures, so it bounds a bad day without
+                # touching position size — the stop distance still decides that.
+                daily_cap       = paper.balance * DAILY_RISK_PCT
+                daily_remaining = paper.risk_remaining(paper.balance, DAILY_RISK_PCT)
                 if daily_remaining <= 0:
-                    print(f"[{base}] ⏭ Sweep {direction} skipped — daily "
-                          f"${daily_cap:.0f} deployment cap (10% of account) reached, resets next UTC day")
+                    print(f"[{base}] ⏭ Sweep {direction} skipped — daily risk budget "
+                          f"${daily_cap:.2f} ({DAILY_RISK_PCT:.0%} of account) used up, resets tomorrow")
                     continue
-                if margin > daily_remaining:
-                    qty = math.floor((daily_remaining * TEST_LEVERAGE / price) * 1e6) / 1e6
-                    notional = qty * price
-                    margin   = notional / TEST_LEVERAGE
-                    if qty <= 0 or notional < 10.0:   # dust floor — not worth opening
-                        print(f"[{base}] ⏭ Sweep {direction} skipped — only "
-                              f"${daily_remaining:.2f} left of daily ${daily_cap:.0f} cap")
-                        continue
-                    print(f"[{base}] ⚠️ Position trimmed to ${margin:.2f} — "
-                          f"daily ${daily_cap:.0f} cap has ${daily_remaining:.2f} left")
+                qty, _was_trimmed = indicators.trim_qty_to_risk(qty, price, sl, daily_remaining)
+                notional = qty * price
+                margin   = notional / TEST_LEVERAGE
+                if qty <= 0 or notional < 10.0:       # dust floor — not worth opening
+                    print(f"[{base}] ⏭ Sweep {direction} skipped — only "
+                          f"${daily_remaining:.2f} of the daily ${daily_cap:.2f} risk budget left")
+                    continue
+                trade_risk = qty * abs(price - sl)
+                if _was_trimmed:
+                    print(f"[{base}] ⚠️ Position trimmed — risking ${trade_risk:.2f}, "
+                          f"all that is left of today's ${daily_cap:.2f} budget")
 
                 if direction == "SHORT":
                     paper.sell(symbol, qty, price)
                 else:
                     paper.buy(symbol, qty, price)
-                paper.record_notional(margin)
+                paper.record_risk(trade_risk)
                 sl_levels[symbol]    = sl
                 tp_levels[symbol]    = tp
                 entry_times[symbol]  = datetime.now(timezone.utc)

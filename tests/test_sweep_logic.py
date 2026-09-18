@@ -155,33 +155,47 @@ def test_size_position_caps_notional():
     assert qty == pytest.approx(max_notional / 60_000, rel=1e-3)
 
 
-def test_daily_cap_full_room_on_first_trade():
+# The daily cap counts RISK, not deployed capital, as of 2026-09-18. Denominating it in
+# notional silently undid risk-based sizing: a tighter stop bought a bigger position,
+# hit the notional ceiling sooner, and so ended up risking LESS — $4 behind a 0.8% stop
+# against a $50 budget. See tests/test_daily_risk_budget.py. The three properties below
+# are unchanged and are the ones worth keeping: a full budget on a fresh day, no release
+# when a trade closes, and a reset on the day roll.
+DAILY_PCT = 0.04          # 4% of a $5,000 balance = a $200 budget
+
+
+def test_daily_risk_budget_full_room_on_first_trade():
     pt = PaperTrader(balance=5_000)
-    assert pt.check_daily_cap(notional_needed=150, daily_cap_dollars=200) == 200
+    assert pt.risk_remaining(5_000, DAILY_PCT) == 200
 
 
-def test_daily_cap_shrinks_after_recording():
+def test_daily_risk_budget_shrinks_after_recording():
     pt = PaperTrader(balance=5_000)
-    pt.record_notional(120)
-    assert pt.check_daily_cap(notional_needed=150, daily_cap_dollars=200) == pytest.approx(80)
+    pt.record_risk(120)
+    assert pt.risk_remaining(5_000, DAILY_PCT) == pytest.approx(80)
 
 
-def test_daily_cap_not_released_when_a_trade_closes():
-    # record_notional tracks $ OPENED today, not concurrent exposure — a closed
-    # trade must NOT free up room, matching binance_bot.py's PaperTrader semantics.
+def test_daily_risk_budget_not_released_when_a_trade_closes():
+    # record_risk tracks risk COMMITTED today, not concurrent exposure — a closed trade
+    # must NOT free up room, or a losing day can keep re-spending the same budget.
     pt = PaperTrader(balance=5_000)
-    pt.record_notional(200)   # one trade opened for the full daily cap
-    assert pt.check_daily_cap(notional_needed=10, daily_cap_dollars=200) == 0
+    pt.record_risk(200)       # one trade taking the whole day's budget
+    assert pt.risk_remaining(5_000, DAILY_PCT) == 0
 
 
-def test_daily_cap_resets_on_a_new_utc_day():
+def test_daily_risk_budget_resets_on_a_new_day():
     pt = PaperTrader(balance=5_000)
-    pt.record_notional(200)
-    assert pt.check_daily_cap(notional_needed=10, daily_cap_dollars=200) == 0
-    # Simulate the clock rolling over to a new UTC day.
+    pt.record_risk(200)
+    assert pt.risk_remaining(5_000, DAILY_PCT) == 0
     import datetime as _dt
-    pt.daily_date = _dt.date(2000, 1, 1)
-    assert pt.check_daily_cap(notional_needed=10, daily_cap_dollars=200) == 200
+    pt.daily_date = _dt.date(2000, 1, 1)      # roll the clock to a new day
+    assert pt.risk_remaining(5_000, DAILY_PCT) == 200
+
+
+def test_the_budget_tracks_the_account_rather_than_a_fixed_dollar_amount():
+    """After a drawdown the day's allowance shrinks with the balance."""
+    pt = PaperTrader(balance=5_000)
+    assert pt.risk_remaining(2_500, DAILY_PCT) == 100
 
 
 # ─────────────────────────── is_trade_stale ───────────────────────────

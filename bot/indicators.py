@@ -1,4 +1,5 @@
 # bot/indicators.py
+import math
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -2130,3 +2131,46 @@ def detect_choch(df, lookback=5):
         return True, "bearish"
     
     return False, None
+
+def daily_risk_remaining(risked_today, balance, daily_risk_pct):
+    """Dollars of RISK still available today. Never negative.
+
+    A daily cap is a sane idea — it stops one bad session compounding — but test_bot.py
+    denominated it in DEPLOYED CAPITAL (DAILY_ACCOUNT_PCT = 10% of the account of
+    notional, summed across all trades, never released on close). That silently undid
+    risk-based sizing: on the $5,000 paper balance the $500/day notional ceiling meant a
+    1%-risk trade actually risked $4 behind a 0.8% stop and $25 behind a 5% stop, so the
+    TIGHTER and better the stop, the LESS money was at risk — the exact inversion
+    risk-based sizing exists to prevent.
+
+    Denominating the cap in the same unit the sizing measures fixes that: "no more than
+    3% of the account lost in one day" is three full-size trades at 1%, whatever their
+    stops happen to be, and it leaves position size alone.
+    """
+    try:
+        budget = float(balance) * float(daily_risk_pct) - float(risked_today)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, budget)
+
+
+def trim_qty_to_risk(qty, entry, stop, risk_remaining):
+    """(qty, was_trimmed) — shrink qty so the trade risks at most `risk_remaining`.
+
+    Floors rather than rounds: a trade must never end up risking a cent more than the
+    day's budget allows, or the cap is not a cap. A zero-width stop is refused rather
+    than treated as an unlimited position — a stop at the entry is a broken setup, not
+    a free one.
+    """
+    try:
+        qty = float(qty)
+        risk_per_unit = abs(float(entry) - float(stop))
+        risk_remaining = float(risk_remaining)
+    except (TypeError, ValueError):
+        return 0.0, True
+    if risk_per_unit <= 0 or risk_remaining <= 0 or qty <= 0:
+        return 0.0, True
+    affordable = risk_remaining / risk_per_unit
+    if qty <= affordable:
+        return qty, False
+    return math.floor(affordable * 1e6) / 1e6, True
