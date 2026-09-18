@@ -179,6 +179,9 @@ Using the full 4H chart above, analyze this SMC setup:
 
 Pick a risk:reward ratio of AT LEAST 3.5 — go higher only if structure genuinely supports it.
 
+Answer on the VERY FIRST LINE, before any reasoning — if you think first you
+will be cut off before you answer, and an answer nobody can read is treated as a refusal.
+
 Reply in EXACTLY this format, one field per line, nothing else:
 DECISION: YES or NO
 RR: a number >= 3.5
@@ -197,26 +200,22 @@ REASON: one concise sentence"""
             model=(_ai_model.resolve(NVIDIA_API_KEY) or _ai_model.configured_model()),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=120,
+            max_tokens=400,   # a reasoning model needs room to reach its own DECISION line
             timeout=15,
         )
         text = resp.choices[0].message.content.strip()
 
-        decision_m = re.search(r"DECISION:\s*(YES|NO)", text, re.IGNORECASE)
-        rr_m       = re.search(r"RR:\s*([\d.]+)", text, re.IGNORECASE)
-        reason_m   = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+        decision, _rr, reason = _ai_model.parse_ai_decision(text)
+        rr = max(MIN_AI_RR, min(_rr if _rr is not None else MIN_AI_RR, MAX_AI_RR))
 
-        confirm = bool(decision_m) and decision_m.group(1).upper() == "YES"
-        rr      = float(rr_m.group(1)) if rr_m else MIN_AI_RR
-        rr      = max(MIN_AI_RR, min(rr, MAX_AI_RR))
-        reason  = reason_m.group(1).strip() if reason_m else text
+        if decision is None:
+            # The model SPOKE and we could not find a decision in it — content, not
+            # infrastructure, and usually reasoning that was cut off before its verdict.
+            # Falling back to "proceed on technicals" here meant the AI gate could never
+            # actually refuse anything; see tests/test_ai_decision_parsing.py.
+            return False, rr, f"AI gave no readable decision — standing aside ({text[:120]})"
 
-        if decision_m is None:
-            # Couldn't read a clear YES/NO — treat as no-signal, fall back to technicals
-            # rather than dropping a setup that already passed every technical filter.
-            return True, MIN_AI_RR, f"AI reply unparsed — proceeding on technicals ({text[:80]})"
-
-        return confirm, rr, reason
+        return decision == "YES", rr, reason
     except Exception as e:
         # Timeout / network / API error — proceed on technicals, don't skip a valid setup.
         return True, MIN_AI_RR, f"AI unavailable ({e}) — proceeding on technicals"
@@ -1914,7 +1913,10 @@ class DebbieLaSMC(Strategy):
                         zone_type=self.amd_zone_type[symbol],
                     )
                     self.log_message(
-                        f"[{symbol}] 🤖 AI Bot Approval: {'✅ YES' if ai_confirm else '❌ NO'}  "
+                        f"[{symbol}] 🤖 AI Bot Approval: "
+                        # Never claim an approval the model did not give — a fail-open
+                        # on timeout/network is still "no opinion", not a yes.
+                        f"{('⚠️ NO OPINION' if _ai_model.is_no_opinion(ai_reason) else '✅ YES') if ai_confirm else '❌ NO'}  "
                         f"R:R=1:{rr_actual:.1f}  {ai_reason}",
                         color="magenta"
                     )

@@ -1342,6 +1342,9 @@ Analyze using the full 4H chart above:
 
 Pick a risk:reward ratio of AT LEAST 3.5 — go higher only if structure genuinely supports it.
 
+Answer on the VERY FIRST LINE, before any reasoning — if you think first you
+will be cut off before you answer, and an answer nobody can read is treated as a refusal.
+
 Reply in EXACTLY this format, one field per line, nothing else:
 DECISION: YES or NO
 RR: a number >= 3.5
@@ -1360,21 +1363,20 @@ REASON: one concise sentence"""
             model=(resolve_ai_model() or __import__("bot.ai_model", fromlist=["x"]).configured_model()),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=120,
+            max_tokens=400,   # a reasoning model needs room to reach its own DECISION line
             timeout=15,
         )
         text = resp.choices[0].message.content.strip()
-        decision_m = re.search(r"DECISION:\s*(YES|NO)", text, re.IGNORECASE)
-        rr_m       = re.search(r"RR:\s*([\d.]+)", text, re.IGNORECASE)
-        reason_m   = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
-        confirm = bool(decision_m) and decision_m.group(1).upper() == "YES"
-        rr      = float(rr_m.group(1)) if rr_m else MIN_AI_RR
-        rr      = max(MIN_AI_RR, min(rr, MAX_AI_RR))
-        reason  = reason_m.group(1).strip() if reason_m else text
-        if decision_m is None:
-            reason = f"(unparsed AI response, defaulting approve) {text}"
-            confirm = True
-        return confirm, rr, reason
+        from bot import ai_model as _ai
+        decision, _rr, reason = _ai.parse_ai_decision(text)
+        rr = max(MIN_AI_RR, min(_rr if _rr is not None else MIN_AI_RR, MAX_AI_RR))
+        if decision is None:
+            # The model SPOKE and we could not find a decision in it. That is content,
+            # not infrastructure — usually reasoning cut off before its verdict, and in
+            # the BTC case on 2026-09-18 it was reasoning toward NO. This used to set
+            # confirm = True and print "🤖 AI Bot Approval: ✅ YES" over the top of it.
+            return False, rr, f"AI gave no readable decision — standing aside ({text[:120]})"
+        return decision == "YES", rr, reason
 
     # Use shutdown(wait=False) so a timeout never blocks the main loop.
     # The `with` form calls shutdown(wait=True) on exit, which hangs forever
@@ -1541,8 +1543,9 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
     # `confirm` is True even when the AI never answered — get_ai_confirmation fails
     # OPEN. Printing ✅ YES there asserts a verdict no model gave. Fixing the reason
     # string alone was not enough: this icon is what the eye actually reads.
-    _ai_dead = "AI SKIPPED" in (ai_reason or "") or "unavailable" in (ai_reason or "")
-    icon    = ("⚠️ SKIPPED" if _ai_dead else "✅ YES") if confirm else "❌ NO"
+    from bot import ai_model as _ai
+    _no_opinion = _ai.is_no_opinion(ai_reason)
+    icon    = ("⚠️ NO OPINION" if _no_opinion else "✅ YES") if confirm else "❌ NO"
     _tp_src = "@4H pool" if (pool_tp and abs(tp_planned - pool_tp) < 1e-9) else f"{MAX_AI_RR:.0f}R cap"
     print(f"[{base}] 🤖 AI Bot Approval: {icon}  Structural R:R=1:{rr_actual:.1f} [{_tp_src}] "
           f"(AI suggested 1:{_ai_rr:.1f})  {ai_reason[:140]}")

@@ -17,6 +17,7 @@ shared logic more than once; one definition means one place to fix it next time.
 """
 import json
 import os
+import re
 import urllib.request
 
 ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -111,3 +112,91 @@ def reset_cache():
     """Forget the probe result — for tests, and for a key change without a restart."""
     global _RESOLVED
     _RESOLVED = None
+
+
+# ── reading the model's answer ────────────────────────────────────────────────
+# Both bots asked for "DECISION: YES or NO" and, when they could not find that line,
+# set confirm = True and logged "🤖 AI Bot Approval: ✅ YES". On 2026-09-18 that put
+# BTC on at $77,214 off this reply, which is the model's first sentence and nothing else:
+#
+#   "We need to analyze the 4H chart data and decide if a genuine liquidity sweep
+#    occurred at $76,182."
+#
+# It was truncated because both callers passed max_tokens=120 to a REASONING model — it
+# spends that budget thinking and never reaches the DECISION line. So the parse did not
+# fail occasionally, it was structurally guaranteed to fail on any setup the model
+# thought hard about, and every one of those became a yes.
+#
+# Returning None here (rather than a decision) is what lets the callers tell apart "the
+# model never spoke", which is an infrastructure problem and should not veto a setup
+# that already passed every technical filter, from "the model spoke and we could not
+# find a decision", which is content — and in the BTC case was content reasoning its way
+# toward NO. Only the first of those may proceed.
+_THINK    = re.compile(r"<think>.*?</think>|<thinking>.*?</thinking>",
+                       re.IGNORECASE | re.DOTALL)
+_DECISION = re.compile(r"DECISION\s*[:\-]?\s*\**\s*(YES|NO)\b", re.IGNORECASE)
+# A whole line that is nothing but YES/NO is unambiguous and worth accepting; "whether
+# this is a yes" inside prose is not, and reading it as one re-invents the bug.
+_BARE     = re.compile(r"^\s*\**\s*(YES|NO)\s*\**\s*\.?\s*$",
+                       re.IGNORECASE | re.MULTILINE)
+_RR       = re.compile(r"\bRR\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+_REASON   = re.compile(r"REASON\s*[:\-]?\s*(.+)", re.IGNORECASE | re.DOTALL)
+
+
+def parse_ai_decision(text):
+    """(decision, rr, reason) from a model reply. decision is "YES", "NO" or None.
+
+    None means "no decision found" — never treat it as approval. rr is None when no
+    usable number was given; a missing RR is recoverable (the caller clamps to its own
+    floor) and must not take the decision down with it.
+    """
+    if not isinstance(text, str):
+        return None, None, ""
+    clean = _THINK.sub(" ", text).strip()
+    if not clean:
+        return None, None, ""
+
+    # A model that thinks out loud often restates itself ("DECISION: NO ... on
+    # reflection ... DECISION: YES"). The final answer is the answer.
+    found = _DECISION.findall(clean) or _BARE.findall(clean)
+    decision = found[-1].upper() if found else None
+
+    rr = None
+    m = _RR.search(clean)
+    if m:
+        try:
+            rr = float(m.group(1))
+        except ValueError:
+            rr = None
+
+    m = _REASON.search(clean)
+    reason = m.group(1).strip() if m else clean
+    return decision, rr, reason
+
+
+# Markers that mean "no verdict was obtained" — either the model never spoke
+# (infrastructure) or it spoke unreadably (content). Both bots fail OPEN on the first
+# kind, which is defensible; printing "🤖 AI Bot Approval: ✅ YES" over the top of it is
+# not, because that icon is what the eye actually reads. binance_bot.py carried an
+# ad-hoc version of this that matched "AI SKIPPED" and "unavailable" and missed the
+# timeout path entirely. One predicate, used by both callers.
+NO_OPINION_MARKERS = (
+    "proceeding on technicals",
+    "standing aside",
+    "ai skipped",
+    "unavailable",
+    "timeout",
+    "no ai key",
+)
+
+
+def is_no_opinion(reason):
+    """True when `reason` describes a fallback rather than a verdict the model gave.
+
+    Unreadable input counts as no-opinion: fail toward "we do not know", never toward
+    "the model said yes".
+    """
+    if not isinstance(reason, str) or not reason.strip():
+        return True
+    lowered = reason.lower()
+    return any(m in lowered for m in NO_OPINION_MARKERS)
