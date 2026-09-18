@@ -1879,7 +1879,19 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
 
         is_long = held > 0
 
-        def close_position(reason):
+        _px = price          # the live price, for exits that really do fill at market
+        def close_position(reason, fill=None):
+            # `fill` is the price this exit ACTUALLY got. A stop or a target rests on
+            # the book and fills at ITS OWN level the instant price touches it — not at
+            # wherever the market has travelled to by the time this loop next looks. The
+            # 10-second watcher already did this ("Fill at the level that was crossed");
+            # this path did not, and on 2026-09-17 a 5.5h machine sleep let three targets
+            # book 1.47x their arithmetic maximum ($200.32 against $136.23) because price
+            # ran 1.3-2.4% past target while nothing was watching.
+            #
+            # Defaults to the live price, which is correct for a STALE timeout: that one
+            # really does cross the book and fill wherever the market is.
+            _fill = _px if fill is None else float(fill)
             # Re-read live qty so we close whatever actually remains (covers a prior scale-out)
             qty_now = abs(paper.get_position(symbol))
             if qty_now < 1e-9:
@@ -1890,11 +1902,11 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             _exit_liq = "maker" if indicators.normalize_exit_reason(
                 reason, state.breakeven_moved) == "TARGET" else "taker"
             if is_long:
-                paper.sell(symbol, qty_now, price, _exit_liq)
-                pnl = (price - state.entry_price) * qty_now
+                paper.sell(symbol, qty_now, _fill, _exit_liq)
+                pnl = (_fill - state.entry_price) * qty_now
             else:
-                paper.buy(symbol, qty_now, price, _exit_liq)
-                pnl = (state.entry_price - price) * qty_now
+                paper.buy(symbol, qty_now, _fill, _exit_liq)
+                pnl = (state.entry_price - _fill) * qty_now
             # NET, not gross (fixed 2026-09-04). _charge_fee already moved `balance` by
             # net on all four legs, but the number reported here went to the ledger, the
             # journal tiles and the desktop alert GROSS — so the sheet and the account
@@ -1902,7 +1914,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             # against trades whose edge is a few dollars: POL logged +$3.16 and was
             # really -$3.64. Two of four rows on screen were green and losing.
             _fees = indicators.round_trip_fee(
-                state.entry_price, price, qty_now,
+                state.entry_price, _fill, qty_now,
                 MAKER_FEE_RATE if MAKER_ENTRIES else TAKER_FEE_RATE,
                 MAKER_FEE_RATE if _exit_liq == "maker" else TAKER_FEE_RATE)
             pnl -= _fees
@@ -1920,13 +1932,13 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             _icon = {"TARGET": "🟢 TP", "STOP": "🔴 SL", "BREAKEVEN": "🛡 BREAK-EVEN",
                      "STALE": "⏰ STALE"}.get(_exit_reason, "⏹ CLOSED")
             trade_print(f"{base} {direction_label}", f"{reason}",
-                        price, pnl=pnl, balance=paper.balance,
+                        _fill, pnl=pnl, balance=paper.balance,
                         extra=lev_tag)
             alert(f"{_icon} — {base} {direction_label} closed",
                   f"P&L ${pnl:+.2f}  Balance ${paper.balance:,.2f}",
                   sound="Glass" if won else "Basso",
                   speak=f"{base} closed. {'Profit' if won else 'Loss'} {abs(pnl):.0f} dollars")
-            _log_trade_close_to_sheet(base, is_long, state.entry_price, price, qty_now, pnl, state, exchange,
+            _log_trade_close_to_sheet(base, is_long, state.entry_price, _fill, qty_now, pnl, state, exchange,
                                       fees=_fees, exit_reason=_exit_reason)
             state.reset()
 
@@ -1942,10 +1954,10 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                  (not is_long and candle_low  <= state.take_profit)
 
         if sl_hit:
-            close_position("🔴 SL hit")
+            close_position("🔴 SL hit", fill=state.stop_loss)
             return price
         if tp_hit:
-            close_position("🟢 TP hit")
+            close_position("🟢 TP hit", fill=state.take_profit)
             return price
         if state.entry_time:
             elapsed = (now - state.entry_time).total_seconds() / 3600
