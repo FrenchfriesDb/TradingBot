@@ -182,6 +182,28 @@ try:
     if not hasattr(_AlpacaBroker, "process_pending_orders"):
         _AlpacaBroker.process_pending_orders = lambda self, *a, **kw: None
 
+    # Wait for the open by RE-CHECKING, not by trusting one long timer.
+    # Broker._await_market_to_open computes the wait once and hands it to a single
+    # time.sleep(), despite a docstring promising an "infinite loop until market opens".
+    # Started at 15:42 on 2026-09-17 that became time.sleep(53280); macOS does not
+    # advance time.sleep's clock while the system is asleep, this Mac slept 5.28h that
+    # night on battery (caffeinate -i -s only holds sleep off on AC), and at 07:15 —
+    # 45 minutes after the open — the bot was still waiting, with its timer due to
+    # expire around 11:46 against a 13:00 close. See bot/market_clock.py.
+    from lumibot.brokers.broker import Broker as _Broker
+    from bot.market_clock import await_market_open as _await_open
+
+    def _resilient_await_market_to_open(self, timedelta=None, strategy=None):
+        def _time_to_open():
+            t = self.get_time_to_open()
+            return t - 60 * timedelta if timedelta is not None else t
+        if not _await_open(self.is_market_open, _time_to_open, self.sleep):
+            self.logger.warning(
+                "Gave up waiting for the market to open — it never reported open. "
+                "The bot stays alive; check the broker connection and the calendar.")
+
+    _Broker._await_market_to_open = _resilient_await_market_to_open
+
 except Exception as _patch_err:
     print(f"[patch] Warning: Could not apply order parser patch: {_patch_err}")
 # ─────────────────────────────────────────────────────────────────────────────
