@@ -94,3 +94,73 @@ def test_absurd_gap_is_bounded_rather_than_writing_thousands_of_rows():
     out = missing_snapshot_dates(date(2020, 1, 1), date(2026, 8, 15))
     assert len(out) <= 30, "a months-long gap must not spam the sheet"
     assert out[-1] == date(2026, 8, 14)
+
+
+# ── test_bot.py had its own copy of this, and it was wrong ────────────────────
+#
+# 2026-09-18, ADA short, live on the dashboard:
+#
+#     Equity: $-30.774 | P&L: $-5030.77 (-100.62%)
+#
+# on a trade that was down $28.81. The account read as blown. test_bot.py never used
+# account_equity(); it computed equity inline, twice (lines 426 and 895), with:
+#
+#     else:                                            # short
+#         equity += (entry - cur) * abs(qty)           # unrealized P&L only
+#
+# and the comment above it explained the reasoning: "shorts (no cash moved at open) add
+# unrealized P&L". That was false in this implementation — PaperTrader.sell() locks
+# notional/leverage as margin when OPENING a short exactly as buy() does, so the $5,000
+# was deducted from balance at open and never added back. Free cash was $0.0000001, the
+# margin was invisible, and equity came out as the P&L alone.
+#
+# binance_bot.py had it right the whole time, and its PaperTrader.equity docstring even
+# points at "indicators.account_equity, which is unit-tested". One bot used the shared
+# definition, the other reimplemented it. These tests pin the case that exposed it.
+
+def test_a_short_holding_its_margin_is_not_a_blown_account():
+    """The live ADA position, to the cent. 21,825.483434 short @ 0.22909 = the whole
+    $5,000 account as margin at 1x; price 0.23041 puts it down $28.81."""
+    eq = account_equity(
+        balance=1.0494022717466578e-07,          # what was left as free cash
+        positions={"ADA/USD": -21825.483434},
+        entry_prices={"ADA/USD": 0.22909},
+        margin_used={"ADA/USD": 21825.483434 * 0.22909},
+        prices={"ADA/USD": 0.23041},
+        leverage=1)
+    assert eq == pytest.approx(4971.19, abs=0.01)
+    assert eq > 4900, "a $28 loss must never read as a wiped account"
+
+
+def test_the_old_inline_formula_is_what_produced_minus_thirty():
+    """Documents the defect, so nobody reintroduces it as a 'simplification'."""
+    balance, qty, entry, cur = 1.05e-07, 21825.483434, 0.22909, 0.23041
+    old = balance + (entry - cur) * abs(qty)     # margin never added back
+    assert old == pytest.approx(-28.81, abs=0.01)
+
+
+def test_a_short_at_leverage_returns_only_the_margin_that_was_locked():
+    """At 10x the same position locks a tenth of the notional, so equity must add back
+    a tenth — not the whole notional, which would invent money."""
+    notional = 21825.483434 * 0.22909
+    eq = account_equity(balance=4500.0, positions={"ADA/USD": -21825.483434},
+                        entry_prices={"ADA/USD": 0.22909},
+                        margin_used={"ADA/USD": notional / 10},
+                        prices={"ADA/USD": 0.23041}, leverage=10)
+    assert eq == pytest.approx(4500.0 + notional / 10 - 28.81, abs=0.01)
+
+
+def test_neither_bot_computes_equity_inline_any_more():
+    """The duplication is the bug: two copies drifted, one of them silently wrong for
+    every short. Equity has one definition."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parent.parent / "test_bot.py").read_text(
+        encoding="utf-8")
+    # Both reporting sites — the state file the dashboard reads, and the console line.
+    assert src.count("account_equity(") >= 2, (
+        "test_bot.py must use indicators.account_equity at BOTH equity sites")
+    # The specific shapes that were wrong. Deliberately not matching the bare
+    # "(entry - cur) * abs(qty)" formula: that is the correct unrealized P&L for a
+    # short and appears legitimately when building the per-position state block.
+    assert "equity += " not in src, "equity is being accumulated inline again"
+    assert "_equity = paper.balance + sum(" not in src

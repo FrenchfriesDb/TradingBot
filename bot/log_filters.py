@@ -82,7 +82,44 @@ TRANSPORT_MESSAGE_OPENERS = (
     "ServerDisconnectedError",
     "NewConnectionError",
     "[Errno ",
+    # Lumibot's own phrasings, found in production on 2026-09-18: logs/stock_bot.log had
+    # 65 traceback lines and ZERO notices, because none of these start with a transport
+    # exception and the whitelist therefore said "not mine". All three are lumibot
+    # strings, never the bot reasoning about a position — and each still has to carry a
+    # network signature before anything is collapsed.
+    "Traceback (most recent call last)",
+    "An error occurred during the on_trading_iteration lifecycle method",
+    "Could not get pricing data from",
 )
+
+# WHAT DECIDES A TRACEBACK is its FINAL exception, not whose frames appear in it.
+#
+# The first version of this guard refused to collapse any traceback naming one of our
+# own files — and measured against logs/stock_bot.log that disabled collapsing outright,
+# because the network calls happen INSIDE our strategy code, so our files are in almost
+# every stack. Whose frames are present says nothing; the exception the stack ENDS on
+# says everything. "During handling of the above exception, another exception occurred"
+# is precisely how a real defect hides inside a network failure, and it is the tail that
+# tells them apart.
+_EXC_LINE = re.compile(r"^(?:[\w.]+\.)?\w*(?:Error|Exception|Timeout|Interrupt)\b")
+
+
+def terminal_exception_is_transport(text):
+    """True when the LAST exception in a traceback is a connectivity failure.
+
+    Returns False for anything it cannot read as a traceback tail, because not knowing
+    means not collapsing.
+    """
+    lines = [l for l in _strip_ansi(text or "").split("\n") if l.strip()]
+    for line in reversed(lines):                 # skip trailing ANSI resets and blanks
+        stripped = line.strip()
+        if _EXC_LINE.match(stripped):
+            return _has_sign(stripped)
+        if stripped.startswith(("File \"", "Traceback", "During handling",
+                                "The above exception")) or stripped.startswith(" "):
+            continue
+        return False
+    return False
 
 # Records whose outage lives in exc_info rather than the message, identified by a fixed
 # phrase their emitter always uses.
@@ -121,14 +158,26 @@ def _has_sign(text):
     return any(sign in text for sign in NETWORK_ERROR_SIGNS)
 
 
+# lumibot's log_message() prepends the STRATEGY NAME into the message text, so a record
+# arrives as "[DebbieLaSMC] Traceback (most recent call last): ..." and startswith() never
+# matches. That alone left 65 uncollapsed traceback lines in logs/stock_bot.log after the
+# openers above were added. A strategy name never contains whitespace inside its brackets,
+# which is what keeps "[Errno 8] ..." from being eaten as one.
+_NAME_PREFIX = re.compile(r"^\[[^\]\s]+\]\s+")
+
+
 def is_transport_record(message):
     """True only for records emitted BY the transport layer or its scheduler.
 
-    Deliberately narrow: not recognised means not collapsed.
+    Deliberately narrow: not recognised means not collapsed. Stripping the name prefix
+    is safe for the bot's own lines — "[MSFT] ⚠️ Couldn't verify/re-attach protection"
+    becomes "⚠️ Couldn't verify...", which is still not a transport opener.
     """
     clean = _strip_ansi(message).lstrip()
+    if any(phrase in clean for phrase in COLLAPSIBLE_RECORDS):
+        return True
     return (clean.startswith(TRANSPORT_MESSAGE_OPENERS)
-            or any(phrase in clean for phrase in COLLAPSIBLE_RECORDS))
+            or _NAME_PREFIX.sub("", clean).startswith(TRANSPORT_MESSAGE_OPENERS))
 
 
 def network_outage_verdict(message, exception_text="", *, outage_active=False):
@@ -140,7 +189,12 @@ def network_outage_verdict(message, exception_text="", *, outage_active=False):
     message = _strip_ansi(message or "").lstrip()
     exception_text = exception_text or ""
 
-    if is_transport_record(message) and (_has_sign(message) or _has_sign(exception_text)):
+    combined = message if "Traceback" in message else (exception_text or message)
+    if "Traceback" in combined:
+        # A stack: only its terminal exception decides.
+        if is_transport_record(message) and terminal_exception_is_transport(combined):
+            return "suppress" if outage_active else "report"
+    elif is_transport_record(message) and (_has_sign(message) or _has_sign(exception_text)):
         return "suppress" if outage_active else "report"
 
     if outage_active and any(s in message for s in OUTAGE_CONSEQUENCE_LINES):

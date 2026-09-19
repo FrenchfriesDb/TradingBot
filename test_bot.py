@@ -419,19 +419,16 @@ def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states, st
             }
             for sym in pools
         }
-        # True account equity, not just leftover cash. Longs deduct their cost from
-        # balance at open (this paper model is spot), so a big open position makes raw
-        # "balance" look like the account got wiped when the money is just deployed.
-        # Longs add back market value; shorts (no cash moved at open) add unrealized P&L.
-        equity = paper.balance
-        for sym, qty in paper.positions.items():
-            if abs(qty) < 1e-9:
-                continue
-            cur = prices.get(sym, 0.0)
-            if qty > 0:
-                equity += qty * cur
-            else:
-                equity += (paper.entry_prices.get(sym, cur) - cur) * abs(qty)
+        # True account equity = free cash + Σ(locked margin + unrealized P&L), via the
+        # ONE shared definition. This used to be computed inline here, and the short
+        # branch added only the unrealized P&L on the reasoning that shorts move no cash
+        # at open. PaperTrader.sell() locks notional/leverage as margin exactly as buy()
+        # does, so on 2026-09-18 an ADA short holding the whole $5,000 as margin and down
+        # $28.81 reported equity of -$30.77 — the dashboard read "-100.62%", a blown
+        # account, on a trade that was fine. See tests/test_account_equity.py.
+        equity = indicators.account_equity(
+            paper.balance, paper.positions, paper.entry_prices,
+            paper.margin_used, prices, TEST_LEVERAGE)
         data = {
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "bot": "SweepTestBot",
@@ -892,11 +889,9 @@ def run_crypto_sweep():
             f"{k.split('/')[0]}={'L' if v>0 else 'S'}{abs(v):.4f}"
             for k, v in paper.positions.items()
         ) or "flat"
-        _equity = paper.balance + sum(
-            (q * live_prices.get(s, 0.0)) if q > 0
-            else (paper.entry_prices.get(s, live_prices.get(s, 0.0)) - live_prices.get(s, 0.0)) * abs(q)
-            for s, q in paper.positions.items() if abs(q) > 1e-9
-        )
+        _equity = indicators.account_equity(
+            paper.balance, paper.positions, paper.entry_prices,
+            paper.margin_used, live_prices, TEST_LEVERAGE)
         print(f"  [CRYPTO] Cash: ${paper.balance:,.2f}  |  Equity: ${_equity:,.2f}  |  {pos_str}\n")
 
         if now - last_stats_print >= POOL_RECALC_SECONDS:

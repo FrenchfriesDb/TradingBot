@@ -307,3 +307,135 @@ def test_a_bare_transport_exception_is_still_recognised_and_collapsed():
     exception, with no sentence in front of it. That is the arming record."""
     assert network_outage_verdict(DNS_FAILURE) == "report"
     assert network_outage_verdict(DNS_FAILURE, outage_active=True) == "suppress"
+
+
+# ── the shapes the whitelist missed in production ─────────────────────────────
+#
+# Found 2026-09-18 in logs/stock_bot.log, written by a bot that HAD this filter loaded:
+# 65 traceback lines and 0 "Network unreachable" notices. The whitelist shipped too
+# narrow. Lumibot logs a transport failure in three shapes, none of which start with a
+# transport exception, so is_transport_record() said "not mine" and let all of it through:
+#
+#   [DebbieLaSMC] Traceback (most recent call last):            <- traceback AS the message
+#   [DebbieLaSMC] An error occurred during the on_trading_iteration lifecycle method: ...
+#   alpaca_data.py:943 | Could not get pricing data from Alpaca for SPY with error: ...
+#
+# These are lumibot's own strings, never the bot reasoning about a position, and every
+# one of them still has to carry a network signature before anything is collapsed — so a
+# genuine crash with the same wrapper still prints in full.
+#
+# The extra guard: a traceback that names OUR files is never collapsed, however much
+# transport text it contains. "During handling of the above exception, another exception
+# occurred" is exactly how a real bug in our code hides inside a network failure.
+
+LUMIBOT_TRACEBACK = (
+    "\x1b[31mTraceback (most recent call last):\n"
+    '  File ".../lumibot/strategies/strategy_executor.py", line 1080, in _on_trading_iteration\n'
+    "    self.sync_broker()\n"
+    "requests.exceptions.ConnectionError: HTTPSConnectionPool("
+    "host='paper-api.alpaca.markets', port=443): Max retries exceeded\x1b[0m")
+
+
+def test_a_traceback_logged_as_the_message_is_recognised():
+    assert network_outage_verdict(LUMIBOT_TRACEBACK) == "report"
+    assert network_outage_verdict(LUMIBOT_TRACEBACK, outage_active=True) == "suppress"
+
+
+def test_the_lifecycle_wrapper_is_recognised():
+    msg = ("\x1b[31mAn error occurred during the on_trading_iteration lifecycle method: "
+           "HTTPSConnectionPool(host='paper-api.alpaca.markets', port=443): "
+           "Read timed out. (read timeout=None)\x1b[0m")
+    assert network_outage_verdict(msg) == "report"
+
+
+def test_the_alpaca_data_layer_message_is_recognised():
+    msg = ("Could not get pricing data from Alpaca for SPY with error: "
+           "('Connection aborted.', ConnectionResetError(54, 'Connection reset by peer'))")
+    assert network_outage_verdict(msg) == "report"
+
+
+def test_a_traceback_with_no_network_signature_still_prints_in_full():
+    """A real crash wears the same wrapper. Only the signature may collapse it."""
+    crash = ("Traceback (most recent call last):\n"
+             '  File "binance_bot.py", line 2109, in _ensure_protection\n'
+             "KeyError: 'entry_price'")
+    assert network_outage_verdict(crash, outage_active=True) == "pass"
+
+
+def test_a_traceback_touching_our_own_code_is_never_collapsed():
+    """"During handling of the above exception, another exception occurred" is exactly
+    how a real bug in our code hides inside a network failure. If our files appear in
+    the stack, the operator sees the whole thing whatever else it contains."""
+    mixed = ("Traceback (most recent call last):\n"
+             "requests.exceptions.ConnectionError: Max retries exceeded\n"
+             "During handling of the above exception, another exception occurred:\n"
+             'Traceback (most recent call last):\n'
+             '  File "/Users/x/TradingBot/bot/strategy.py", line 656, in _ensure_protection\n'
+             "TypeError: unsupported operand")
+    assert network_outage_verdict(mixed, outage_active=True) == "pass"
+
+
+@pytest.mark.parametrize("ours", ["bot/strategy.py", "binance_bot.py", "tradingbot.py",
+                                  "bot/indicators.py", "test_bot.py"])
+def test_our_files_in_the_stack_do_not_by_themselves_protect_a_traceback(ours):
+    """The first version of this guard refused to collapse any traceback naming one of
+    our files — which is nearly all of them, since the network calls happen INSIDE our
+    strategy code. Measured on logs/stock_bot.log it disabled collapsing entirely.
+
+    Whose frames are in the stack is not the question. What the FINAL exception is, is."""
+    tb = (f"Traceback (most recent call last):\n  File \"/x/{ours}\", line 1, in f\n"
+          f"requests.exceptions.ConnectionError: Max retries exceeded")
+    assert network_outage_verdict(tb, outage_active=True) == "suppress", ours
+
+
+def test_the_terminal_exception_decides_not_the_frames():
+    """Same stack, same transport text in the middle, different ending."""
+    head = ("Traceback (most recent call last):\n"
+            "requests.exceptions.ConnectionError: Max retries exceeded\n"
+            "During handling of the above exception, another exception occurred:\n"
+            'Traceback (most recent call last):\n  File "/x/bot/strategy.py", line 656\n')
+    assert network_outage_verdict(head + "TypeError: unsupported operand",
+                                  outage_active=True) == "pass"
+    assert network_outage_verdict(head + "requests.exceptions.ReadTimeout: timed out",
+                                  outage_active=True) == "suppress"
+
+
+def test_a_trailing_ansi_reset_does_not_hide_the_terminal_exception():
+    """log_message(color=...) closes with \x1b[0m on its own line, so the last line of
+    a real record is an escape code, not the exception. Seen verbatim in production."""
+    tb = ("Traceback (most recent call last):\n"
+          "requests.exceptions.ConnectionError: Max retries exceeded\n\x1b[0m")
+    assert network_outage_verdict(tb, outage_active=True) == "suppress"
+
+
+def test_the_strategy_name_prefix_does_not_hide_a_transport_record():
+    """The reason the production log still had 65 uncollapsed traceback lines AFTER the
+    openers above were added. lumibot's log_message() prepends the strategy name INTO
+    the message text, so the record actually reads
+
+        [DebbieLaSMC] \x1b[31mTraceback (most recent call last): ...
+
+    and startswith() never matched. Verbatim from logs/stock_bot.log."""
+    real = ('[DebbieLaSMC] \x1b[31mTraceback (most recent call last):\n'
+            '  File ".../lumibot/strategies/strategy_executor.py", line 1080\n'
+            "requests.exceptions.ConnectionError: HTTPSConnectionPool("
+            "host='paper-api.alpaca.markets', port=443): Max retries exceeded\x1b[0m")
+    assert network_outage_verdict(real) == "report"
+    assert network_outage_verdict(real, outage_active=True) == "suppress"
+
+
+def test_stripping_that_prefix_does_not_expose_the_bots_own_lines():
+    """[MSFT] is the same shape as [DebbieLaSMC]. Stripping it must still leave a
+    sentence that is not a transport opener, or the safety-critical lines come back
+    into scope."""
+    assert network_outage_verdict(
+        f"[MSFT] ⚠️ Couldn't verify/re-attach protection: {DNS_FAILURE}",
+        outage_active=True) == "pass"
+    assert network_outage_verdict(
+        f"[DebbieLaSMC] Startup sync skipped (broker not ready): {DNS_FAILURE}",
+        outage_active=True) == "pass"
+
+
+def test_an_errno_prefix_is_not_mistaken_for_a_strategy_name():
+    """"[Errno 8]" has a space inside the brackets; a strategy name never does."""
+    assert network_outage_verdict(f"[Errno 8] {DNS_FAILURE}") == "report"
