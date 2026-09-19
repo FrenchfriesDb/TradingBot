@@ -1346,7 +1346,7 @@ Answer on the VERY FIRST LINE, before any reasoning — if you think first you
 will be cut off before you answer, and an answer nobody can read is treated as a refusal.
 
 Reply in EXACTLY this format, one field per line, nothing else:
-DECISION: YES or NO
+DECISION: <YES or NO>
 RR: a number >= 3.5
 REASON: one concise sentence"""
 
@@ -1363,7 +1363,7 @@ REASON: one concise sentence"""
             model=(resolve_ai_model() or __import__("bot.ai_model", fromlist=["x"]).configured_model()),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=400,   # a reasoning model needs room to reach its own DECISION line
+            max_tokens=1000,   # a reasoning model needs room to reach its own DECISION line
             timeout=15,
         )
         text = resp.choices[0].message.content.strip()

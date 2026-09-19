@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from bot import indicators
+from bot import ai_model as _ai_model
 from config import GOOGLE_SHEET_URL
 from sheets_logger import get_sheet_client, log_trade, ensure_tabs, LEDGER_HEADER
 from chart_renderer import (render_trade_chart, render_stock_tradingview,
@@ -66,6 +67,12 @@ STOP_ATR_MULT        = 1.0       # stop sits this many 15m-ATRs beyond the sweep
 # candles already fetched for the trend filter below, so no extra API call.
 MIN_STOP_ATR_MULT_HTF = 1.5      # stop floored at least this many 1h-ATRs from entry
 MIN_RR               = 2.5       # skip the trade if implied R:R is below this
+# The momentum half of the sweep confirmation needs an absolute size floor as well as a
+# body/range ratio, or a clean-looking body on a dead 1m chart passes as a "move". Sized
+# as a fraction of the 1h ATR, because a 1m body is a small multiple of it. Measured on
+# ADA: 0.10x clears roughly the top quartile of 1m bodies. 0 disables the floor.
+SWEEP_MOMENTUM_ATR_FRAC = float(os.getenv("SWEEP_MOMENTUM_ATR_FRAC", "0.10"))
+MAX_AI_RR            = 15.0      # sanity ceiling on a model-suggested R:R
 # Higher-timeframe momentum filter (Step 4). Coinbase has NO native 4h granularity
 # (only 1m/5m/15m/30m/1h/2h/6h/1d), so we fetch 1h and resample to true 4h candles.
 TREND_FETCH_TF       = "1h"      # granularity actually requested from the exchange
@@ -843,6 +850,21 @@ def run_crypto_sweep():
                     print(f"[{base}] ⏭ {direction} sweep skipped — {_trend_why}")
                     continue
 
+                # The two-bar reversal: INDECISION at the swept level, then MOMENTUM away
+                # from it. A sweep alone says only that a level was touched, and price may
+                # simply keep going — which is what ADA did on 2026-09-18 while this bot
+                # was short into it. Closed candles only; iloc[-1] is still forming.
+                # See tests/test_sweep_confirmation.py.
+                _bars = [{"open": float(r["open"]), "high": float(r["high"]),
+                          "low": float(r["low"]), "close": float(r["close"])}
+                         for _, r in df_1m.iloc[:-1].iterrows()]
+                _pat_ok, _pat_why = indicators.sweep_confirmation(
+                    _bars, is_long=(direction == "LONG"),
+                    min_body_abs=htf_atr_value * SWEEP_MOMENTUM_ATR_FRAC)
+                if not _pat_ok:
+                    print(f"[{base}] ⏭ {direction} sweep skipped — {_pat_why}")
+                    continue
+
                 # ATR-based stop: measure volatility on the higher timeframe (1m ATR is
                 # inside the noise band) so the stop clears noise while the entry stays
                 # on the 1m sweep. Fetched only now (on an actual signal), not every tick.
@@ -862,6 +884,24 @@ def run_crypto_sweep():
                 rr = compute_rr(price, sl, tp)
                 if rr < MIN_RR:
                     print(f"[{base}] ⏭ Sweep {direction} skipped — R:R 1:{rr:.1f} < 1:{MIN_RR:.0f} min")
+                    continue
+
+                # AI confirmation, LAST — after every mechanical gate, so the model is
+                # only asked about setups that already qualify and a slow call costs
+                # nothing on the setups that were never going to trade. Shared with the
+                # other two bots (bot/ai_model.confirm_setup) rather than a third private
+                # copy, because the private copies are how both of them ended up with the
+                # same fail-open. Unreadable reply = no trade; transport failure =
+                # proceed on technicals, but labelled NO OPINION, never a green tick.
+                _ai_ok, _ai_rr, _ai_why = _ai_model.confirm_setup(
+                    {"symbol": symbol, "direction": direction, "entry": price,
+                     "stop": sl, "target": tp, "rr": f"{rr:.1f}",
+                     "trend": trend or "unknown", "pattern": _pat_why},
+                    min_rr=MIN_RR, max_rr=MAX_AI_RR)
+                _ai_icon = (("⚠️ NO OPINION" if _ai_model.is_no_opinion(_ai_why)
+                             else "✅ YES") if _ai_ok else "❌ NO")
+                print(f"[{base}] 🤖 AI: {_ai_icon}  (suggested 1:{_ai_rr:.1f})  {_ai_why[:130]}")
+                if not _ai_ok:
                     continue
 
                 qty = size_position(paper.balance, RISK_PCT, price, sl)

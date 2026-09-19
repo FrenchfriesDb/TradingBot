@@ -2207,3 +2207,65 @@ def trend_filter_verdict(trend, direction):
     if t == "DOWN" and d == "LONG":
         return False, "fights the 4H DOWN trend (only shorts with the trend)"
     return True, f"with the 4H {t} trend"
+
+
+# A bar whose body is this small a fraction of its range is a fight, not a move: the
+# doji / spinning-top / long-rejection-wick family.
+INDECISION_BODY_FRAC = 0.35
+# ...and this much body means the fight resolved.
+MOMENTUM_BODY_FRAC = 0.50
+
+
+def _bar_geometry(bar):
+    """(body, rng, bullish) or None if the bar cannot be read."""
+    try:
+        o, c = float(bar["open"]), float(bar["close"])
+        h, l = float(bar["high"]), float(bar["low"])
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+    rng = h - l
+    if rng <= 0:
+        return None
+    return abs(c - o), rng, c >= o
+
+
+def sweep_confirmation(candles, is_long, min_body_abs=0.0, lookback=4,
+                       indecision_frac=INDECISION_BODY_FRAC,
+                       momentum_frac=MOMENTUM_BODY_FRAC):
+    """(ok, reason) — did the sweep produce INDECISION, then MOMENTUM the trade's way?
+
+    A sweep on its own says only that a level was touched; price may simply keep going,
+    which is what ADA did on 2026-09-18 while the bot was short. The two-bar pattern is
+    what separates a reversal from a continuation:
+
+      1. indecision AT the level — doji, spinning top, long rejection wick. The move
+         that carried price in has stalled and both sides are fighting.
+      2. momentum AWAY from it — a decisive body our way. The fight resolved, our way.
+
+    Without (1) nothing was rejected. Without (2) there is a stall but no evidence
+    anyone has taken the other side, and entering is guessing at the turn.
+
+    The momentum bar must be the MOST RECENT one: stall, push, then three bars of chop
+    is a stale setup, and taking it is the "enters after the big move" failure again.
+    """
+    if not isinstance(candles, (list, tuple)) or len(candles) < 2:
+        return False, "not enough candles to see a sweep confirmation — standing aside"
+
+    window = list(candles)[-max(2, lookback):]
+    last = _bar_geometry(window[-1])
+    if last is None:
+        return False, "the latest candle could not be read — standing aside"
+
+    body, rng, bullish = last
+    if body / rng < momentum_frac or body < min_body_abs or bullish != bool(is_long):
+        return False, ("no momentum candle closing the trade's way yet — the sweep has "
+                       "not resolved into a move")
+
+    for bar in reversed(window[:-1]):           # nearest first
+        geo = _bar_geometry(bar)
+        if geo is None:
+            continue
+        if geo[0] / geo[1] <= indecision_frac:
+            return True, "indecision at the sweep, then momentum the trade's way"
+    return False, ("no indecision candle before the push — the level was passed "
+                   "through, not rejected")

@@ -115,7 +115,7 @@ def reset_cache():
 
 
 # ── reading the model's answer ────────────────────────────────────────────────
-# Both bots asked for "DECISION: YES or NO" and, when they could not find that line,
+# Both bots asked for "DECISION: <YES or NO>" and, when they could not find that line,
 # set confirm = True and logged "🤖 AI Bot Approval: ✅ YES". On 2026-09-18 that put
 # BTC on at $77,214 off this reply, which is the model's first sentence and nothing else:
 #
@@ -200,3 +200,86 @@ def is_no_opinion(reason):
         return True
     lowered = reason.lower()
     return any(m in lowered for m in NO_OPINION_MARKERS)
+
+
+# ── one shared confirmation call ──────────────────────────────────────────────
+# binance_bot.py and bot/strategy.py each grew their own copy of prompt-and-parse, and
+# each grew the SAME fail-open bug, fixed separately in both on 2026-09-18. test_bot had
+# no AI at all. This is the shared version, so a third private copy does not repeat the
+# lesson a third time. The transport is injected: testable without a network, and each
+# caller keeps control of its own timeout.
+CONFIRM_PROMPT = """You are grading a mechanical trading setup. Be sceptical; most
+setups are not worth taking.
+
+Symbol     : {symbol}
+Direction  : {direction}
+Entry      : {entry}
+Stop       : {stop}
+Target     : {target}
+Structural R:R : 1:{rr}
+Higher-timeframe trend : {trend}
+Sweep confirmation     : {pattern}
+
+Answer on the VERY FIRST LINE, before any reasoning — if you think first you will be cut
+off before you answer, and an answer nobody can read is treated as a refusal.
+
+Reply in EXACTLY this format, one field per line, nothing else:
+DECISION: <YES or NO>
+RR: a number
+REASON: one concise sentence"""
+
+
+def _default_call(api_key, model, timeout):
+    """Real NVIDIA NIM transport. Returns a callable taking the prompt, returning text."""
+    def call(prompt):
+        import urllib.request
+        body = json.dumps({"model": model,
+                           "messages": [{"role": "user", "content": prompt}],
+                           # Measured 2026-09-18 against the live model: 400 finishes
+                           # with finish_reason "length" mid-deliberation, 900 completes.
+                           "max_tokens": 1000, "temperature": 0.1}).encode()
+        req = urllib.request.Request(
+            "https://integrate.api.nvidia.com/v1/chat/completions", data=body,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            choice = json.loads(resp.read())["choices"][0]
+            # finish_reason "length" means the model was cut off mid-thought. Report it:
+            # a decision string found inside truncated deliberation is not a verdict.
+            return choice["message"]["content"], choice.get("finish_reason")
+    return call
+
+
+def confirm_setup(context, *, call=None, api_key=None, model=None,
+                  min_rr=2.0, max_rr=15.0, timeout=25):
+    """(confirm, rr, reason) — should this setup be taken?
+
+    An unreadable reply REFUSES. A transport failure proceeds on technicals but says so,
+    so is_no_opinion() can keep the log from printing a green tick nobody earned. See
+    tests/test_ai_confirm_setup.py for why each of those is the way round it is.
+    """
+    if call is None:
+        api_key = api_key if api_key is not None else os.getenv("NVIDIA_API_KEY", "")
+        if not api_key:
+            return True, min_rr, "no AI key — proceeding on technicals"
+        call = _default_call(api_key, model or configured_model(), timeout)
+
+    try:
+        result = call(CONFIRM_PROMPT.format(**context))
+    except Exception as exc:                 # timeout / DNS / 5xx: the model never spoke
+        return True, min_rr, f"AI unavailable ({type(exc).__name__}) — proceeding on technicals"
+
+    # A transport may report why generation stopped; one that does not is not truncated.
+    text, finish = result if isinstance(result, tuple) else (result, None)
+
+    decision, rr, reason = parse_ai_decision(text)
+    rr = max(min_rr, min(rr if rr is not None else min_rr, max_rr))
+    if finish == "length":
+        # Cut off mid-thought. Measured live: at max_tokens=400 this model produced a
+        # "NO" matched out of its own deliberation, not an answer. It happened to fail
+        # closed, but a coin flip that lands safe is still a coin flip.
+        return False, rr, "AI reply was truncated before its verdict — standing aside"
+    if decision is None:
+        # The model SPOKE and no decision could be found in it — content, not
+        # infrastructure, and on BTC it was content reasoning its way toward NO.
+        return False, rr, f"AI gave no readable decision — standing aside ({str(text)[:120]})"
+    return decision == "YES", rr, reason

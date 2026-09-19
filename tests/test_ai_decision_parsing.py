@@ -170,3 +170,53 @@ def test_a_real_verdict_is_not_mistaken_for_a_fallback(reason):
 def test_junk_counts_as_no_opinion_rather_than_as_approval(junk):
     """Fail toward 'we do not know', never toward 'the model said yes'."""
     assert is_no_opinion(junk)
+
+
+# ── the fail-open hiding in the PROMPT ────────────────────────────────────────
+#
+# Found 2026-09-18 by smoke-testing the live model. Every prompt in this repo asked for:
+#
+#     DECISION: YES or NO
+#
+# and a model that echoes or reasons about that template emits that exact line back. The
+# parser then matches "DECISION: YES" out of the echoed instruction and reports an
+# approval the model never gave — the same bug as the unparsed-reply fail-open, one layer
+# further out, and invisible because the parser was behaving correctly on the text it was
+# handed. Seen live: a reply that got as far as "REASON: one concise sentence. Must be on
+# first line? Actually they say..." was being scored as a verdict.
+#
+# The template now writes the placeholder as <YES or NO>, which cannot self-match, and
+# test_no_prompt_can_match_its_own_template keeps it that way in every bot.
+
+def test_an_echoed_template_is_not_a_decision():
+    echoed = ("Reply in EXACTLY this format, one field per line, nothing else:\n"
+              "DECISION: <YES or NO>\nRR: a number\nREASON: one concise sentence")
+    assert parse_ai_decision(echoed)[0] is None
+
+
+def test_a_model_musing_about_the_format_is_not_a_decision():
+    """Verbatim shape of the live reply that exposed this."""
+    musing = ("REASON: one concise sentence. Must be on first line? Actually they say "
+              "answer on the very first line, so I should put DECISION: <YES or NO> there")
+    assert parse_ai_decision(musing)[0] is None
+
+
+def test_no_prompt_in_the_repo_can_match_its_own_template():
+    """Any prompt whose literal text parses as a decision is a fail-open waiting for a
+    model to echo it. Checked across every bot, not just the one that was caught."""
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    offenders = []
+    for name in ("bot/ai_model.py", "binance_bot.py", "bot/strategy.py"):
+        src = (repo / name).read_text(encoding="utf-8")
+        for line in src.splitlines():
+            stripped = line.strip()
+            # Source COMMENTS may quote a decision while explaining the parser — a model
+            # cannot echo those. Only text a model could actually be shown counts.
+            if stripped.startswith("#"):
+                continue
+            if "DECISION" in line and parse_ai_decision(line)[0] is not None:
+                offenders.append(f"{name}: {stripped[:70]}")
+    assert not offenders, (
+        "these prompt/template lines parse as a real decision, so a model echoing them "
+        "would be read as a verdict:\n  " + "\n  ".join(offenders))
