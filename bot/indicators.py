@@ -2174,3 +2174,36 @@ def trim_qty_to_risk(qty, entry, stop, risk_remaining):
     if qty <= affordable:
         return qty, False
     return math.floor(affordable * 1e6) / 1e6, True
+
+
+def trend_filter_verdict(trend, direction):
+    """(allowed, reason) — may this sweep be taken given the higher-timeframe trend?
+
+    A LONG sweep is buy-the-dip and needs an uptrend; a SHORT sweep is sell-the-rip and
+    needs a downtrend. Blocking the counter-trend side is what stops the bot fading a
+    running move.
+
+    UNREADABLE TRENDS ARE REFUSED, and that is the whole point of this function. The
+    caller used to set `trend = None` on any exception during the 1h fetch and treat
+    None as "allow". On 2026-09-18 that put a SHORT on ADA at $0.2291 — the exact 1H
+    high — into a move that ran from $0.2210 to $0.2323, for a full-risk loss. Replayed
+    afterwards against real data, the 4H trend was UP for the entire 24 hours before the
+    entry: the gate could not have evaluated and permitted it, so it never evaluated.
+
+    Without the read we do not know WHICH side is the counter-trend one, so neither side
+    may pass. The next 1-minute tick tries again; declining late is recoverable in a way
+    that fading a rocket is not. Same lesson as the AI gate: a check that cannot reach a
+    verdict is not a verdict in favour.
+    """
+    t = trend.strip().upper() if isinstance(trend, str) else None
+    d = direction.strip().upper() if isinstance(direction, str) else None
+    if d not in ("LONG", "SHORT"):
+        return False, f"unrecognised trade direction {direction!r} — standing aside"
+    if t not in ("UP", "DOWN"):
+        return False, ("could not read the higher-timeframe trend — standing aside "
+                       "rather than risk fading a running move")
+    if t == "UP" and d == "SHORT":
+        return False, "fights the 4H UP trend (only longs with the trend)"
+    if t == "DOWN" and d == "LONG":
+        return False, "fights the 4H DOWN trend (only shorts with the trend)"
+    return True, f"with the 4H {t} trend"

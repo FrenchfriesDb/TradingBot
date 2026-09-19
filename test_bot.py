@@ -802,18 +802,28 @@ def run_crypto_sweep():
                 # stops the bot fading a running move — the "all shorts in an uptrend,
                 # all stopped" pattern from the ledger. None = not enough data, allow.
                 htf_atr_value = 0.0
+                trend = None
                 try:
-                    # fetch 1h (native), resample to true 4h, then read the trend
+                    # Fetch 1h (native), resample to true 4h, then read the trend.
+                    # The margin matters: (30+5)*4 = 140 hourly candles is only 35 4H
+                    # bars against a 30-bar EMA minimum, so any short or partial response
+                    # dropped the read to None — which used to mean "allow". Ask for
+                    # roughly double, so a thin response still clears the minimum.
                     hourly = exchange.fetch_ohlcv(
-                        symbol, TREND_FETCH_TF, limit=(TREND_EMA_LEN + 5) * 4)
+                        symbol, TREND_FETCH_TF, limit=(TREND_EMA_LEN * 2 + 10) * 4)
                     trend = trend_direction(resample_ohlcv(hourly, TREND_TF_SECONDS))
                     htf_atr_value = atr(hourly, STOP_ATR_LEN)   # reuse this fetch for the stop floor below
-                except Exception:
-                    trend = None
-                if (trend == "UP" and direction == "SHORT") or \
-                   (trend == "DOWN" and direction == "LONG"):
-                    print(f"[{base}] ⏭ {direction} sweep skipped — fights 4H {trend} trend "
-                          f"(only {'longs' if trend == 'UP' else 'shorts'} with the trend)")
+                except Exception as _trend_err:
+                    # Say so. This used to fail silently into trend = None, and the ADA
+                    # short on 2026-09-18 left no trace of why the filter had vanished.
+                    print(f"[{base}] ⚠️ 4H trend fetch failed ({type(_trend_err).__name__}) "
+                          f"— no trend read this tick")
+                # A check that cannot reach a verdict is NOT a verdict in favour: an
+                # unreadable trend now refuses both directions. See
+                # tests/test_trend_filter_fail_closed.py.
+                _trend_ok, _trend_why = indicators.trend_filter_verdict(trend, direction)
+                if not _trend_ok:
+                    print(f"[{base}] ⏭ {direction} sweep skipped — {_trend_why}")
                     continue
 
                 # ATR-based stop: measure volatility on the higher timeframe (1m ATR is
