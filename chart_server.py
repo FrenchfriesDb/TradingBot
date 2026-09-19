@@ -10,6 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import urllib.request
 from jinja2 import Template
+from bot.live_candle import patch_live_candle
 
 CRYPTO_STATE   = "crypto_state.json"
 TEST_STATE     = "test_state.json"
@@ -17,6 +18,34 @@ STRATEGY_STATE = "strategy_state.json"
 PORT           = 8888
 
 _eq_cache = {"t": 0.0, "v": None}
+
+# Coinbase's /candles is the HISTORIC-RATES endpoint: it serves completed buckets from a
+# cache and never streams the bucket currently forming. Measured 2026-09-19, the newest
+# candle's close sat frozen for 43s while BTC moved $22 — so polling it every 5s just
+# re-fetched the same row nine times, which is the "slow and behind" the chart showed.
+# Cache it briefly (it genuinely is not changing) and get the liveness from the ticker
+# instead, which is what a real chart does. See bot/live_candle.py.
+_CANDLE_TTL = 10.0
+_TICKER_TTL = 2.0
+_candle_cache: dict = {}
+_ticker_cache: dict = {}
+
+
+def _coinbase_ticker(product):
+    """Last traded price, cached briefly so several open tabs cannot hammer the API."""
+    hit = _ticker_cache.get(product)
+    if hit and time.time() - hit[0] < _TICKER_TTL:
+        return hit[1]
+    try:
+        req = urllib.request.Request(
+            f"https://api.exchange.coinbase.com/products/{product}/ticker",
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            price = float(json.loads(resp.read())["price"])
+    except Exception:
+        return None                    # no ticker -> chart falls back to raw candles
+    _ticker_cache[product] = (time.time(), price)
+    return price
 def _fee_summary(account):
     """{'totalFees': float|None, 'feeRate': float|None} from the bot's state file.
 
@@ -917,11 +946,22 @@ class Handler(BaseHTTPRequestHandler):
             product = params.get("sym",  ["BTC-USD"])[0]   # Coinbase product id e.g. BTC-USD
             gran    = params.get("gran", ["300"])[0]        # granularity in seconds (300 = 5m)
             try:
-                url = (f"https://api.exchange.coinbase.com/products/{product}/candles"
-                       f"?granularity={gran}&limit=300")   # more macro context (was 200)
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    body = resp.read()
+                key = (product, gran)
+                hit = _candle_cache.get(key)
+                if hit and time.time() - hit[0] < _CANDLE_TTL:
+                    rows = hit[1]
+                else:
+                    url = (f"https://api.exchange.coinbase.com/products/{product}/candles"
+                           f"?granularity={gran}&limit=300")   # more macro context (was 200)
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        rows = json.loads(resp.read())
+                    _candle_cache[key] = (time.time(), rows)
+                # Drive the FORMING candle from the live ticker. Completed buckets are
+                # never touched; a missing ticker just leaves the raw candles alone.
+                rows = patch_live_candle(rows, _coinbase_ticker(product),
+                                         time.time(), int(gran))
+                body = json.dumps(rows).encode()
             except Exception:
                 body = b"[]"
             self.send_response(200)
