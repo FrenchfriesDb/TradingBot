@@ -129,6 +129,10 @@ def _first_heavy_import_line(tree):
 @pytest.mark.parametrize("script,logname", [
     ("binance_bot.py", "binance_bot.log"),
     ("tradingbot.py", "stock_bot.log"),
+    # Added 2026-09-18: test_bot took a counter-trend ADA short and the entry reasoning
+    # was unreconstructable, because that process wrote to a tty and the output died
+    # with the window. The diagnosis had to come from replaying market data instead.
+    ("test_bot.py", "test_bot.log"),
 ])
 def test_each_bot_tees_its_own_stdout(script, logname):
     tree = ast.parse((REPO / script).read_text(encoding="utf-8"))
@@ -147,7 +151,7 @@ def test_each_bot_tees_its_own_stdout(script, logname):
             f"line {heavy} — the startup banner would be lost")
 
 
-@pytest.mark.parametrize("script", ["binance_bot.py", "tradingbot.py"])
+@pytest.mark.parametrize("script", ["binance_bot.py", "tradingbot.py", "test_bot.py"])
 def test_teeing_is_guarded_so_importing_the_module_never_tees(script):
     """pytest imports these modules; an unguarded tee would spray the suite into a log."""
     tree = ast.parse((REPO / script).read_text(encoding="utf-8"))

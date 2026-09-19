@@ -17,6 +17,23 @@ import math
 import time
 import logging
 import threading
+
+# ── Make this run explainable no matter how it was launched ───────────────────
+# scripts/start_test_bot.sh redirects stdout into a log; a bare `python3 test_bot.py`
+# in a Terminal does not, and then the session exists only in scrollback. On
+# 2026-09-18 this bot took a counter-trend ADA short that cost a full stop, and the
+# entry reasoning could not be reconstructed at all — the process had written to a tty
+# and the window was gone, so the diagnosis had to come from replaying market data
+# instead. binance_bot.py and tradingbot.py already do this; this one did not.
+# Runs before anything prints so the startup banner is captured. should_tee() makes it
+# a no-op when stdout is already a file, so a script launch never double-writes.
+if __name__ == "__main__":
+    from bot.tee_logging import tee_stdout_to
+    _TEED = tee_stdout_to(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "logs", "test_bot.log"))
+    if _TEED:
+        print(f"📝 Also logging to {_TEED} (started from a terminal — teeing so this "
+              f"session is still explainable afterwards)")
 import pandas as pd
 from datetime import datetime, timezone
 from dotenv import load_dotenv
