@@ -141,3 +141,83 @@ def test_a_complete_reply_is_trusted():
 def test_a_caller_returning_plain_text_still_works():
     """The transport may not report a finish reason; absence is not truncation."""
     assert confirm_setup(CTX, call=lambda p: "DECISION: YES\nRR: 3")[0] is True
+
+
+# ── transient 503s are NVIDIA's, and must be retried, not surrendered to ──────
+#
+# "why does the terminal say the AI is unavailable" — measured 2026-09-20, four calls
+# back to back on a working key:
+#
+#   call 1:  0.3s  HTTP 503  {"message":"Service temporarily overloaded"}
+#   call 2:  0.3s  HTTP 503  {"message":"Service temporarily overloaded"}
+#   call 3:  6.1s  200 OK
+#   call 4: 12.7s  200 OK
+#
+# Not the key, not our timeout, not rate limiting: NVIDIA's service is intermittently
+# overloaded and clears within seconds. confirm_setup() made ONE attempt, so a 503 that
+# would have succeeded on the next try became "AI unavailable — proceeding on
+# technicals", and the gate silently stopped gating. Of the four verdicts this bot has
+# produced in production, one was exactly that.
+#
+# The model RESOLVER in this same file already retries transient failures three times
+# (see PERMANENT_CODES and the attempts loop). The confirmation call did not.
+#
+# Permanent codes still fail immediately: retrying a 401 or a 404 only wastes the time
+# of a setup that is waiting on an answer.
+
+class _Flaky:
+    """Fails with `code` for the first `fails` calls, then returns `then`."""
+    def __init__(self, fails, code=503, then="DECISION: YES\nRR: 3\nREASON: ok"):
+        self.left, self.code, self.then, self.calls = fails, code, then, 0
+
+    def __call__(self, prompt):
+        self.calls += 1
+        if self.left > 0:
+            self.left -= 1
+            import urllib.error, io
+            raise urllib.error.HTTPError("u", self.code, "overloaded", {}, io.BytesIO(b""))
+        return self.then
+
+
+def test_a_single_503_is_retried_and_the_verdict_survives():
+    flaky = _Flaky(fails=1)
+    ok, _, reason = confirm_setup(CTX, call=flaky, retry_wait=0)
+    assert ok is True, reason
+    assert flaky.calls == 2, "should have tried again rather than giving up"
+    assert not is_no_opinion(reason)
+
+
+def test_two_503s_in_a_row_are_still_retried():
+    """The live sample had two consecutive 503s before a 200."""
+    flaky = _Flaky(fails=2)
+    ok, _, _ = confirm_setup(CTX, call=flaky, retry_wait=0)
+    assert ok is True and flaky.calls == 3
+
+
+def test_retries_are_bounded_and_then_it_gives_up_honestly():
+    flaky = _Flaky(fails=99)
+    ok, _, reason = confirm_setup(CTX, call=flaky, retry_wait=0)
+    assert flaky.calls <= 3, "must not hammer a service that is already overloaded"
+    assert ok is True, "an exhausted transient failure still proceeds on technicals"
+    assert is_no_opinion(reason), "but it is NO OPINION, never an approval"
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404, 410, 422])
+def test_a_permanent_error_is_not_retried(code):
+    """Retrying a bad key or a dead model only delays a setup that is waiting."""
+    flaky = _Flaky(fails=99, code=code)
+    confirm_setup(CTX, call=flaky, retry_wait=0)
+    assert flaky.calls == 1, f"HTTP {code} should fail immediately"
+
+
+def test_a_timeout_is_transient_and_retried_too():
+    class _Slow:
+        def __init__(self): self.calls = 0
+        def __call__(self, prompt):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("read timed out")
+            return "DECISION: NO\nRR: 2\nREASON: thin"
+    slow = _Slow()
+    ok, _, _ = confirm_setup(CTX, call=slow, retry_wait=0)
+    assert slow.calls == 2 and ok is False

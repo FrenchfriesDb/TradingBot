@@ -18,6 +18,7 @@ shared logic more than once; one definition means one place to fix it next time.
 import json
 import os
 import re
+import time
 import urllib.request
 
 ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -250,7 +251,8 @@ def _default_call(api_key, model, timeout):
 
 
 def confirm_setup(context, *, call=None, api_key=None, model=None,
-                  min_rr=2.0, max_rr=15.0, timeout=25):
+                  min_rr=2.0, max_rr=15.0, timeout=25,
+                  attempts=3, retry_wait=1.0):
     """(confirm, rr, reason) — should this setup be taken?
 
     An unreadable reply REFUSES. A transport failure proceeds on technicals but says so,
@@ -263,10 +265,33 @@ def confirm_setup(context, *, call=None, api_key=None, model=None,
             return True, min_rr, "no AI key — proceeding on technicals"
         call = _default_call(api_key, model or configured_model(), timeout)
 
-    try:
-        result = call(CONFIRM_PROMPT.format(**context))
-    except Exception as exc:                 # timeout / DNS / 5xx: the model never spoke
-        return True, min_rr, f"AI unavailable ({type(exc).__name__}) — proceeding on technicals"
+    # NVIDIA's endpoint is intermittently overloaded. Measured 2026-09-20, four calls
+    # back to back on a working key: 503, 503, then 200 in 6.1s and 200 in 12.7s. A
+    # single attempt turned a blip that clears in seconds into "AI unavailable", and the
+    # gate silently stopped gating — one of this bot's four production verdicts was
+    # exactly that. The model RESOLVER in this same file already retried transient
+    # failures three times; the confirmation call did not.
+    #
+    # Permanent codes are not retried: a bad key or a dead model will not fix itself,
+    # and the setup is waiting on an answer.
+    prompt = CONFIRM_PROMPT.format(**context)
+    result, failure = None, None
+    for attempt in range(max(1, attempts)):
+        try:
+            result = call(prompt)
+            failure = None
+            break
+        except Exception as exc:
+            failure = exc
+            if getattr(exc, "code", None) in PERMANENT_CODES:
+                break
+            if attempt < attempts - 1 and retry_wait:
+                time.sleep(retry_wait)
+
+    if failure is not None:
+        code = getattr(failure, "code", None)
+        detail = f"{type(failure).__name__}{f' {code}' if code else ''}"
+        return True, min_rr, f"AI unavailable ({detail}) — proceeding on technicals"
 
     # A transport may report why generation stopped; one that does not is not truncated.
     text, finish = result if isinstance(result, tuple) else (result, None)
