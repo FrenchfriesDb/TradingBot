@@ -118,7 +118,11 @@ STOCK_TEST_BALANCE = 5_000.0    # reference balance for STOCK position sizing on
                                  # changes. The crypto side never had this problem: PaperTrader
                                  # already tracks its own isolated CRYPTO_BALANCE, never touching a
                                  # real exchange account.
-STALE_TRADE_HOURS = 4    # a sweep setup that hasn't hit SL/TP in this long has lost its edge and
+# Raised 4 -> 12 on 2026-09-20. Both trades of 2026-09-19 died on this clock, neither
+# anywhere near its stop or target: ADA -0.46% against a -2.21% stop and a +6.06% target,
+# DOGE -0.46% against -1.97% / +7.30%. Booking -0.20R and -0.26R on setups that had not
+# resolved either way. A 4h ceiling on a target 6-7% away asks price to move ~1.5%/hour.
+STALE_TRADE_HOURS = 12   # a sweep setup that hasn't hit SL/TP in this long has lost its edge and
                           # is just tying up capital doing nothing — these are 1H-timeframe setups,
                           # so 4h (~4 candles) is the natural ceiling. REAL INCIDENT 2026-08-09: an
                           # ADA LONG sat open 48.9 hours with no time-based exit anywhere in this
@@ -585,19 +589,33 @@ def compute_rr(entry: float, sl: float, tp: float) -> float:
     return reward / risk if risk > 0 else 0.0
 
 
-def size_position(balance: float, risk_pct: float, entry: float, sl: float) -> float:
-    """Qty sized so a stop-out loses exactly risk_pct of balance. Returns 0.0 if risk <= 0.
+def size_position(balance: float, risk_pct: float, entry: float, sl: float,
+                  cash_available: float = None) -> float:
+    """Qty sized so a stop-out loses exactly risk_pct of `balance`. 0.0 if risk <= 0.
 
-    Capped at MAX_MARGIN_PCT of balance in margin (notional = margin × TEST_LEVERAGE):
-    with a tight stop, pure risk-based sizing demands more capital than the account
-    even has (e.g. a $123 stop on a $61k coin with 1% of a $5k account = $24k of
-    notional) — without this cap the paper trader would silently deploy everything
-    into one position. A capped trade risks LESS than risk_pct, never more."""
+    TWO DIFFERENT BASES, deliberately:
+
+      balance         the RISK basis — account EQUITY. "1% of your account is how much
+                      you lose" has to mean 1% of the account every time.
+      cash_available  the CAPITAL cap — free cash. You cannot deploy money already
+                      committed to another position, whatever your equity says.
+                      Defaults to `balance` for the flat-account case.
+
+    Passing free cash as the risk basis is what made the second trade of 2026-09-19 half
+    the size of the first: ADA locked $2,255.96 of the $5,000, so DOGE sized off the
+    $2,744.04 that was left and risked $27.44 instead of $50.00. Position size must not
+    depend on how many trades happen to be open.
+
+    The capital cap is still needed on its own terms: with a tight stop, pure risk-based
+    sizing demands more capital than the account has (a $123 stop on a $61k coin with 1%
+    of $5k wants $24k of notional). A capped trade risks LESS than risk_pct, never more.
+    """
     risk_per_unit = abs(entry - sl)
     if risk_per_unit <= 0:
         return 0.0
     qty = (balance * risk_pct) / risk_per_unit
-    qty = min(qty, (balance * MAX_MARGIN_PCT * TEST_LEVERAGE) / entry)
+    cap_basis = balance if cash_available is None else cash_available
+    qty = min(qty, (cap_basis * MAX_MARGIN_PCT * TEST_LEVERAGE) / entry)
     return math.floor(qty * 1e6) / 1e6
 
 
@@ -904,7 +922,13 @@ def run_crypto_sweep():
                 if not _ai_ok:
                     continue
 
-                qty = size_position(paper.balance, RISK_PCT, price, sl)
+                # Risk off EQUITY (1% of the account, every trade), capital capped by
+                # free cash (cannot deploy what another position already holds).
+                _equity_now = indicators.account_equity(
+                    paper.balance, paper.positions, paper.entry_prices,
+                    paper.margin_used, live_prices, TEST_LEVERAGE)
+                qty = size_position(_equity_now, RISK_PCT, price, sl,
+                                    cash_available=paper.balance)
                 if qty <= 0:
                     print(f"[{base}] ⏭ Sweep {direction} skipped — position size rounds to zero")
                     continue

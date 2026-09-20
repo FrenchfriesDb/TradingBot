@@ -117,3 +117,61 @@ def test_risk_taken_no_longer_depends_on_how_tight_the_stop_is():
         sized, _ = trim_qty_to_risk(qty, entry, stop, daily_risk_remaining(0.0, BAL, DAILY))
         taken.append(round(sized * (entry - stop), 2))
     assert taken == [50.0, 50.0, 50.0, 50.0], taken
+
+
+# ── risk is a share of the ACCOUNT, not of whatever cash is left ──────────────
+#
+# Live on 2026-09-19, two trades in a row:
+#
+#   ADA   risk $50.00  (1.00% of the $5,000 account)   <- first trade, full size
+#   DOGE  risk $27.44  (0.55%)                          <- second trade, half size
+#
+# The daily budget was not the cause: $100 of the $150 was still unspent. The cause was
+# the call site, size_position(paper.balance, ...), because paper.balance is FREE CASH
+# and ADA had locked $2,255.96 of it as margin:
+#
+#   account equity             $5,000.00  -> 1% = $50.00
+#   free cash after ADA        $2,744.04  -> 1% = $27.44   <- exactly what was risked
+#
+# So every additional position risked 1% of what was LEFT, and a third would have risked
+# less again. "1% of your account is how much you lose" has to mean 1% of the account
+# every time, or position size quietly depends on how many trades happen to be open.
+#
+# The capital cap is a different question and still belongs on free cash: you cannot
+# deploy money that is already committed, whatever your equity says. Hence two inputs.
+from test_bot import size_position, MAX_MARGIN_PCT, TEST_LEVERAGE
+
+
+def test_risk_is_a_share_of_equity_not_of_the_cash_left_over():
+    """The live DOGE case, to the cent."""
+    equity, free_cash = 5_000.0, 2_744.04
+    qty = size_position(equity, 0.01, entry=0.08509, sl=0.08341, cash_available=free_cash)
+    assert qty * (0.08509 - 0.08341) == pytest.approx(50.0, abs=0.01)
+
+
+def test_a_second_position_is_sized_the_same_as_the_first():
+    """The property that was broken: size must not depend on how many trades are open."""
+    first = size_position(5_000.0, 0.01, entry=10.0, sl=9.5, cash_available=5_000.0)
+    second = size_position(5_000.0, 0.01, entry=10.0, sl=9.5, cash_available=2_744.04)
+    assert first * 0.5 == pytest.approx(second * 0.5), "same risk either way"
+
+
+def test_deployment_still_cannot_exceed_the_cash_actually_available():
+    """Equity sets the RISK; free cash still caps the CAPITAL. Sizing off equity alone
+    would deploy money that is already committed to another position."""
+    qty = size_position(5_000.0, 0.01, entry=60_000, sl=59_880, cash_available=1_000.0)
+    assert qty * 60_000 <= 1_000.0 * MAX_MARGIN_PCT * TEST_LEVERAGE + 1e-6
+
+
+def test_omitting_cash_available_keeps_the_old_single_basis_behaviour():
+    """Back-compat: the flat account case, where equity and cash are the same number."""
+    a = size_position(5_000.0, 0.01, entry=60_000, sl=59_880)
+    b = size_position(5_000.0, 0.01, entry=60_000, sl=59_880, cash_available=5_000.0)
+    assert a == b
+
+
+def test_a_drawdown_shrinks_the_risk_because_equity_shrank():
+    """Sizing off equity is not sizing off a fixed number — a smaller account risks less."""
+    full = size_position(5_000.0, 0.01, entry=10.0, sl=9.0, cash_available=5_000.0)
+    down = size_position(4_000.0, 0.01, entry=10.0, sl=9.0, cash_available=4_000.0)
+    assert down == pytest.approx(full * 0.8, rel=1e-6)
