@@ -2216,8 +2216,15 @@ INDECISION_BODY_FRAC = 0.35
 MOMENTUM_BODY_FRAC = 0.50
 
 
+# The rejection wick must be at least this much of the bar's range, and must dominate
+# the wick on the other side. A gravestone at a swept high is the canonical shape: price
+# pushed up, sellers slammed it back, and the upper wick is where that is recorded.
+REJECTION_WICK_FRAC = 0.40
+REJECTION_WICK_DOMINANCE = 1.5
+
+
 def _bar_geometry(bar):
-    """(body, rng, bullish) or None if the bar cannot be read."""
+    """(body, rng, bullish, upper_wick, lower_wick) or None if the bar cannot be read."""
     try:
         o, c = float(bar["open"]), float(bar["close"])
         h, l = float(bar["high"]), float(bar["low"])
@@ -2226,7 +2233,27 @@ def _bar_geometry(bar):
     rng = h - l
     if rng <= 0:
         return None
-    return abs(c - o), rng, c >= o
+    return abs(c - o), rng, c >= o, h - max(o, c), min(o, c) - l
+
+
+def is_rejection_bar(bar, is_long, indecision_frac=None):
+    """True when this bar is a small-bodied REJECTION of the level, the trade's way.
+
+    Direction matters and the first version of this gate ignored it. A hammer at a swept
+    high — tiny body, long LOWER wick — is buyers defending, and treating it as
+    indecision before a SHORT reads the bar backwards. What confirms a short is a bar
+    that pushed up and was pushed back: a gravestone, where the UPPER wick records the
+    rejection. A long mirrors it.
+    """
+    geo = _bar_geometry(bar)
+    if geo is None:
+        return False
+    body, rng, _bull, upper, lower = geo
+    if body / rng > (INDECISION_BODY_FRAC if indecision_frac is None else indecision_frac):
+        return False
+    reject, opposite = (lower, upper) if is_long else (upper, lower)
+    return (reject / rng >= REJECTION_WICK_FRAC
+            and reject >= REJECTION_WICK_DOMINANCE * opposite)
 
 
 def sweep_confirmation(candles, is_long, min_body_abs=0.0, lookback=4,
@@ -2256,16 +2283,16 @@ def sweep_confirmation(candles, is_long, min_body_abs=0.0, lookback=4,
     if last is None:
         return False, "the latest candle could not be read — standing aside"
 
-    body, rng, bullish = last
+    body, rng, bullish = last[0], last[1], last[2]
     if body / rng < momentum_frac or body < min_body_abs or bullish != bool(is_long):
         return False, ("no momentum candle closing the trade's way yet — the sweep has "
                        "not resolved into a move")
 
+    side = "lower" if is_long else "upper"
     for bar in reversed(window[:-1]):           # nearest first
-        geo = _bar_geometry(bar)
-        if geo is None:
-            continue
-        if geo[0] / geo[1] <= indecision_frac:
-            return True, "indecision at the sweep, then momentum the trade's way"
-    return False, ("no indecision candle before the push — the level was passed "
-                   "through, not rejected")
+        if is_rejection_bar(bar, is_long, indecision_frac):
+            return True, (f"a {side}-wick rejection at the sweep, then momentum the "
+                          f"trade's way")
+    return False, (f"no rejection candle before the push — wanted a small body with a "
+                   f"long {side} wick, showing the level was defended, not just passed "
+                   f"through")
