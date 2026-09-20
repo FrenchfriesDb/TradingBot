@@ -141,3 +141,60 @@ def test_an_estimate_that_raises_falls_back_to_the_chunk():
     c = _Clock(opens_after_checks=2)
     await_market_open(c.is_open, bad_estimate, c.sleep, max_chunk=45)
     assert c.slept == [45, 45]
+
+
+# ── the give-up cap must not be shorter than a weekend ───────────────────────
+#
+# Live, 2026-09-20 07:58:12:
+#
+#   WARNING [DebbieLaSMC] Gave up waiting for the market to open — it never reported open.
+#
+# It had started waiting Fri 19:37:34 and gave up 36.3 hours later: exactly
+# DEFAULT_MAX_WAIT. But a normal US weekend is Fri 13:00 close to Mon 06:30 open = 65.5
+# hours, so a 36-hour cap is guaranteed to fire every single Friday night. The safety
+# net meant for "this market never opens" was instead going off on the most ordinary
+# schedule there is.
+#
+# The bot recovered — lumibot re-enters the wait, and CPU showed it still polling — so
+# nothing was lost. But a false alarm that fires weekly trains you to ignore the one
+# that matters.
+#
+# The broker already knows when it expects to open. get_time_to_open() reported ~65h on
+# Friday night; the cap should respect that rather than a constant chosen without a
+# weekend in mind. The constant stays as a FLOOR for the case where the estimate is
+# missing or absurdly small.
+
+def test_a_normal_weekend_does_not_trip_the_give_up():
+    """Fri close -> Mon open is 65.5h. This is the case that actually fired."""
+    weekend = 65.5 * 3600
+    c = _Clock(opens_after_checks=10**6)      # never opens within the test
+    c.time_to_open = lambda: weekend
+    await_market_open(c.is_open, c.time_to_open, c.sleep, max_chunk=3600)
+    assert sum(c.slept) > 36 * 3600, (
+        f"gave up after {sum(c.slept)/3600:.1f}h — a weekend is 65.5h")
+
+
+def test_the_broker_estimate_raises_the_cap_but_an_explicit_one_still_wins():
+    c = _Clock(opens_after_checks=10**6)
+    c.time_to_open = lambda: 65.5 * 3600
+    await_market_open(c.is_open, c.time_to_open, c.sleep, max_chunk=3600, max_wait=300)
+    assert sum(c.slept) <= 300 + 3600, "an explicit max_wait is the caller's decision"
+
+
+def test_a_tiny_estimate_cannot_shrink_the_cap_below_the_floor():
+    """A broker reporting 5 minutes to open, then never opening, must still be waited
+    out for the full floor rather than abandoned in five minutes."""
+    from bot.market_clock import DEFAULT_MAX_WAIT
+    c = _Clock(opens_after_checks=10**6)
+    c.time_to_open = lambda: 300.0
+    await_market_open(c.is_open, c.time_to_open, c.sleep, max_chunk=3600)
+    assert sum(c.slept) >= DEFAULT_MAX_WAIT
+
+
+def test_it_still_gives_up_eventually_on_a_market_that_never_opens():
+    """The cap is raised, not removed — an unbounded silent loop is the thing it exists
+    to prevent."""
+    c = _Clock(opens_after_checks=10**6)
+    c.time_to_open = lambda: 65.5 * 3600
+    assert await_market_open(c.is_open, c.time_to_open, c.sleep, max_chunk=3600) is False
+    assert sum(c.slept) < 14 * 24 * 3600, "must not wait indefinitely"

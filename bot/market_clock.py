@@ -26,12 +26,21 @@ is_market_open() is the authority; an arithmetic prediction made hours ago is no
 """
 
 DEFAULT_MAX_CHUNK = 60.0        # re-check at least once a minute
-DEFAULT_MAX_WAIT = 36 * 3600.0  # a market that never opens must not pin us for ever
+# FLOOR for the give-up cap, not the cap itself. This was the cap, at 36h, and a normal
+# US weekend is Fri 13:00 close to Mon 06:30 open = 65.5h — so the safety net meant for
+# "this market never opens" fired every single Friday night. Live on 2026-09-20 07:58:12,
+# after waiting from Fri 19:37: "Gave up waiting for the market to open". The bot
+# recovered, but a false alarm that fires weekly trains you to ignore the real one.
+DEFAULT_MAX_WAIT = 36 * 3600.0
+# The broker knows when it expects to open; trust that over a constant, with headroom for
+# the estimate drifting. Bounded so a nonsense estimate cannot mean "wait for ever".
+ESTIMATE_HEADROOM = 1.25
+ABSOLUTE_MAX_WAIT = 8 * 24 * 3600.0
 _MIN_SLEEP = 1.0                # get_time_to_open() can return <= 0 while still closed
 
 
 def await_market_open(is_market_open, get_time_to_open, sleep,
-                      max_chunk=DEFAULT_MAX_CHUNK, max_wait=DEFAULT_MAX_WAIT):
+                      max_chunk=DEFAULT_MAX_CHUNK, max_wait=None):
     """Block until the market opens. Returns True if it opened, False if we gave up.
 
     Every argument is injected so this is testable without a broker or a real clock:
@@ -43,6 +52,16 @@ def await_market_open(is_market_open, get_time_to_open, sleep,
     Both callbacks are allowed to raise; a network blip during an overnight wait must
     not take the strategy down before the session it was waiting for.
     """
+    # Derive the give-up cap from the broker's own first estimate unless the caller
+    # named one: a weekend is 65.5h and no constant chosen in the abstract covers it.
+    if max_wait is None:
+        try:
+            first = float(get_time_to_open())
+        except Exception:
+            first = 0.0
+        max_wait = min(ABSOLUTE_MAX_WAIT,
+                       max(DEFAULT_MAX_WAIT, first * ESTIMATE_HEADROOM))
+
     waited = 0.0
     while waited < max_wait:
         try:
