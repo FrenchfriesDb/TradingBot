@@ -2,6 +2,7 @@ from lumibot.strategies import Strategy
 from lumibot.entities import Asset, Order
 from bot import indicators
 from bot import ai_model as _ai_model
+from bot.market_clock import call_with_deadline
 from finbert_utils import estimate_sentiment
 from config import (NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALPACA_API_SECRET,
                     BASE_URL as ALPACA_BASE_URL, GOOGLE_SHEET_URL)
@@ -67,6 +68,16 @@ MAX_TARGET_ATR_MULT    = float(os.getenv("MAX_TARGET_ATR_MULT", "1.5"))
 # Same gate and same defaults as binance_bot.py — see bot/indicators.sweep_within_reach.
 SWEEP_MAX_ATR_MULT     = float(os.getenv("SWEEP_MAX_ATR_MULT", "2.5"))
 SWEEP_MAX_PCT          = float(os.getenv("SWEEP_MAX_PCT", "0.02"))
+# lumibot has no native 4h data, so it satisfies "N bars of 4 hours" by pulling N*240
+# ONE-MINUTE bars and resampling. At 200 bars that is 48,000 minute-bars per symbol per
+# iteration — and the longest lookback anything actually uses on that frame is 50
+# (find_support_resistance); everything else is 14-20. 60 leaves headroom and cuts the
+# fetch to 14,400, which is also a much smaller window for a sleeping Mac to kill.
+HTF_BARS               = int(os.getenv("HTF_BARS", "60"))
+# No call in a trading loop may block indefinitely. On 2026-09-21 an NVDA fetch stalled
+# 8h16m on a socket the Mac killed by sleeping one second after the request, and the bot
+# saw 3 of its 8 symbols all session. See bot.market_clock.call_with_deadline.
+DATA_FETCH_TIMEOUT     = float(os.getenv("DATA_FETCH_TIMEOUT", "45"))
 
 MIN_STOP_ATR_MULT = 1.5
 MIN_TP_RR = 2.0
@@ -852,7 +863,9 @@ class DebbieLaSMC(Strategy):
             if not chart_path:
                 # Fallback: self-rendered lightweight-charts image from Alpaca bars
                 asset = self._make_asset(symbol)
-                bars = self.get_historical_prices(asset, 200, self.timeframe_ltf)
+                bars, _o = call_with_deadline(
+                    lambda: self.get_historical_prices(asset, 200, self.timeframe_ltf),
+                    DATA_FETCH_TIMEOUT)
                 df = bars.pandas_df if bars is not None else None
                 chart_path = render_trade_chart(df, symbol, side,
                                                   entry_price, sl, tp, PAPER_LEVERAGE,
@@ -984,7 +997,9 @@ class DebbieLaSMC(Strategy):
         """Daily EMA20 vs EMA50 alignment — must agree with the 4H BOS or we skip."""
         asset = self._make_asset(symbol)
         try:
-            bars = self.get_historical_prices(asset, 100, "1 day")
+            bars, _o = call_with_deadline(
+                lambda: self.get_historical_prices(asset, 100, "1 day"),
+                DATA_FETCH_TIMEOUT)
             if bars is None:
                 return None
             return indicators.get_daily_trend(bars.pandas_df)
@@ -1032,8 +1047,23 @@ class DebbieLaSMC(Strategy):
     def get_htf_bias(self, symbol):
         asset = self._make_asset(symbol)
         try:
-            bars    = self.get_historical_prices(asset, 200, self.timeframe_htf)
-            bars_1h = self.get_historical_prices(asset, 200, "1 hour")
+            # Deadlined: a stalled fetch costs this symbol, not the session.
+            bars, _o1 = call_with_deadline(
+                lambda: self.get_historical_prices(asset, HTF_BARS, self.timeframe_htf),
+                DATA_FETCH_TIMEOUT)
+            bars_1h, _o2 = call_with_deadline(
+                lambda: self.get_historical_prices(asset, HTF_BARS, "1 hour"),
+                DATA_FETCH_TIMEOUT)
+            if _o1 != "ok" or _o2 != "ok":
+                # Say which of the two failed and what that actually costs: losing the
+                # 4H frame skips the symbol, losing only the 1H drops the faster BOS
+                # signal and the ATR noise floor but leaves the 4H read intact.
+                _cost = ("skipping this symbol this iteration" if _o1 != "ok"
+                         else "continuing on 4H alone — no 1H BOS, no 1H ATR floor")
+                self.log_message(
+                    f"[{symbol}] ⏱ {self.timeframe_htf}={_o1} 1h={_o2} after "
+                    f"{DATA_FETCH_TIMEOUT:g}s — {_cost}",
+                    color="yellow")
             if bars is None:
                 return None
             df    = bars.pandas_df
@@ -1115,7 +1145,9 @@ class DebbieLaSMC(Strategy):
     def get_ltf_technicals(self, symbol):
         asset = self._make_asset(symbol)
         try:
-            bars = self.get_historical_prices(asset, 50, self.timeframe_ltf)
+            bars, _o = call_with_deadline(
+                lambda: self.get_historical_prices(asset, 50, self.timeframe_ltf),
+                DATA_FETCH_TIMEOUT)
             if bars is None:
                 return None
             df = bars.pandas_df

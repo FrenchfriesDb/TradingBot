@@ -86,3 +86,34 @@ def await_market_open(is_market_open, get_time_to_open, sleep,
         return bool(is_market_open())
     except Exception:
         return False
+
+
+def call_with_deadline(fn, timeout, default=None):
+    """(value, outcome) — run fn(), abandoning it after `timeout` seconds.
+
+    outcome is "ok", "timeout" or "error". A falsy result is still "ok": "no bars" is a
+    legitimate answer from a data fetch, not a failure.
+
+    WHY THIS EXISTS. On 2026-09-21 the stock bot asked lumibot for NVDA's history at
+    06:44:11, the Mac slept one second later, the TCP connection died with it, and
+    get_historical_prices() — which takes no timeout — blocked until 15:00, two hours
+    after the close. It saw 3 of 8 symbols all session.
+
+    WHAT IT CANNOT DO. Python cannot kill a thread stuck on a dead socket, so this
+    ABANDONS the call rather than cancelling it (shutdown(wait=False), the same pattern
+    the AI confirmation path already uses). The leaked thread finishes or it does not;
+    either way the loop loses one symbol instead of a session.
+    """
+    import concurrent.futures
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        value = future.result(timeout=timeout if timeout and timeout > 0 else None)
+        return value, "ok"
+    except concurrent.futures.TimeoutError:
+        return default, "timeout"
+    except Exception:
+        return default, "error"
+    finally:
+        # Never wait: the whole point is not to block on a thread that may never return.
+        executor.shutdown(wait=False)
