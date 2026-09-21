@@ -2236,6 +2236,21 @@ class DebbieLaSMC(Strategy):
         if self._sheet_log_date == today:
             return
         balance = self.get_portfolio_value()
+        # An unreadable balance is not a balance. During a DNS outage on 2026-09-21
+        # get_portfolio_value() returned None and the subtraction below raised
+        # TypeError: unsupported operand type(s) for -: 'NoneType' and 'float',
+        # taking down the whole trading iteration. Worse than the crash was the near
+        # miss: had _daily_open_balance also been None the guard would have scored the
+        # day 0.0%, written None to the Macro tab and stamped _sheet_log_date — burning
+        # the one snapshot this day gets on a number the broker never gave us.
+        # There is no rush; the next iteration writes it. Skip, don't guess.
+        if isinstance(balance, bool) or not isinstance(balance, (int, float)) \
+                or balance != balance:
+            self.log_message(
+                "[SHEETS] Portfolio value unreadable — skipping today's Macro snapshot "
+                "this iteration (will retry; the day stays unlogged rather than wrong).",
+                color="yellow")
+            return
         if self._daily_open_balance is None:
             self._daily_open_balance = balance   # first iteration ever — nothing to compare yet
         spy_price = self.get_last_price("SPY")
@@ -2254,11 +2269,12 @@ class DebbieLaSMC(Strategy):
         # Correct for an equity CURVE: the account genuinely held that value on those
         # days, so a flat Sat/Sun point is the truth, not noise. Do not "optimise" this
         # into skipping non-trading days.
+        _carry = self._daily_open_balance if self._daily_open_balance is not None else balance
         for _gap_day in missing_snapshot_dates(self._sheet_log_date, today):
             self.log_message(f"[SHEETS] Backfilling missed Stock Macro row for {_gap_day} "
-                             f"@ ${self._daily_open_balance:,.2f}", color="yellow")
+                             f"@ ${_carry:,.2f}", color="yellow")
             log_daily_snapshot(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Macro",
-                                _gap_day.isoformat(), self._daily_open_balance, 0.0,
+                                _gap_day.isoformat(), _carry, 0.0,
                                 spy_price or 0.0, 0.0)
         log_daily_snapshot(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Macro",
                             today.isoformat(), balance, daily_return_pct,
