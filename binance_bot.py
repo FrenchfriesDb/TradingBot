@@ -860,6 +860,12 @@ def load_crypto_state(paper: "PaperTrader", states: dict, symbols: list, daily_s
             st.bars_in_entry_wait = saved.get("bars_in_entry_wait", 0)
             st.amd_phase          = saved.get("amd_phase")
             st.amd_zone_type      = saved.get("amd_zone_type")
+            # Restored, not recomputed: unlike ote_*/disp_low/inducement — which the
+            # per-cycle analysis rebuilds from fresh candles every loop — fvg_tf is written
+            # once, at the moment the zone is armed. Saving it without reading it back
+            # meant every restart silently dropped the timeframe off an already-armed
+            # zone's chart label, which is the state the restart of 2026-09-21 landed in.
+            st.fvg_tf             = saved.get("fvg_tf")
             st.partial_taken      = saved.get("partial_taken", False)
             st.banked_pnl         = saved.get("banked_pnl", 0.0)
             st.breakeven_moved    = saved.get("breakeven_moved", False)
@@ -2049,6 +2055,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     state.sweep_low          = sweep_wick_htf
                     state.amd_phase          = 'manipulation_up'
                     state.amd_zone_type      = sup_type
+                    state.fvg_tf             = HTF_TIMEFRAME   # found in df_htf_closed
                     state.ranging_mode       = False
                     state.state              = "ENTRY_WAIT"
                     state.arm_zone(sup_lo, sup_hi)
@@ -2071,6 +2078,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     state.sweep_low          = sweep_high_wick_htf
                     state.amd_phase          = 'manipulation_down'
                     state.amd_zone_type      = dem_type
+                    state.fvg_tf             = HTF_TIMEFRAME   # found in df_htf_closed
                     state.ranging_mode       = False
                     state.state              = "ENTRY_WAIT"
                     state.arm_zone(dem_lo, dem_hi)
@@ -2098,6 +2106,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                                                           DISPLACEMENT_MIN_PCT, MIN_FVG_PCT))
             if disp_found and disp_dir == direction:
                 state.amd_zone_type      = "choch_fvg"     # displacement gap = the CHoCH zone
+                state.fvg_tf             = HTF_TIMEFRAME   # this one is the HTF gap
                 state.state              = "ENTRY_WAIT"
                 state.arm_zone(disp_lo, disp_hi)
                 print(f"[{base}] STEP 1+2: {bos_tf} BOS ({direction}) + displacement FVG "
@@ -2125,6 +2134,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     state.bias               = "BEARISH"
                     state.amd_phase          = "trend_follow"
                     state.amd_zone_type      = sup_type
+                    state.fvg_tf             = HTF_TIMEFRAME   # found in df_htf_closed
                     state.ranging_mode       = True   # half size — no fresh BOS/sweep
                     state.state              = "ENTRY_WAIT"
                     state.arm_zone(sup_lo, sup_hi)
@@ -2139,6 +2149,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     state.bias               = "BULLISH"
                     state.amd_phase          = "trend_follow"
                     state.amd_zone_type      = dem_type
+                    state.fvg_tf             = HTF_TIMEFRAME   # found in df_htf_closed
                     state.ranging_mode       = True
                     state.state              = "ENTRY_WAIT"
                     state.arm_zone(dem_lo, dem_hi)
@@ -2301,6 +2312,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     state.bias           = "BULLISH"
                     state.amd_phase      = "wedge_breakout"
                     state.amd_zone_type  = "wedge_retest"
+                    state.fvg_tf         = LTF_TIMEFRAME   # detect_falling_wedge(df_ltf)
                     # Entry zone: from the last ascending low up to just above broken resistance.
                     # fvg_low becomes the SL reference (structural stop just below last higher low).
                     state.fvg_low        = round(_wsl, 8)
