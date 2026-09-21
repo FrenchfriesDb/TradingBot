@@ -2374,3 +2374,22 @@ def find_swing_leg(df, lookback=60, swing_window=3):
     if not starts:
         return None
     return last_low[1], starts[-1][1], False
+
+
+def zone_source_tf(htf_found, ltf_found, htf_name, ltf_name):
+    """Which timeframe an armed zone came from, or None if neither had one.
+
+    Mirrors the caller's own selection (`htf_value if is_htf else ltf_value`), so the
+    label can never disagree with the data it describes. That mattered: BTC's armed zone
+    of 82087-84753 was a REAL 6-hour FVG — c1.high 82087.11 to c3.low 84753.25, exact —
+    drawn over a 5-minute chart where no such gap exists. Correct number, wrong canvas,
+    and no way for anyone looking at it to tell.
+
+    Names are passed in rather than hardcoded because the log already drifted once:
+    tf_tag said "4H" while the bot was fetching "6h".
+    """
+    if htf_found:
+        return htf_name
+    if ltf_found:
+        return ltf_name
+    return None

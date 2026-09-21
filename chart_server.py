@@ -386,12 +386,18 @@ function drawAnalysis(sm){
     const col  = bearish ? '#ff7043' : '#66bb6a';      // supply=orange, demand=green
     const kind = sm.amd_phase ? 'AMD' : 'FVG';
     const side = bearish ? 'SHORT' : 'LONG';
+    // NAME THE CHART THE LEVEL CAME FROM. These candles are 5m, but the bot prefers an
+    // HTF gap when it finds one — BTC's armed 82087-84753 was a real SIX-HOUR FVG
+    // (c1.high 82087.11 -> c3.low 84753.25), drawn here over 5m candles that contain no
+    // such structure. Correct number, wrong canvas, and nothing on screen said so.
+    const ztf = sm.fvg_tf ? ` ${sm.fvg_tf}` : '';
+    const off = (sm.fvg_tf && sm.ltf && sm.fvg_tf !== sm.ltf) ? ' ⓘ' : '';
     aLines.push(candles.createPriceLine({price:sm.fvg_high, color:col, lineWidth:1,
       lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true,
-      title:`${kind} zone ▲ ${side}`}));
+      title:`${kind}${ztf} zone ▲ ${side}${off}`}));
     aLines.push(candles.createPriceLine({price:sm.fvg_low, color:col, lineWidth:1,
       lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true,
-      title:`${kind} zone ▼`}));
+      title:`${kind}${ztf} zone ▼${off}`}));
   }
   if(sm.sweep_low){
     aLines.push(candles.createPriceLine({price:sm.sweep_low, color:'#ab47bc', lineWidth:1,
@@ -400,10 +406,10 @@ function drawAnalysis(sm){
   // EQL / EQH liquidity pools (present only if the bot wrote them to state)
   if(sm.eql_level) aLines.push(candles.createPriceLine({price:sm.eql_level, color:'#42a5f5',
     lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true,
-    title:`EQL ${sm.eql_touch||''}`.trim()}));
+    title:`EQL ${sm.ltf||''} ${sm.eql_touch||''}`.trim()}));
   if(sm.eqh_level) aLines.push(candles.createPriceLine({price:sm.eqh_level, color:'#42a5f5',
     lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true,
-    title:`EQH ${sm.eqh_touch||''}`.trim()}));
+    title:`EQH ${sm.ltf||''} ${sm.eqh_touch||''}`.trim()}));
 
   // ── SMC context markings — what the bot is structurally "seeing" right now ─────
   // Distinct colors so they're separable at a glance from the zone/pool lines above:
@@ -433,10 +439,10 @@ function drawAnalysis(sm){
     const upLeg = sm.ote_is_up !== false;
     aLines.push(candles.createPriceLine({price:sm.ote_high, color:'#ba68c8', lineWidth:1,
       lineStyle:LightweightCharts.LineStyle.LargeDashed, axisLabelVisible:true,
-      title:upLeg ? 'OTE 0.618' : 'OTE 0.786'}));
+      title:(upLeg ? 'OTE 0.618' : 'OTE 0.786') + (sm.ltf ? ' '+sm.ltf : '')}));
     aLines.push(candles.createPriceLine({price:sm.ote_low, color:'#ba68c8', lineWidth:1,
       lineStyle:LightweightCharts.LineStyle.LargeDashed, axisLabelVisible:true,
-      title:upLeg ? 'OTE 0.786' : 'OTE 0.618'}));
+      title:(upLeg ? 'OTE 0.786' : 'OTE 0.618') + (sm.ltf ? ' '+sm.ltf : '')}));
   }
 
   // Inducement — the minor pool likely swept BEFORE price delivers into our zone

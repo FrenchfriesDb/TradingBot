@@ -277,6 +277,10 @@ MIN_FVG_PCT            = float(os.getenv("MIN_FVG_PCT", "0.0015"))
 # inside the span of one. It cannot resolve — it just prints a flattering R:R on the way
 # in and exits on the timer. POL: target 13.3% away vs a 2.755% 6H ATR, reported 1:9.4.
 MAX_TARGET_ATR_MULT    = float(os.getenv("MAX_TARGET_ATR_MULT", "1.5"))
+# The timeframes, named once. tf_tag used to say "4H" while line ~1717 fetched "6h", so
+# every log line and chart label describing an HTF level named the wrong chart.
+HTF_TIMEFRAME          = os.getenv("HTF_TIMEFRAME", "6h")
+LTF_TIMEFRAME          = os.getenv("LTF_TIMEFRAME", "5m")
 # How far a swept level may sit from price and still be treated as THIS move's
 # inducement. Volatility-relative, with the percentage as a floor so a dead ATR read
 # tightens the gate rather than opening it. 2.5x/2% refuses the 2026-09-17 entries
@@ -735,6 +739,8 @@ def save_crypto_state(paper: "PaperTrader", states: dict, symbols: list, prices:
                 "ote_low":            st.ote_low,
                 "ote_high":           st.ote_high,
                 "ote_is_up":          st.ote_is_up,
+                "fvg_tf":             st.fvg_tf,
+                "ltf":                LTF_TIMEFRAME,
                 "inducement":         st.inducement,
                 "sniper_armed":       st.sniper_armed,
                 "sniper_sl":          st.sniper_sl,
@@ -959,6 +965,7 @@ class SymbolState:
         self.disp_high = None; self.disp_low = None     # latest displacement candle's range
         self.ote_low = None; self.ote_high = None       # fib Optimal Trade Entry band
         self.ote_is_up = None                           # leg direction: which end is 0.618
+        self.fvg_tf = None                              # chart the armed zone came from
         self.inducement = None   # minor liquidity swept before the zone tap
         self.ai_reject_count = 0  # consecutive AI rejections; reset to IDLE at threshold
         self.is_chase = False     # True when the current ENTRY_WAIT is a breakout-chase, not a retest
@@ -1714,7 +1721,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             df_htf    = ohlcv_to_df(fetch_ohlcv_retry(htf_exchange, bybit_sym, "4h", 200))
             df_htf_1h = ohlcv_to_df(fetch_ohlcv_retry(htf_exchange, bybit_sym, "1h", 200))
         else:
-            df_htf    = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, "6h", 200))
+            df_htf    = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, HTF_TIMEFRAME, 200))
             df_htf_1h = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, "1h", 200))
     except Exception as e:
         # type(e).__name__ matters more than the message here: ccxt stringifies a
@@ -1794,9 +1801,16 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     is_fvg_bull    = is_fvg_bull_htf or is_fvg_bull_ltf
     fvg_bot        = fvg_bot_htf  if is_fvg_bull_htf else fvg_bot_ltf
     fvg_top        = fvg_top_htf  if is_fvg_bull_htf else fvg_top_ltf
+    # Which chart each zone came from, so the label can name it. A 6h FVG drawn over a
+    # 5m chart has no visible 3-candle structure and reads as invented — see
+    # tests/test_zone_source_timeframe.py.
+    fvg_bull_tf    = indicators.zone_source_tf(is_fvg_bull_htf, is_fvg_bull_ltf,
+                                               HTF_TIMEFRAME, LTF_TIMEFRAME)
     is_fvg_bear    = is_fvg_bear_htf or is_fvg_bear_ltf
     fvg_bear_bot   = fvg_bear_bot_htf if is_fvg_bear_htf else fvg_bear_bot_ltf
     fvg_bear_top   = fvg_bear_top_htf if is_fvg_bear_htf else fvg_bear_top_ltf
+    fvg_bear_tf    = indicators.zone_source_tf(is_fvg_bear_htf, is_fvg_bear_ltf,
+                                               HTF_TIMEFRAME, LTF_TIMEFRAME)
 
     # Equal-lows / equal-highs liquidity pools — the wick shelves where stops cluster.
     # LTF (5m, ~10h back to match the live chart); HTF = macro pools the sweep logic hunts.
@@ -1863,7 +1877,8 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     except Exception as _e:
         print(f"[{base}] (chart overlay calc skipped: {_e})")
 
-    tf_tag = "4H" if (is_sweep_htf or is_fvg_bull_htf or is_fvg_bear_htf) else "5m"
+    tf_tag = (HTF_TIMEFRAME if (is_sweep_htf or is_fvg_bull_htf or is_fvg_bear_htf)
+              else LTF_TIMEFRAME)
     zone_tag = ""
     if state.state == "ENTRY_WAIT" and state.fvg_low and state.fvg_high:
         tag = "AMD" if state.amd_phase else "FVG"
@@ -2207,6 +2222,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
 
         if disp_found and disp_dir == want:
             state.amd_zone_type = "choch_fvg"      # mark: FVG == CHoCH → retest-rebounce entry
+            state.fvg_tf = LTF_TIMEFRAME           # displacement gaps are detected on the LTF
             state.state         = "ENTRY_WAIT"
             state.arm_zone(disp_lo, disp_hi)
             print(f"[{base}] STEP 2: 🎯 CHoCH FVG (displacement) locked  "
@@ -2214,6 +2230,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                   f"sweep=${state.sweep_low:,.4f} — waiting for retest/refill")
 
         elif state.bias == "BULLISH" and is_fvg_bull:
+            state.fvg_tf = fvg_bull_tf
             # A generic gap, NOT the displacement that broke structure — say so.
             # Leaving this unset left amd_zone_type None, and None took the one
             # branch of sniper_entry_allowed() that never checked displacement.
@@ -2225,6 +2242,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                   f"sweep=${state.sweep_low:,.4f}")
 
         elif state.bias == "BEARISH" and is_fvg_bear:
+            state.fvg_tf = fvg_bear_tf
             # A generic gap, NOT the displacement that broke structure — say so.
             # Leaving this unset left amd_zone_type None, and None took the one
             # branch of sniper_entry_allowed() that never checked displacement.
