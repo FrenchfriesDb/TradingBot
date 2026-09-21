@@ -77,7 +77,18 @@ HTF_BARS               = int(os.getenv("HTF_BARS", "60"))
 # No call in a trading loop may block indefinitely. On 2026-09-21 an NVDA fetch stalled
 # 8h16m on a socket the Mac killed by sleeping one second after the request, and the bot
 # saw 3 of its 8 symbols all session. See bot.market_clock.call_with_deadline.
-DATA_FETCH_TIMEOUT     = float(os.getenv("DATA_FETCH_TIMEOUT", "45"))
+#
+# The number is set from that same morning's measured 4H fetches (200 bars):
+#     AAPL  06:43:01.4 -> 06:43:49.7   48.4s   <- FIRST of the day, cold
+#     QQQ                                5.7s
+#     SPY                                9.1s
+#     TSLA / GOOGL / META / MSFT    3.9 - 7.1s
+# The first fetch of the session is a 5-10x outlier — connection and auth setup, not
+# payload — so the cut to HTF_BARS=60 does NOT remove it. An earlier 45s value here
+# would have timed out AAPL every single morning, and AAPL is the symbol that armed a
+# trend zone that day. 120s is ~2.5x the worst observed cold fetch and still bounds a
+# fully-stalled iteration (8 symbols x 2 HTF fetches) to ~32 minutes instead of 8h16m.
+DATA_FETCH_TIMEOUT     = float(os.getenv("DATA_FETCH_TIMEOUT", "120"))
 
 MIN_STOP_ATR_MULT = 1.5
 MIN_TP_RR = 2.0
