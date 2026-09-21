@@ -2296,3 +2296,81 @@ def sweep_confirmation(candles, is_long, min_body_abs=0.0, lookback=4,
     return False, (f"no rejection candle before the push — wanted a small body with a "
                    f"long {side} wick, showing the level was defended, not just passed "
                    f"through")
+
+
+# ── Fibonacci: the real OTE, of a real leg, in the right direction ────────────
+# calculate_fib_levels() above returns 38.2%-61.8% and calls it the Optimal Trade Entry.
+# It is not: the OTE in ICT/SMC is 61.8%-78.6%. Measured on ADA's live 60-bar swing the
+# two bands did not even overlap — drawn 0.22951-0.23130 against a true 0.22823-0.22951.
+#
+# Two more defects travelled with it. binance_bot anchored the fib to
+# df_ltf['low'].tail(60).min() / ['high'].tail(60).max() — the extremes of an arbitrary
+# 5-hour window, not an impulse leg — and calculate_fib_levels always measured DOWN from
+# the high, with no way to express a retracement of a DOWN leg.
+#
+# The direction bug stayed hidden because 38.2-61.8 is symmetric: [hi-0.618d, hi-0.382d]
+# from the high equals [lo+0.382d, lo+0.618d] from the low. The real OTE is not, so
+# correcting the band alone would have switched a latent bug on.
+OTE_LO_PCT = 0.618
+OTE_HI_PCT = 0.786
+
+
+def optimal_trade_entry(leg_low, leg_high, is_up_leg, lo_pct=OTE_LO_PCT, hi_pct=OTE_HI_PCT):
+    """(ote_low, ote_high) — the 61.8-78.6% retracement of a leg, or None.
+
+    An UP leg retraces DOWN from its high; a DOWN leg retraces UP from its low. These are
+    different price bands and which one applies depends entirely on which end came last.
+    """
+    try:
+        lo, hi = float(leg_low), float(leg_high)
+    except (TypeError, ValueError):
+        return None
+    if hi <= lo:
+        return None
+    span = hi - lo
+    if is_up_leg:                       # bought the impulse, wait for the pullback DOWN
+        band = (hi - span * hi_pct, hi - span * lo_pct)
+    else:                               # sold the impulse, wait for the pullback UP
+        band = (lo + span * lo_pct, lo + span * hi_pct)
+    return (min(band), max(band))
+
+
+def find_swing_leg(df, lookback=60, swing_window=3):
+    """(leg_low, leg_high, is_up_leg) for the most recent impulse leg, or None.
+
+    The leg ENDS on the most recent swing pivot and STARTS on the most recent opposite
+    pivot before it. A lone pivot is not a leg, and neither is the min/max of a window —
+    that was the old anchor, and it slid around as the window rolled.
+    """
+    if df is None or not hasattr(df, "tail"):
+        return None
+    try:
+        recent = df.tail(lookback).reset_index(drop=True)
+    except Exception:
+        return None
+    n = len(recent)
+    if n < (2 * swing_window + 1):
+        return None
+
+    highs, lows = [], []
+    for i in range(swing_window, n - swing_window):
+        window = range(i - swing_window, i + swing_window + 1)
+        hv = float(recent.iloc[i]["high"])
+        lv = float(recent.iloc[i]["low"])
+        if all(hv > float(recent.iloc[j]["high"]) for j in window if j != i):
+            highs.append((i, hv))
+        if all(lv < float(recent.iloc[j]["low"]) for j in window if j != i):
+            lows.append((i, lv))
+    if not highs or not lows:
+        return None
+
+    last_high, last_low = highs[-1], lows[-1]
+    if last_high[0] > last_low[0]:          # a high came last -> the leg ran UP into it
+        starts = [p for p in lows if p[0] < last_high[0]]
+        if not starts:
+            return None
+        return starts[-1][1], last_high[1], True
+    starts = [p for p in highs if p[0] < last_low[0]]
+    if not starts:
+        return None
+    return last_low[1], starts[-1][1], False

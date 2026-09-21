@@ -425,12 +425,18 @@ function drawAnalysis(sm){
       lineStyle:LightweightCharts.LineStyle.Dotted, axisLabelVisible:true, title:'DISP ▼'}));
   }
 
-  // Fib Optimal Trade Entry band (38.2%-61.8% of the recent swing)
+  // Fib Optimal Trade Entry band — 61.8%-78.6% of the most recent impulse leg.
+  // WHICH END is the 0.618 depends on the leg: an UP leg retraces DOWN from its high so
+  // ote_high is the shallow end, a DOWN leg retraces UP so ote_low is. A fixed label
+  // would be wrong half the time — the same direction-blindness the maths just lost.
   if(sm.ote_high && sm.ote_low){
+    const upLeg = sm.ote_is_up !== false;
     aLines.push(candles.createPriceLine({price:sm.ote_high, color:'#ba68c8', lineWidth:1,
-      lineStyle:LightweightCharts.LineStyle.LargeDashed, axisLabelVisible:true, title:'OTE 0.382'}));
+      lineStyle:LightweightCharts.LineStyle.LargeDashed, axisLabelVisible:true,
+      title:upLeg ? 'OTE 0.618' : 'OTE 0.786'}));
     aLines.push(candles.createPriceLine({price:sm.ote_low, color:'#ba68c8', lineWidth:1,
-      lineStyle:LightweightCharts.LineStyle.LargeDashed, axisLabelVisible:true, title:'OTE 0.618'}));
+      lineStyle:LightweightCharts.LineStyle.LargeDashed, axisLabelVisible:true,
+      title:upLeg ? 'OTE 0.786' : 'OTE 0.618'}));
   }
 
   // Inducement — the minor pool likely swept BEFORE price delivers into our zone

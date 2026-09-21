@@ -734,6 +734,7 @@ def save_crypto_state(paper: "PaperTrader", states: dict, symbols: list, prices:
                 "disp_low":           st.disp_low,
                 "ote_low":            st.ote_low,
                 "ote_high":           st.ote_high,
+                "ote_is_up":          st.ote_is_up,
                 "inducement":         st.inducement,
                 "sniper_armed":       st.sniper_armed,
                 "sniper_sl":          st.sniper_sl,
@@ -957,6 +958,7 @@ class SymbolState:
         self.choch_level = None; self.choch_dir = None  # 15m change-of-character
         self.disp_high = None; self.disp_low = None     # latest displacement candle's range
         self.ote_low = None; self.ote_high = None       # fib Optimal Trade Entry band
+        self.ote_is_up = None                           # leg direction: which end is 0.618
         self.inducement = None   # minor liquidity swept before the zone tap
         self.ai_reject_count = 0  # consecutive AI rejections; reset to IDLE at threshold
         self.is_chase = False     # True when the current ENTRY_WAIT is a breakout-chase, not a retest
@@ -1838,14 +1840,20 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         state.disp_low  = float(_dsp_lo) if _dsp_found else None
         state.disp_high = float(_dsp_hi) if _dsp_found else None
 
-        # Fib OTE band off the recent 5m swing range
-        _sw_lo = float(df_ltf['low'].tail(60).min())
-        _sw_hi = float(df_ltf['high'].tail(60).max())
-        if _sw_hi > _sw_lo:
-            _, _ote = indicators.calculate_fib_levels(_sw_lo, _sw_hi)
-            state.ote_low, state.ote_high = float(_ote['lower']), float(_ote['upper'])
+        # Fib OTE — the 61.8-78.6% retracement of the most recent IMPULSE LEG.
+        # This used to take df_ltf['low'].tail(60).min() / ['high'].tail(60).max(): the
+        # extremes of an arbitrary 5-hour window, which slide as the window rolls and are
+        # not a leg at all. It also used calculate_fib_levels()' 38.2-61.8 band, which is
+        # not the OTE — on ADA's live swing the two bands did not even overlap — and
+        # always measured DOWN from the high regardless of which end came last.
+        _leg = indicators.find_swing_leg(df_ltf)
+        _ote = indicators.optimal_trade_entry(*_leg) if _leg else None
+        if _ote:
+            state.ote_low, state.ote_high = _ote
+            state.ote_is_up = _leg[2]      # the chart needs it: on an UP leg ote_high is
+                                           # the 0.618 end, on a DOWN leg ote_low is.
         else:
-            state.ote_low = state.ote_high = None
+            state.ote_low = state.ote_high = state.ote_is_up = None
 
         # Inducement — only meaningful while a zone is armed and waiting for its tap
         state.inducement = (indicators.detect_inducement(
