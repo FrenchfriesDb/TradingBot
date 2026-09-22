@@ -280,6 +280,9 @@ MAX_TARGET_ATR_MULT    = float(os.getenv("MAX_TARGET_ATR_MULT", "1.5"))
 # The timeframes, named once. tf_tag used to say "4H" while line ~1717 fetched "6h", so
 # every log line and chart label describing an HTF level named the wrong chart.
 HTF_TIMEFRAME          = os.getenv("HTF_TIMEFRAME", "6h")
+# Bybit's granularity, named once for the same reason: the startup banner announcing it
+# and the fetch requesting it must never be able to disagree.
+BYBIT_HTF_TIMEFRAME    = os.getenv("BYBIT_HTF_TIMEFRAME", "4h")
 LTF_TIMEFRAME          = os.getenv("LTF_TIMEFRAME", "5m")
 # How far a swept level may sit from price and still be treated as THIS move's
 # inducement. Volatility-relative, with the percentage as a floor so a dead ATR read
@@ -601,10 +604,11 @@ def connect_htf_exchange():
     try:
         ex = ccxt.bybit({"enableRateLimit": True, "timeout": 4000})
         ex.load_markets()
-        print("HTF data:  Bybit public (4H candles)")
+        print(f"HTF data:  Bybit public ({BYBIT_HTF_TIMEFRAME.upper()} candles)")
         return ex
     except Exception as e:
-        print(f"HTF data:  Bybit unavailable ({e}) — falling back to 6H on main exchange")
+        print(f"HTF data:  Bybit unavailable ({e}) — "
+              f"falling back to {HTF_TIMEFRAME.upper()} on main exchange")
         return None
 
 
@@ -1568,7 +1572,9 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
     from bot import ai_model as _ai
     _no_opinion = _ai.is_no_opinion(ai_reason)
     icon    = ("⚠️ NO OPINION" if _no_opinion else "✅ YES") if confirm else "❌ NO"
-    _tp_src = "@4H pool" if (pool_tp and abs(tp_planned - pool_tp) < 1e-9) else f"{MAX_AI_RR:.0f}R cap"
+    # The pool is found in df_htf, so it is named after df_htf's real frame.
+    _tp_src = (f"@{htf_name.upper()} pool" if (pool_tp and abs(tp_planned - pool_tp) < 1e-9)
+               else f"{MAX_AI_RR:.0f}R cap")
     print(f"[{base}] 🤖 AI Bot Approval: {icon}  Structural R:R=1:{rr_actual:.1f} [{_tp_src}] "
           f"(AI suggested 1:{_ai_rr:.1f})  {ai_reason[:140]}")
 
@@ -1734,7 +1740,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         # from this one value rather than re-stating a timeframe from memory.
         if htf_exchange:
             bybit_sym = symbol.replace("/USD", "/USDT")
-            htf_name  = "4h"
+            htf_name  = BYBIT_HTF_TIMEFRAME
             df_htf    = ohlcv_to_df(fetch_ohlcv_retry(htf_exchange, bybit_sym, htf_name, 200))
             df_htf_1h = ohlcv_to_df(fetch_ohlcv_retry(htf_exchange, bybit_sym, "1h", 200))
         else:
@@ -1760,6 +1766,10 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     # the fill only happened against the stale snapshot. Closed bars keep the zone stable
     # between recomputes, so what was armed still means what it meant.
     df_htf_closed = indicators.drop_forming_candle(df_htf)
+    # Log/label form of the frame these candles actually are. Every "4H ..." string
+    # below used to be a literal, which is how the bot spent weeks announcing
+    # "4H low-sweep" over 6H bars.
+    HTF = htf_name.upper()
 
     price = float(df_ltf["close"].iloc[-1])
     held  = paper.get_position(symbol)
@@ -1779,12 +1789,12 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     daily_trend = indicators.get_daily_trend(df_daily)
 
     # Dual HTF BOS: 4H = full conviction, 1H = faster signal at half size
-    is_bos_4h, direction_4h, _ = indicators.detect_displacement_bos(df_htf,    lookback=15)
+    is_bos_htf, direction_htf, _ = indicators.detect_displacement_bos(df_htf,    lookback=15)
     is_bos_1h, direction_1h, _ = indicators.detect_displacement_bos(df_htf_1h, lookback=15)
-    is_bos    = is_bos_4h or is_bos_1h
-    direction = direction_4h if is_bos_4h else direction_1h
-    bos_tf    = "4H" if is_bos_4h else ("1H" if is_bos_1h else "—")
-    is_1h_only = is_bos_1h and not is_bos_4h   # half size when only 1H confirms
+    is_bos    = is_bos_htf or is_bos_1h
+    direction = direction_htf if is_bos_htf else direction_1h
+    bos_tf    = HTF if is_bos_htf else ("1H" if is_bos_1h else "—")
+    is_1h_only = is_bos_1h and not is_bos_htf   # half size when only 1H confirms
 
     # Candle pattern on the latest 5m bar
     candle_type = indicators.classify_candle(df_ltf.iloc[-1], df_ltf.iloc[-2])
@@ -1852,7 +1862,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     # Wrapped so a detector hiccup can never interrupt trading.
     try:
         # BOS: the HTF break level + direction (4H preferred, else 1H — matches is_bos above)
-        _bos_src = df_htf if is_bos_4h else df_htf_1h
+        _bos_src = df_htf if is_bos_htf else df_htf_1h
         state.bos_dir = direction if is_bos else None
         state.bos_level = (float(_bos_src['high'].tail(15).max()) if direction == 'bullish'
                            else float(_bos_src['low'].tail(15).min()) if direction == 'bearish'
@@ -2071,7 +2081,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     state.ranging_mode       = False
                     state.state              = "ENTRY_WAIT"
                     state.arm_zone(sup_lo, sup_hi)
-                    print(f"[{base}] 🎯 AMD (PRIORITY): 4H low-sweep ${sweep_wick_htf:,.4f} + daily BEARISH → "
+                    print(f"[{base}] 🎯 AMD (PRIORITY): {HTF} low-sweep ${sweep_wick_htf:,.4f} + daily BEARISH → "
                           f"[{sup_type}] ${sup_lo:,.2f}–${sup_hi:,.2f} → waiting for SHORT entry{pool_note}")
                 else:
                     print(f"[{base}] AMD sweep valid but no supply zone above ${price:,.2f} — trying generic setups")
@@ -2094,7 +2104,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                     state.ranging_mode       = False
                     state.state              = "ENTRY_WAIT"
                     state.arm_zone(dem_lo, dem_hi)
-                    print(f"[{base}] 🎯 AMD (PRIORITY): 4H high-sweep ${sweep_high_wick_htf:,.4f} + daily BULLISH → "
+                    print(f"[{base}] 🎯 AMD (PRIORITY): {HTF} high-sweep ${sweep_high_wick_htf:,.4f} + daily BULLISH → "
                           f"[{dem_type}] ${dem_lo:,.2f}–${dem_hi:,.2f} → waiting for LONG entry{pool_note}")
                 else:
                     print(f"[{base}] AMD high-sweep valid but no demand zone below ${price:,.2f} — trying generic setups")
@@ -2108,7 +2118,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         bos_counter = is_bos and direction and daily_trend and daily_trend != direction
 
         if state.state == "IDLE" and bos_aligned and atr_pct < atr_min:
-            print(f"[{base}] BOS skip — consolidating (4H ATR={atr_pct:.1%} < {atr_min:.1%})")
+            print(f"[{base}] BOS skip — consolidating ({HTF} ATR={atr_pct:.1%} < {atr_min:.1%})")
         elif state.state == "IDLE" and bos_aligned:
             state.bias         = direction.upper()
             state.ranging_mode = (daily_trend is None) or is_1h_only
@@ -2197,9 +2207,9 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         # a LONG wants sell-side liquidity (lows) swept. Matching the sweep to the
         # bias filters out the wrong-side grab that precedes the opposite move.
         if state.bias == "BEARISH":
-            sweep_ok, sweep_lvl, sweep_src = is_sweep_high, sweep_high_wick, ("4H" if is_sweep_high_htf else "5m")
+            sweep_ok, sweep_lvl, sweep_src = is_sweep_high, sweep_high_wick, (HTF if is_sweep_high_htf else LTF_TIMEFRAME)
         else:
-            sweep_ok, sweep_lvl, sweep_src = is_sweep, sweep_wick, ("4H" if is_sweep_htf else "5m")
+            sweep_ok, sweep_lvl, sweep_src = is_sweep, sweep_wick, (HTF if is_sweep_htf else LTF_TIMEFRAME)
 
         if sweep_ok and sweep_lvl:
             state.sweep_low = sweep_lvl
@@ -2499,7 +2509,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             entry_atr_pct = entry_atr / price
             if entry_atr_pct < atr_gate_for(symbol):
                 print(f"[{base}] ⏸ Entry skipped — market dead at tap "
-                      f"(4H ATR={entry_atr_pct:.1%} < {atr_gate_for(symbol):.1%})")
+                      f"({HTF} ATR={entry_atr_pct:.1%} < {atr_gate_for(symbol):.1%})")
                 return price
 
             # ── Reversal veto: never fade a fresh opposite-side reversal ──────────────
@@ -2675,7 +2685,12 @@ def run():
     print("DEBBIE-LA CCXT BOT — PAPER TRADING (real Kraken data)")
     print(f"  Symbols:  {', '.join(symbols)}")
     print(f"  Balance:  ${PAPER_BALANCE:,.0f} USDT (paper)")
-    print(f"  Risk:     {BINANCE_CASH_AT_RISK*100:.1f}% per symbol | Interval: 5m | LTF: 5m | HTF: 6h")
+    # The HTF is not known yet — connect_htf_exchange() runs ~20 lines below and is what
+    # decides between Bybit's 4H and the Coinbase fallback. Stating one here was a claim
+    # this line could not back, so it names both and defers to the authoritative line.
+    print(f"  Risk:     {BINANCE_CASH_AT_RISK*100:.1f}% per symbol | "
+          f"Interval: {LTF_TIMEFRAME} | LTF: {LTF_TIMEFRAME} | "
+          f"HTF: {BYBIT_HTF_TIMEFRAME} or {HTF_TIMEFRAME} (resolved below)")
     print("=" * 70)
 
     if not _libs_ready.is_set():
