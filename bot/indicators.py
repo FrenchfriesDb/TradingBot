@@ -1648,7 +1648,7 @@ def cap_qty_for_risk(qty, risk_per_unit, max_risk_dollars):
 
 
 def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12,
-                      max_age_bars=30):
+                      max_age_bars=30, min_width_pct=0.0015):
     """
     Scans the 4H chart for supply zones (bearish imbalances) ABOVE current price.
 
@@ -1728,6 +1728,26 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
                     if min_price <= z_lo <= max_price:
                         candidates.append((z_lo, z_hi, 'bearish_breaker'))
 
+    # WIDTH FLOOR. A zone thinner than this is a LINE, not a zone: price crosses it
+    # inside a single tick, so the tap either never registers or registers on noise, and
+    # a structural stop placed against it sits inside the spread. Same rule
+    # detect_displacement_fvg / find_bullish_fvg / find_bearish_fvg already enforce via
+    # min_gap_abs ("A one-tick gap is a line, not a zone") — these two never did, and
+    # they are what produce the AMD and trend-follow zones the bots mostly arm.
+    #   2026-09-22: AAPL armed [bullish_fvg] 338.49-338.53 — FOUR CENTS on a $338 stock,
+    #   0.012%, against 0.198%-2.319% for every other symbol that morning — and sat in
+    #   ENTRY_WAIT on it for hours without ever filling.
+    # Defaulted ON rather than opt-in: all eight live call sites across the two bots pass
+    # no width argument, so a floor that had to be requested would have been missed at
+    # every one of them.
+    try:
+        _min_width = float(min_width_pct) * float(current_price)
+    except (TypeError, ValueError):
+        return False, 0.0, 0.0, ''
+    if _min_width != _min_width or _min_width < 0.0:      # NaN or nonsense price
+        return False, 0.0, 0.0, ''
+    candidates = [c for c in candidates if (c[1] - c[0]) >= _min_width]
+
     if not candidates:
         return False, 0.0, 0.0, ''
 
@@ -1740,7 +1760,7 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
 
 
 def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12,
-                      max_age_bars=30):
+                      max_age_bars=30, min_width_pct=0.0015):
     """
     Scans the 4H chart for demand zones (bullish imbalances) BELOW current price.
     Mirror of find_supply_zone for LONG setups.
@@ -1810,6 +1830,16 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
                     z_lo, z_hi = float(c1['low']), float(c1['high'])
                     if min_price <= z_hi <= max_price:
                         candidates.append((z_lo, z_hi, 'bullish_breaker'))
+
+    # Width floor — see the matching note in find_supply_zone. A zone thinner than this
+    # is a line, not a zone; AAPL's 338.49-338.53 (0.012%) came through here.
+    try:
+        _min_width = float(min_width_pct) * float(current_price)
+    except (TypeError, ValueError):
+        return False, 0.0, 0.0, ''
+    if _min_width != _min_width or _min_width < 0.0:      # NaN or nonsense price
+        return False, 0.0, 0.0, ''
+    candidates = [c for c in candidates if (c[1] - c[0]) >= _min_width]
 
     if not candidates:
         return False, 0.0, 0.0, ''
