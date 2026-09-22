@@ -110,6 +110,23 @@ def test_the_fallback_banner_names_the_configured_frame():
     assert 'falling back to {HTF_TIMEFRAME.upper()} on main exchange' in SRC
 
 
+def test_no_executable_string_names_an_exchange_the_bot_never_connects_to():
+    """Same defect, different field. The startup banner announced "real Kraken data"
+    while connect_exchange() builds ccxt.coinbase (or ccxt.binance with a key) — and it
+    printed ~27 lines BEFORE that choice is made, so it could not have known either way.
+    Kraken appears nowhere in the client code; it was simply never true."""
+    skip = _docstring_line_numbers()
+    bad = [(n.lineno, n.value.strip()[:70]) for n in ast.walk(TREE)
+           if isinstance(n, ast.Constant) and isinstance(n.value, str)
+           and n.lineno not in skip and re.search(r"kraken", n.value, re.I)]
+    assert not bad, bad
+
+
+def test_the_banner_defers_the_exchange_to_the_line_that_resolves_it():
+    assert "PAPER TRADING (live market data)" in SRC
+    assert 'print(f"Exchange: {mode}  |  Chart display: Coinbase")' in SRC
+
+
 def test_no_variable_is_named_after_a_timeframe_it_may_not_be():
     """is_bos_4h / direction_4h held the HTF result whatever frame the HTF was — the
     name itself re-seeded the literal every time someone printed it."""

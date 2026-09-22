@@ -1,7 +1,12 @@
 """
 CCXT bot — Debbie-La SMC state machine with paper trading.
-Uses Kraken public data feed by default (no API key needed).
+Uses the Coinbase public data feed by default (no API key needed); Bybit supplies 4H
+candles when it is reachable, else the HTF falls back to Coinbase 6H.
 Set BINANCE_API_KEY/SECRET in .env to switch to real Binance trading.
+
+(It said "Kraken" here and in the startup banner for months. Nothing in this file has
+ever built a Kraken client — connect_exchange() constructs ccxt.coinbase, or ccxt.binance
+when a key is present.)
 """
 
 import time
@@ -2682,7 +2687,11 @@ def run():
                [symbols_env] if symbols_env else DEFAULT_SYMBOLS)
 
     print("=" * 70)
-    print("DEBBIE-LA CCXT BOT — PAPER TRADING (real Kraken data)")
+    # No exchange named here: connect_exchange() picks between Coinbase and Binance ~27
+    # lines below, from whether BINANCE_API_KEY is set, and prints the authoritative
+    # "Exchange: ..." line itself. This banner claimed "real Kraken data" — an exchange
+    # this bot has never once connected to.
+    print("DEBBIE-LA CCXT BOT — PAPER TRADING (live market data)")
     print(f"  Symbols:  {', '.join(symbols)}")
     print(f"  Balance:  ${PAPER_BALANCE:,.0f} USDT (paper)")
     # The HTF is not known yet — connect_htf_exchange() runs ~20 lines below and is what
