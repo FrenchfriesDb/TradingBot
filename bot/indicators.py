@@ -317,6 +317,45 @@ def find_swing_points(df, lookback=10):
     
     return swing_high, swing_high_idx, swing_low, swing_low_idx
 
+def nearest_sr(levels, price):
+    """(nearest_above, nearest_below) — which levels are acting as R and S RIGHT NOW.
+
+    find_support_resistance() sorts its two lists by TOUCH COUNT and never looks at
+    current price, so `resistance[0]` is just "most-tested swing-high cluster in the
+    window". After a rally that sits BELOW price, and the stock bot's status line
+    printed it as `sr=res=` anyway. On 2026-09-22 that was every symbol but one:
+
+        AAPL  px 342.33  res 335.73   -1.9%
+        QQQ   px 746.85  res 718.86   -3.7%
+        META  px 740.48  res 664.30  -10.3%
+
+    A level below price is not resistance — price is already through it, which flips it
+    to support. So membership of the highs-list or the lows-list does not decide the
+    label; the side of price does. Both lists go in together and come back sorted by
+    which side they are on.
+
+    Returns (None, None) for an unusable price or no levels.
+    """
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None, None
+    if price != price or price <= 0 or not levels:
+        return None, None
+    vals = []
+    for lv in levels:
+        try:
+            v = float(lv)
+        except (TypeError, ValueError):
+            continue
+        if v == v and v > 0:
+            vals.append(v)
+    above = [v for v in vals if v > price]
+    below = [v for v in vals if v < price]
+    return (min(above) if above else None,
+            max(below) if below else None)
+
+
 def find_support_resistance(df, lookback=50, tolerance_pct=0.004, min_touches=2):
     """
     Finds significant S/R levels by clustering swing-point touches.

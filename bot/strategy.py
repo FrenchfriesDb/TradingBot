@@ -1424,8 +1424,17 @@ class DebbieLaSMC(Strategy):
                       else ("🚩bull_flag" if htf.get("bull_flag")
                             else ("🚩bear_flag" if htf.get("bear_flag") else "—")))
         amd_tag = htf.get("amd_phase", "—")
+        # Label S/R by which side of PRICE the level sits on, not by which list it came
+        # from. find_support_resistance ranks by touch count and ignores price, so this
+        # line used to print the most-tested swing-high as "res=" even when price was
+        # already far above it — on 2026-09-22 that was 7 of 8 symbols, META reading
+        # "res=664.30" at a price of 740.48, 10.3% BELOW. A level price has gone through
+        # is support now, and calling it resistance inverts what the line is telling you.
+        _r, _s = indicators.nearest_sr(
+            (htf.get("resistance") or []) + (htf.get("support") or []), current_price)
+        _sr_parts = ([f"res={_r:.2f}"] if _r else []) + ([f"sup={_s:.2f}"] if _s else [])
         sr_tag  = (f"SR✅{htf['bos_sr_level']:.2f}" if htf.get("bos_near_sr")
-                   else f"res={htf['resistance'][0]:.2f}" if htf.get("resistance") else "—")
+                   else (" ".join(_sr_parts) if _sr_parts else "—"))
         self.log_message(
             f"[{symbol}] state={self.state[symbol]} price={current_price:.4f} "
             f"daily={daily_trend} bos={htf['bos']}({htf['direction']}/{htf['bos_tf']}) "
