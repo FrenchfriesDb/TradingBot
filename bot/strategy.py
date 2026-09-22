@@ -24,6 +24,13 @@ _ET = ZoneInfo("America/New_York")   # US equities session clock
 # at 3:59 PM can't be flattened by before_closing_bell in time and rides overnight
 # straight into a gap (exactly how QQQ got held) — so we simply don't open that late.
 ENTRY_CUTOFF_MIN = 30
+# How many LTF bars back to look for a zone touch. The loop polls every 15 minutes on
+# 15-minute bars and the newest bar may still be forming, so 2 always spans the interval
+# since the previous poll. See indicators.zone_tapped.
+TAP_LOOKBACK_BARS  = int(os.getenv("TAP_LOOKBACK_BARS", "2"))
+# How far past the zone edge a fill may still be taken, in LTF ATRs. Bounds the chase
+# that bar-range detection makes possible. See indicators.tap_chase_ok.
+TAP_MAX_CHASE_ATR  = float(os.getenv("TAP_MAX_CHASE_ATR", "0.5"))
 # Force-flatten any open position inside this window of the close. This runs from the
 # main loop (which we KNOW executes every iteration), not only Lumibot's
 # before_closing_bell hook — so an EOD flatten no longer depends on that single hook
@@ -1762,9 +1769,38 @@ class DebbieLaSMC(Strategy):
                     self._reset(symbol)
                     return
 
-            in_fvg = (self.fvg_low[symbol] is not None and
-                      self.fvg_high[symbol] is not None and
-                      self.fvg_low[symbol] <= current_price <= self.fvg_high[symbol])
+            # A tap is something that HAPPENED during the bar, not something true at the
+            # instant of a poll. `self.fvg_low <= current_price <= self.fvg_high` sampled
+            # the last price once every 15 minutes, so a dip that began and ended between
+            # two polls was invisible: on 2026-09-22 SPY spent 31 minutes inside its
+            # armed zone and NVDA 1, and neither was ever evaluated.
+            _zlo, _zhi = self.fvg_low[symbol], self.fvg_high[symbol]
+            _live_tap = (_zlo is not None and _zhi is not None and
+                         _zlo <= current_price <= _zhi)
+            _bar_tap  = indicators.zone_tapped(ltf["df"], _zlo, _zhi, lookback=TAP_LOOKBACK_BARS)
+
+            in_fvg = False
+            if _bar_tap:
+                # Detection widened, so price may have left the zone by now — and every
+                # downstream number (stop, risk, target, R:R) comes from the live price
+                # on a MARKET order. tap_chase_ok bounds the fill, asymmetrically: a long
+                # may chase a little ABOVE its demand zone (that is the rejection working)
+                # but never fills BELOW it, where the zone has failed and the stop sits.
+                _ok, _why = indicators.tap_chase_ok(
+                    current_price, _zlo, _zhi,
+                    indicators.range_atr(ltf["df"]),
+                    is_long=(self.bias[symbol] == "BULLISH"),
+                    max_atr_mult=TAP_MAX_CHASE_ATR)
+                if _ok:
+                    in_fvg = True
+                    if not _live_tap:
+                        self.log_message(
+                            f"[{symbol}] 🎯 Bar-range tap — price entered "
+                            f"{_zlo:.2f}–{_zhi:.2f} during the last {TAP_LOOKBACK_BARS} bars "
+                            f"and is now {current_price:.2f}; {_why}.", color="cyan")
+                else:
+                    self.log_message(
+                        f"[{symbol}] 🚫 Tap not actionable — {_why}.", color="yellow")
 
             if in_fvg:
                 # ATR gate at execution: skip if market gone dead since zone was set

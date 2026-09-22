@@ -317,6 +317,112 @@ def find_swing_points(df, lookback=10):
     
     return swing_high, swing_high_idx, swing_low, swing_low_idx
 
+def _finite(x, positive=True):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    if v != v:                      # NaN
+        return None
+    if positive and v <= 0:
+        return None
+    return v
+
+
+def zone_tapped(bars, zone_lo, zone_hi, lookback=2):
+    """Did price trade into [zone_lo, zone_hi] during the last `lookback` bars?
+
+    The entry test used to be `zone_lo <= last_price <= zone_hi` — the price at the
+    instant of a 15-minute poll. A dip that begins and ends between two polls leaves no
+    trace in it. On 2026-09-22 SPY sat inside its armed zone for 31 minutes and NVDA for
+    1; neither was ever evaluated.
+
+    A bar's [low, high] is the range price actually visited, so overlapping it with the
+    zone asks the question the poll could not. lookback=2 because the bot polls every 15
+    minutes on 15-minute bars: the newest bar may still be forming, so two of them always
+    span the interval since the previous poll.
+
+    This answers ONLY "did price get there". Whether it is still a fair place to fill is
+    tap_chase_ok's job — see the ASTER incident quoted there.
+    """
+    lo = _finite(zone_lo)
+    hi = _finite(zone_hi)
+    if lo is None or hi is None or lo > hi:
+        return False
+    if bars is None:
+        return False
+    try:                                    # accept a DataFrame or a list of mappings
+        rows = bars.tail(lookback).to_dict("records")
+    except AttributeError:
+        try:
+            rows = list(bars)[-lookback:]
+        except TypeError:
+            return False
+    for r in rows:
+        try:
+            b_lo = _finite(r["low"])
+            b_hi = _finite(r["high"])
+        except (TypeError, KeyError, IndexError):
+            continue
+        if b_lo is None or b_hi is None:
+            continue
+        if b_lo <= hi and b_hi >= lo:       # ranges overlap
+            return True
+    return False
+
+
+def tap_chase_ok(price, zone_lo, zone_hi, atr, is_long, max_atr_mult=0.5):
+    """(ok, why) — is `price` still a fair place to fill a tap of this zone?
+
+    Detection widened to the bar's range, so by the time the bot looks, price may have
+    left the zone. Everything downstream (stop, risk, target, R:R) is computed from the
+    live price and the order is a MARKET order, so an unbounded "the bar touched it,
+    buy now" reintroduces a bug already diagnosed on the crypto side:
+
+        ASTER/USD LONG armed demand at 0.7190-0.7588 and filled at 0.7906 — 4.19% above
+        the top of its own zone, on a price that never traded down to it.
+
+    THE GUARD IS NOT SYMMETRIC, and that is the point:
+
+      LONG, demand zone below — price back ABOVE the zone is the tap-and-reject working
+        exactly as intended, so a bounded chase is allowed. Price BELOW the zone low
+        means the demand has FAILED: the structural stop sits just under it and we would
+        be buying into a live invalidation. Refused at any distance.
+
+      SHORT, supply zone above — the mirror.
+
+    A dead or unreadable ATR gives a chase budget of zero rather than an unlimited one,
+    so a bad volatility read tightens this gate instead of opening it.
+    """
+    px = _finite(price)
+    lo = _finite(zone_lo)
+    hi = _finite(zone_hi)
+    if px is None or lo is None or hi is None or lo > hi:
+        return False, "unreadable price or zone"
+    if lo <= px <= hi:
+        return True, "in zone"
+
+    if is_long:
+        if px < lo:
+            return False, (f"price {px:.4f} is BELOW the demand zone low {lo:.4f} — "
+                           f"the zone failed, not a tap")
+        gone = px - hi
+        edge = hi
+    else:
+        if px > hi:
+            return False, (f"price {px:.4f} is ABOVE the supply zone high {hi:.4f} — "
+                           f"the zone failed, not a tap")
+        gone = lo - px
+        edge = lo
+
+    _atr = _finite(atr)
+    budget = (_atr * max_atr_mult) if _atr is not None else 0.0
+    if gone <= budget:
+        return True, f"chased {gone:.4f} past {edge:.4f} (budget {budget:.4f})"
+    return False, (f"price ran {gone:.4f} past the zone edge {edge:.4f} — "
+                   f"more than {max_atr_mult:g}x ATR ({budget:.4f}); the move left without us")
+
+
 def nearest_sr(levels, price):
     """(nearest_above, nearest_below) — which levels are acting as R and S RIGHT NOW.
 
