@@ -1169,7 +1169,7 @@ MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
 def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
                         fvg_low, fvg_high, sweep_level,
                         sl, risk_amt, pool_tp, df_ltf, df_htf=None,
-                        amd_phase=None, zone_type=None):
+                        amd_phase=None, zone_type=None, htf_name=HTF_TIMEFRAME):
     """
     Asks Llama 3.3 70B (via NVIDIA API) whether this SMC setup is worth taking,
     and lets it pick the R:R target itself (we only enforce a 1:{MIN_AI_RR} floor).
@@ -1181,22 +1181,29 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
         return True, MIN_AI_RR, f"no_nvidia_key — proceeding at minimum 1:{MIN_AI_RR:g} R:R"
 
     side = "LONG" if bos_dir == "bullish" else "SHORT"
-    pool_line = (f"Nearest 4H liquidity pool target: ${pool_tp:,.4f}  "
+    # The prompt said "4H" in ten places while the candles under it were 6H, because
+    # Bybit (the only 4H source) is geo-blocked from this machine and the bot silently
+    # falls back to Coinbase 6H. The model was being told the wrong chart and asked to
+    # reason about sweeps and displacement on it — a 6H bar is 1.5x the range of the 4H
+    # bar it was told to expect. HTF is derived from htf_name, which IS the string the
+    # fetch was made with, so it cannot say one thing while the data is another.
+    HTF = (htf_name or HTF_TIMEFRAME).upper()
+    pool_line = (f"Nearest {HTF} liquidity pool target: ${pool_tp:,.4f}  "
                  f"(implies 1:{abs(pool_tp - price) / risk_amt:.1f} R:R)"
-                 if pool_tp else "Nearest 4H liquidity pool target: none found")
+                 if pool_tp else f"Nearest {HTF} liquidity pool target: none found")
 
-    # Full 4H chart context — 20 candles so the AI can see the sweep, BOS, FVG, and AMD phase
+    # Full HTF chart context — 20 candles so the AI can see the sweep, BOS, FVG, and AMD phase
     if df_htf is not None and len(df_htf) >= 5:
         htf_rows = df_htf.tail(20)
         swing_high = float(df_htf['high'].tail(50).max())
         swing_low  = float(df_htf['low'].tail(50).min())
-        htf_block = "4H candles (oldest → newest):\n" + "\n".join(
+        htf_block = f"{HTF} candles (oldest → newest):\n" + "\n".join(
             f"  {i+1:2d}. O:{r['open']:,.2f} H:{r['high']:,.2f} "
             f"L:{r['low']:,.2f} C:{r['close']:,.2f}"
             for i, (_, r) in enumerate(htf_rows.iterrows())
         ) + f"\n50-bar structure: Low ${swing_low:,.2f}  High ${swing_high:,.2f}"
     else:
-        htf_block = "(4H data unavailable)"
+        htf_block = f"({HTF} data unavailable)"
 
     # Last 5 LTF candles for execution precision
     ltf_recent = df_ltf.tail(5)
@@ -1267,7 +1274,7 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
             f"               IFVG / supply zone: ${fvg_low:,.4f} – ${fvg_high:,.4f} is the SHORT entry."
         )
         amd_question = (
-            f"- Confirm: does the 4H chart show a brutal sweep of lows followed by a bleed-up?\n"
+            f"- Confirm: does the {HTF} chart show a brutal sweep of lows followed by a bleed-up?\n"
             f"- Is the {zone_type or 'supply'} zone at ${fvg_low:,.4f}–${fvg_high:,.4f} a valid "
             f"IFVG / distribution area?\n"
             f"- Does the daily trend support a SHORT from this supply zone?"
@@ -1282,7 +1289,7 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
             f"               IFVG / demand zone: ${fvg_low:,.4f} – ${fvg_high:,.4f} is the LONG entry."
         )
         amd_question = (
-            f"- Confirm: does the 4H chart show a brutal sweep of highs followed by a bleed-down?\n"
+            f"- Confirm: does the {HTF} chart show a brutal sweep of highs followed by a bleed-down?\n"
             f"- Is the {zone_type or 'demand'} zone at ${fvg_low:,.4f}–${fvg_high:,.4f} a valid "
             f"IFVG / accumulation area?\n"
             f"- Does the daily trend support a LONG from this demand zone?"
@@ -1298,7 +1305,7 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
             f"               Zone: ${fvg_low:,.4f} – ${fvg_high:,.4f}  SL: ${sl:,.4f}"
         )
         amd_question = (
-            f"- Is the daily trend clearly {'bearish' if side == 'SHORT' else 'bullish'} on the 4H chart?\n"
+            f"- Is the daily trend clearly {'bearish' if side == 'SHORT' else 'bullish'} on the {HTF} chart?\n"
             f"- Is price rejecting from the {zone_type or zone_label} zone "
             f"${fvg_low:,.4f}–${fvg_high:,.4f} with bearish/bullish structure?\n"
             f"- Is there enough room to the next liquidity pool to justify a 1:3.5+ R:R?"
@@ -1314,7 +1321,7 @@ def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
             f"               Chase risk band: ${fvg_low:,.4f} – ${fvg_high:,.4f}  SL: ${sl:,.4f}"
         )
         amd_question = (
-            f"- Does the 4H chart show genuine fresh displacement/momentum still supporting "
+            f"- Does the {HTF} chart show genuine fresh displacement/momentum still supporting "
             f"{side}, or does this look already extended/exhausted?\n"
             f"- Is the daily trend aligned with chasing this {side}?\n"
             f"- Is there still enough room to the next liquidity pool to justify a 1:3.5+ R:R "
@@ -1339,7 +1346,7 @@ Symbol       : {symbol}
 Direction    : {side}
 Current Price: ${price:,.4f}
 Daily Trend  : {(daily_trend or 'UNCLEAR').upper()}
-4H BOS       : {(bos_dir or 'NONE').upper()}
+{HTF} BOS{" " * max(0, 9 - len(HTF))}: {(bos_dir or 'NONE').upper()}
 Swept level  : ${sweep_level:,.4f}
 {amd_context}
 Stop Loss    : ${sl:,.4f}  (risk = ${risk_amt:,.4f} per unit)
@@ -1348,7 +1355,7 @@ Last 5 execution candles: {ltf_candles}
 
 {news_block}
 
-Analyze using the full 4H chart above:
+Analyze using the full {HTF} chart above:
 {amd_question}
 - Weigh the news above as CONTEXT ONLY: does it support or contradict this {side}?
   Structure decides the trade; news can raise or lower your confidence in it, and
@@ -1446,7 +1453,7 @@ def check_chase_continuation(df_ltf, bias, min_body_abs=0.0):
 
 def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt,
                              df_ltf, df_htf, daily_trend, entry_atr, now, risk_fraction,
-                             exchange=None):
+                             exchange=None, htf_name=HTF_TIMEFRAME):
     """Shared AI-confirmation + position-sizing + execution tail for BOTH the
     retest-entry path and the breakout-chase path. The caller must already have set
     state.stop_loss (zone-edge+ATR-cap+swing-guard for a retest, swing-high/low
@@ -1502,7 +1509,7 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
         symbol, price, daily_trend, bias_str,
         zone_lo, zone_hi, ref_level,
         state.stop_loss, risk_amt, pool_tp, df_ltf, df_htf,
-        amd_phase=amd_phase, zone_type=zone_type,
+        amd_phase=amd_phase, zone_type=zone_type, htf_name=htf_name,
     )
     # Structural target: pin TP to the nearest 4H liquidity pool offering ≥MIN_AI_RR,
     # capped at MAX_AI_RR — real structure, not a multiple of risk. rr_actual now means
@@ -1721,13 +1728,18 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         df_ltf    = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, "5m",  120))  # execution + ~10h of liquidity pools
         df_ltf_15 = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, "15m", 55))   # MSS / CHoCH confirmation
         df_daily  = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, "1d",  60))
-        # Bybit uses USDT pairs — fetch both 4H (high conviction) and 1H (faster signals)
+        # Bybit uses USDT pairs and has true 4H; Coinbase does not, so the fallback is 6H.
+        # htf_name is the SAME variable passed to the fetch, so the name and the data
+        # cannot drift apart — every label downstream (including the AI prompt) is read
+        # from this one value rather than re-stating a timeframe from memory.
         if htf_exchange:
             bybit_sym = symbol.replace("/USD", "/USDT")
-            df_htf    = ohlcv_to_df(fetch_ohlcv_retry(htf_exchange, bybit_sym, "4h", 200))
+            htf_name  = "4h"
+            df_htf    = ohlcv_to_df(fetch_ohlcv_retry(htf_exchange, bybit_sym, htf_name, 200))
             df_htf_1h = ohlcv_to_df(fetch_ohlcv_retry(htf_exchange, bybit_sym, "1h", 200))
         else:
-            df_htf    = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, HTF_TIMEFRAME, 200))
+            htf_name  = HTF_TIMEFRAME
+            df_htf    = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, htf_name, 200))
             df_htf_1h = ohlcv_to_df(fetch_ohlcv_retry(exchange, symbol, "1h", 200))
     except Exception as e:
         # type(e).__name__ matters more than the message here: ccxt stringifies a
@@ -2399,7 +2411,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
                                        _chase_rng.rolling(3).mean().iloc[-1])
                 execute_confirmed_entry(symbol, base, state, paper, is_long, price, chase_risk_amt,
                                          df_ltf, df_htf, daily_trend, chase_entry_atr, now, risk_fraction,
-                                         exchange=exchange)
+                                         exchange=exchange, htf_name=htf_name)
                 return price
 
         # ── Sniper arming (once, on first bar, before zone tap) ─────────────────
@@ -2646,7 +2658,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             state.is_chase = False   # this is a retest entry, not a chase
             execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt,
                                      df_ltf, df_htf, daily_trend, entry_atr, now, risk_fraction,
-                                     exchange=exchange)
+                                     exchange=exchange, htf_name=htf_name)
 
     return price
 
