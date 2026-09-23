@@ -58,6 +58,43 @@ load_dotenv()
 FILLS = []      # every simulated fill, in order — the authoritative trade record
 
 
+def _force_feed(feed_name: str):
+    """Make lumibot ask Alpaca for a data feed it is actually entitled to.
+
+    lumibot builds its StockBarsRequest with no `feed` argument
+    (backtesting/alpaca_backtesting.py:623), so alpaca-py defaults it to SIP — the full
+    consolidated tape. On the free data plan every such request is a hard 403:
+
+        403 Forbidden .../v2/stocks/bars?...timeframe=1Min&symbols=SPY
+        {"message":"subscription does not permit querying recent SIP data"}
+
+    and the strategy thread dies before the first bar, while the progress bar keeps
+    drawing and the process still exits 0. Patched here rather than in the library, and
+    only inside the backtest sandbox — nothing live goes through this path.
+
+    CAVEAT, and it is not a small one: IEX is a single venue carrying roughly 2-3% of
+    consolidated volume. Its bar highs, lows and closes are genuinely different from
+    SIP's, thinner and gappier, so a backtest on IEX is an approximation of the tape the
+    live bot trades. Directional conclusions survive that; precise fills and win rates do
+    not. Use --feed sip if the account is ever upgraded.
+    """
+    import lumibot.backtesting.alpaca_backtesting as _ab
+    from alpaca.data.enums import DataFeed
+    feed = DataFeed.SIP if str(feed_name).lower() == "sip" else DataFeed.IEX
+    _orig = _ab.StockBarsRequest
+
+    def _with_feed(*a, **kw):
+        kw.setdefault("feed", feed)
+        return _orig(*a, **kw)
+
+    _ab.StockBarsRequest = _with_feed
+    if feed is DataFeed.IEX:
+        print("  data feed: IEX (free plan) — ~2-3% of consolidated volume; "
+              "treat fills and win rate as approximate")
+    else:
+        print("  data feed: SIP (full consolidated tape)")
+
+
 def sandbox_strategy(use_ai: bool):
     """Replace every live side effect with a no-op, and hook trade closes.
 
@@ -277,6 +314,9 @@ def main():
                          "everything (default 90)")
     ap.add_argument("--funnel", action="store_true",
                     help="tally state-machine transitions to show WHERE setups died")
+    ap.add_argument("--feed", type=str, default="iex", choices=["iex", "sip"],
+                    help="Alpaca data feed. Free plans only have IEX; SIP 403s. "
+                         "IEX is one venue (~2-3%% of volume) so fills are approximate.")
     ap.add_argument("--ai", action="store_true",
                     help="let the live Llama gate vote (slow, non-reproducible, "
                          "and look-ahead-contaminated — see module docstring)")
@@ -304,6 +344,7 @@ def main():
     if args.funnel:
         instrument_funnel(S)
     from lumibot.backtesting import AlpacaBacktesting
+    _force_feed(args.feed)
 
     print("=" * 66)
     print(f"  DEBBIE-LA SMC — ALPACA INTRADAY BACKTEST")
