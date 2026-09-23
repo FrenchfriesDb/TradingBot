@@ -1999,6 +1999,69 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
 # CHART STRUCTURE — Flags, Channels
 # ============================================================================
 
+def flag_breakout_retest(df, is_long, max_shift=6, atr_mult=0.5,
+                         pole_bars=10, flag_bars=8, min_pole_pct=0.04):
+    """(found, retest_lo, retest_hi, stop_ref, target) — a broken flag worth retesting.
+
+    detect_bull_flag refuses once `flag_high >= pole_high`, so the moment price breaks
+    out of a flag the flag stops being detected. Asking "is there a flag AND has it
+    broken out" in a single call is therefore impossible.
+
+    This asks it as two questions against the same dataframe, holding no state: for each
+    shift back, was there an INTACT flag as of that bar, and has price CLOSED through its
+    edge since? The first (most recent) match wins. max_shift bounds how stale the
+    breakout may be — beyond it, the "retest" is just a level from last week.
+
+    The band returned is the retest of the broken edge (flag_high for a long, flag_low
+    for a short), widened by atr_mult x ATR so the existing ENTRY_WAIT tap machinery has
+    a real zone to work with. A dead ATR REFUSES rather than emitting a zero-width band:
+    [x, x] is the four-cent AAPL zone again, crossed inside a single tick.
+
+    MIND THE SIGNATURES — positions 1 and 2 swap meaning between the two detectors:
+        detect_bull_flag -> (found, pole_low,  pole_high, flag_low, flag_high, target)
+        detect_bear_flag -> (found, pole_high, pole_low,  flag_low, flag_high, target)
+    """
+    none = (False, None, None, None, None)
+    try:
+        n = len(df)
+        closes = df["close"]
+    except (TypeError, KeyError, AttributeError):
+        return none
+    if n < pole_bars + flag_bars + 1:
+        return none
+
+    atr = range_atr(df)
+    if not atr or atr != atr or atr <= 0:
+        return none                       # fail closed — no width, no zone
+
+    detect = detect_bull_flag if is_long else detect_bear_flag
+    for shift in range(1, int(max_shift) + 1):
+        if n - shift < pole_bars + flag_bars:
+            break
+        window = df.iloc[:-shift]
+        found, _a, _b, flag_low, flag_high, target = detect(
+            window, pole_bars=pole_bars, flag_bars=flag_bars, min_pole_pct=min_pole_pct)
+        if not found:
+            continue
+
+        since = closes.iloc[-shift:]
+        if is_long:
+            if float(since.max()) <= flag_high:
+                continue                  # never broke out (or broke the wrong way)
+            edge, stop_ref = flag_high, flag_low
+        else:
+            if float(since.min()) >= flag_low:
+                continue
+            edge, stop_ref = flag_low, flag_high
+
+        half = atr * float(atr_mult)
+        if half <= 0:
+            return none
+        return True, edge - half, edge + half, stop_ref, target
+
+    return none
+
+
 def detect_bull_flag(df, pole_bars=10, flag_bars=8, min_pole_pct=0.04):
     """
     Bull flag: sharp upward pole (≥ min_pole_pct move) followed by a tight

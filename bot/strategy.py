@@ -28,6 +28,13 @@ ENTRY_CUTOFF_MIN = 30
 # 15-minute bars and the newest bar may still be forming, so 2 always spans the interval
 # since the previous poll. See indicators.zone_tapped.
 TAP_LOOKBACK_BARS  = int(os.getenv("TAP_LOOKBACK_BARS", "2"))
+# Flag-continuation setups (pole -> flag -> break -> retest). OFF by default, like
+# binance_bot's ENABLE_WEDGE_BREAKOUT: detect_bull_flag has existed for months wired to
+# nothing but a log string, so this path has never traded and is unproven. Backtest with
+# ENABLE_FLAG_CONTINUATION=1 before considering it live.
+ENABLE_FLAG_CONTINUATION = os.getenv("ENABLE_FLAG_CONTINUATION", "0") not in ("0", "", "false", "False")
+FLAG_MAX_SHIFT     = int(os.getenv("FLAG_MAX_SHIFT", "6"))      # how stale a break may be
+FLAG_RETEST_ATR    = float(os.getenv("FLAG_RETEST_ATR", "0.5")) # retest band half-width
 # How far past the zone edge a fill may still be taken, in LTF ATRs. Bounds the chase
 # that bar-range detection makes possible. See indicators.tap_chase_ok.
 TAP_MAX_CHASE_ATR  = float(os.getenv("TAP_MAX_CHASE_ATR", "0.5"))
@@ -292,6 +299,12 @@ class DebbieLaSMC(Strategy):
         self.amd_phase          = {s: None   for s in self.symbols}
         self.amd_zone_type      = {s: None   for s in self.symbols}
         self.zone_set_price     = {s: None   for s in self.symbols}  # price when trend_follow zone armed
+        # Flag-continuation only: the flag's own invalidation level, and the measured
+        # move (flag edge + pole body) the detector computed. Both are None on every
+        # other path, and the entry code falls back to its normal structural stop /
+        # pool target when they are.
+        self.flag_stop_ref      = {s: None   for s in self.symbols}
+        self.flag_target        = {s: None   for s in self.symbols}
         self._iter_count        = 0
 
         # ── Google Sheets logging ────────────────────────────────────────────
@@ -934,6 +947,8 @@ class DebbieLaSMC(Strategy):
         self.fvg_low[symbol]         = None
         self.fvg_high[symbol]        = None
         self.fvg_set_iter[symbol]    = 0
+        self.flag_stop_ref[symbol]   = None
+        self.flag_target[symbol]     = None
         self.ote_zone[symbol]        = None
         self.entry_price[symbol]     = None
         self.stop_loss[symbol]       = None
@@ -1462,13 +1477,30 @@ class DebbieLaSMC(Strategy):
             # side until it breaks. Without this first, a BOS printed inside the range
             # whipsaws us. Log the range and bail for this iteration.
             if htf.get("amd_phase") == "accumulation":
-                ai = htf.get("amd_info", {})
+                # A flag IS a tight range, so this guard blocks the exact setup a flag
+                # trade is made of. The exception is deliberately narrow: a flag must be
+                # CONFIRMED by the detector, it must have already broken out, and its
+                # direction must agree with the daily trend. Anything short of all three
+                # is still chop and still bails. When the feature is off (the default)
+                # this is byte-for-byte the old behaviour.
+                _flag_ok = False
+                if ENABLE_FLAG_CONTINUATION and daily_trend in ("bullish", "bearish"):
+                    _flag_ok = indicators.flag_breakout_retest(
+                        htf["df"], is_long=(daily_trend == "bullish"),
+                        max_shift=FLAG_MAX_SHIFT, atr_mult=FLAG_RETEST_ATR)[0]
+                if not _flag_ok:
+                    ai = htf.get("amd_info", {})
+                    self.log_message(
+                        f"[{symbol}] 📦 Accumulation: {ai.get('range_low', 0):.2f}–"
+                        f"{ai.get('range_high', 0):.2f} ({ai.get('range_pct', 0):.1%} wide) "
+                        f"— chop, no entry until breakout/sweep", color="cyan"
+                    )
+                    return
                 self.log_message(
-                    f"[{symbol}] 📦 Accumulation: {ai.get('range_low', 0):.2f}–"
-                    f"{ai.get('range_high', 0):.2f} ({ai.get('range_pct', 0):.1%} wide) "
-                    f"— chop, no entry until breakout/sweep", color="cyan"
-                )
-                return
+                    f"[{symbol}] 🚩 Accumulation overridden — confirmed "
+                    f"{'bull' if daily_trend == 'bullish' else 'bear'} flag broke out with "
+                    f"the daily trend; treating the range as continuation, not chop.",
+                    color="cyan")
 
             # ── FIX #1: BOS handling — trade the displacement retest, don't demand a sweep ──
             # When a BOS leaves a displacement FVG, lock that gap and go straight to
@@ -1576,6 +1608,33 @@ class DebbieLaSMC(Strategy):
                                 f"target≈${amd_info.get('manipulation_target', 0):.2f}",
                                 color="green"
                             )
+
+            # ── Flag continuation: pole → flag → break → retest of the broken edge ──
+            # Placed ABOVE the trend-zone fallback: both buy a pullback in a trend, but a
+            # flag names the level price actually broke and carries a measured target,
+            # which is strictly more structure than "a demand zone somewhere below".
+            if (ENABLE_FLAG_CONTINUATION and self.state[symbol] == "IDLE"
+                    and atr_pct >= MIN_ATR_PCT and daily_trend in ("bullish", "bearish")):
+                _fl_long = daily_trend == "bullish"
+                _ffound, _flo, _fhi, _fstop, _ftgt = indicators.flag_breakout_retest(
+                    htf["df"], is_long=_fl_long,
+                    max_shift=FLAG_MAX_SHIFT, atr_mult=FLAG_RETEST_ATR)
+                if _ffound:
+                    self.bias[symbol]            = "BULLISH" if _fl_long else "BEARISH"
+                    self.amd_phase[symbol]       = "flag_continuation"
+                    self.amd_zone_type[symbol]   = "flag_retest"
+                    self.fvg_low[symbol]         = _flo
+                    self.fvg_high[symbol]        = _fhi
+                    self.flag_stop_ref[symbol]   = _fstop
+                    self.flag_target[symbol]     = _ftgt
+                    self.ranging_mode[symbol]    = True    # half size — unproven path
+                    self.state[symbol]           = "ENTRY_WAIT"
+                    self.fvg_set_iter[symbol]    = self._iter_count
+                    self.zone_set_price[symbol]  = current_price
+                    self.log_message(
+                        f"[{symbol}] 🚩 Flag continuation: daily {daily_trend.upper()} → "
+                        f"retest {_flo:.2f}–{_fhi:.2f}  stop-ref {_fstop:.2f}  "
+                        f"measured target {_ftgt:.2f} (½ size)", color="green")
 
             # ── Trend-zone fallback: daily trend clear but no fresh BOS/sweep ──
             if self.state[symbol] == "IDLE":
@@ -1940,6 +1999,14 @@ class DebbieLaSMC(Strategy):
                     _zone = ((self.fvg_low[symbol] * 0.997) if (is_long and self.fvg_low[symbol])
                              else (self.fvg_high[symbol] * 1.003) if (not is_long and self.fvg_high[symbol])
                              else None)
+                    # A flag invalidates at the FLAG's extreme, not at the retest band —
+                    # price dipping a cent under the retest is normal, price back inside
+                    # the flag means the breakout failed. Wider stop, honest stop: if the
+                    # resulting R:R cannot clear MIN_TP_RR the setup is refused below,
+                    # which is the correct outcome rather than a flattering tight stop.
+                    _fstop_ref = self.flag_stop_ref.get(symbol)
+                    if _fstop_ref:
+                        _zone = _fstop_ref * (0.997 if is_long else 1.003)
                     _liq_cap = (current_price / PAPER_LEVERAGE) * 0.90 if PAPER_LEVERAGE > 1 else None
                     # Anchor to the ZONE EDGE, not the live price. structural_stop_price
                     # returns `entry - dist`, so passing current_price let the stop SLIDE
@@ -1964,6 +2031,14 @@ class DebbieLaSMC(Strategy):
                     _min_tp_lvl = (current_price + MIN_TP_RR * risk_amt if is_long
                                    else current_price - MIN_TP_RR * risk_amt)
                     pool_tp = indicators.find_next_liquidity_target(htf["df"], _min_tp_lvl, bias_str)
+                    # Flag continuation carries its own structural target: the measured
+                    # move (broken edge + pole body) the detector already computed. It
+                    # goes in where the pool would, so structural_take_profit and then
+                    # reachable_target treat it exactly like any other real level — a
+                    # measured move the session cannot cover still gets trimmed.
+                    _flag_tp = self.flag_target.get(symbol)
+                    if _flag_tp:
+                        pool_tp = _flag_tp
                     tp_planned = round(indicators.structural_take_profit(
                         current_price, risk_amt, pool_tp, is_long, MIN_TP_RR, MAX_TP_RR), 2)
                     # Reachability: MAX_TP_RR caps the target in units of RISK, which says
@@ -1986,7 +2061,10 @@ class DebbieLaSMC(Strategy):
                             f"< 1:{MIN_TP_RR:g}. Standing aside.", color="yellow")
                         return
                     rr_actual = abs(tp_planned - current_price) / risk_amt if risk_amt else 0.0
-                    _tp_src = "@4H pool" if (pool_tp and abs(tp_planned - pool_tp) < 0.01) else f"{rr_actual:.1f}R cap"
+                    _tp_src = ("@measured move" if (self.flag_target.get(symbol) and pool_tp
+                                                    and abs(tp_planned - pool_tp) < 0.01)
+                               else "@4H pool" if (pool_tp and abs(tp_planned - pool_tp) < 0.01)
+                               else f"{rr_actual:.1f}R cap")
                     self.log_message(
                         f"[{symbol}] 🎯 Structural: SL ${sl:.2f} (risk {risk_amt:.2f} = "
                         f"{risk_amt / _atr_1h:.1f}×1hATR) → TP ${tp_planned:.2f} [{_tp_src}] "
