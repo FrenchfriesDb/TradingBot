@@ -749,6 +749,7 @@ def save_crypto_state(paper: "PaperTrader", states: dict, symbols: list, prices:
                 "ote_high":           st.ote_high,
                 "ote_is_up":          st.ote_is_up,
                 "fvg_tf":             st.fvg_tf,
+                "zone_left":          st.zone_left,
                 "ltf":                LTF_TIMEFRAME,
                 "inducement":         st.inducement,
                 "sniper_armed":       st.sniper_armed,
@@ -875,6 +876,9 @@ def load_crypto_state(paper: "PaperTrader", states: dict, symbols: list, daily_s
             # meant every restart silently dropped the timeframe off an already-armed
             # zone's chart label, which is the state the restart of 2026-09-21 landed in.
             st.fvg_tf             = saved.get("fvg_tf")
+            # Default FALSE on a restore that predates this field: an unknown history must
+            # not be read as "the retest already happened".
+            st.zone_left          = bool(saved.get("zone_left", False))
             st.partial_taken      = saved.get("partial_taken", False)
             st.banked_pnl         = saved.get("banked_pnl", 0.0)
             st.breakeven_moved    = saved.get("breakeven_moved", False)
@@ -989,6 +993,10 @@ class SymbolState:
         # ── 10-second entry sniper ──────────────────────────────────────────────
         # Armed by 5-min cycle when zone is identified; fired by 10-sec loop
         # the instant price enters the zone (no waiting for next 5-min tick).
+        self.zone_left     = False   # price has traded OUTSIDE the armed zone since arming.
+                                     # Until then there is nothing to "retest": a choch_fvg
+                                     # zone IS the gap the impulse just made, so the first
+                                     # touch is the impulse, not a return to it.
         self.sniper_armed  = False   # True = ready to fire on zone touch
         self.sniper_sl     = None    # pre-calculated SL at arm time
         self.sniper_tp     = None    # pre-calculated TP at arm time
@@ -1011,6 +1019,7 @@ class SymbolState:
         at 0 — so a zone that has really been sitting for hours reads as stale and gets
         rejected by the STALE_ZONE_BARS gate rather than looking freshly armed."""
         self.fvg_low, self.fvg_high = lo, hi
+        self.zone_left = False          # re-earned per zone; set on the first tick outside
         self.bars_in_entry_wait = indicators.carried_zone_age(
             lo, hi, self.last_zone_lo, self.last_zone_hi, self.last_zone_age)
 
@@ -2502,7 +2511,19 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         in_fvg = indicators.price_in_entry_zone(
             price, state.fvg_low, state.fvg_high, state.bias == "BULLISH")
 
-        if in_fvg:
+        # A retest requires price to have LEFT the zone first. Tracked every cycle, sticky
+        # once earned. For the ordinary setup (demand armed below price) this is already
+        # True at arming and nothing changes; it only holds back the case where the zone
+        # was armed AROUND price — a choch_fvg gap the impulse just made — where the first
+        # "tap" is the impulse itself. DOGE armed and filled in the same cycle that way.
+        state.zone_left = indicators.zone_left_since_arming(
+            price, state.fvg_low, state.fvg_high, state.zone_left)
+        if in_fvg and not state.zone_left:
+            print(f"[{base}] ⏳ Not a retest yet — price ${price:,.4f} has not left "
+                  f"${state.fvg_low:,.4f}–${state.fvg_high:,.4f} since it was armed; "
+                  f"this is the impulse, not a return to it.")
+
+        if in_fvg and state.zone_left:
             is_long = state.bias == "BULLISH"
             bias_str = "bullish" if is_long else "bearish"
 
@@ -2928,6 +2949,14 @@ def run():
                         # where overshooting improves the fill.
                         _in     = indicators.price_in_entry_zone(
                             _cur, st.fvg_low, st.fvg_high, _is_long)
+                        # Same retest rule as the 5m cycle. This watcher polls every 10s
+                        # and "wins nearly every race" against it, so a gate that lives
+                        # only in the 5m path is effectively dead code — exactly how the
+                        # candle veto ended up unenforced.
+                        st.zone_left = indicators.zone_left_since_arming(
+                            _cur, st.fvg_low, st.fvg_high, st.zone_left)
+                        if _in and not st.zone_left:
+                            _in = False
                         if _in:
                             _base    = sym.split("/")[0]
 
@@ -2951,6 +2980,8 @@ def run():
                             _is_stale = st.bars_in_entry_wait > STALE_ZONE_BARS
                             _fresh_mom = False
                             _tap_confirms = False
+                            _tap_opposes = True    # fail CLOSED: if the candle cannot be
+                                                   # read, treat it as opposing and refuse
                             try:
                                 _sniper_ltf = exchange.fetch_ohlcv(sym, "5m", limit=17)
                                 _df_sniper  = pd.DataFrame(
@@ -2963,12 +2994,15 @@ def run():
                                     _is_long, min_body_frac=DISPLACEMENT_BODY_FRAC,
                                     min_body_abs=indicators.displacement_min_body(_atr5_sniper, _px_sniper,
                                         DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT))
+                                _ctype_sniper = indicators.classify_candle(
+                                    _df_sniper.iloc[-1], _df_sniper.iloc[-2])
                                 _tap_confirms = indicators.candle_confirms_bias(
-                                    indicators.classify_candle(_df_sniper.iloc[-1],
-                                                               _df_sniper.iloc[-2]),
-                                    "BULLISH" if _is_long else "BEARISH")
+                                    _ctype_sniper, "BULLISH" if _is_long else "BEARISH")
+                                _tap_opposes = indicators.tap_candle_opposes_bias(
+                                    _ctype_sniper, "BULLISH" if _is_long else "BEARISH")
                             except Exception:
-                                pass   # both stay False -> fail closed, do not fire
+                                pass   # momentum/confirm stay False and _tap_opposes stays
+                                       # True -> fail closed, do not fire
 
                             # choch_aligned=False on purpose: no 15m fetch on a 10s cadence.
                             # That makes the sniper STRICTER than the 5m path, never looser —
@@ -2976,7 +3010,8 @@ def run():
                             # have the 15m read. Declining late is recoverable.
                             _tap_ok, _tap_why = indicators.sniper_entry_allowed(
                                 st.amd_zone_type, _is_stale, _fresh_mom,
-                                _tap_confirms, choch_aligned=False)
+                                _tap_confirms, choch_aligned=False,
+                                opposing_candle=_tap_opposes)
                             if not _tap_ok:
                                 print(f"[{_base}] ⏭ Sniper stood down — {_tap_why} "
                                       f"(zone={st.amd_zone_type}, {st.bars_in_entry_wait} bars armed)",

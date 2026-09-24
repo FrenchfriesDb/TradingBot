@@ -1471,6 +1471,46 @@ def drop_forming_candle(df):
     return df.iloc[:-1]
 
 
+def zone_left_since_arming(price, zone_lo, zone_hi, already_left):
+    """Has price traded OUTSIDE this zone since it was armed? Sticky once True.
+
+    A "retest" means price left a level and came back to it. The bot printed
+    "waiting for retest/refill" and then never checked: nothing tracked whether price
+    had ever been outside the zone, so the FIRST touch counted — and for a choch_fvg
+    zone the first touch is the displacement itself, because that zone IS the gap the
+    impulse just tore open. Price is normally still inside it at the moment it is armed.
+
+    REAL ENTRIES 2026-09-24:
+        DOGE  zone $0.0951-$0.0955 armed 14:44 on a shooting_star, FILLED the same cycle
+              at $0.0954 — inside the gap it had just made, at the top of the impulse.
+        ASTER zone $0.7011-$0.7034, filled $0.7004 with the last candle a marubozu_bear.
+
+    The ordinary case is unaffected and must stay that way: a demand zone armed BELOW
+    price is already outside-the-zone, so it returns True immediately and the eventual
+    drop into it trades exactly as before. This only delays the case where the zone was
+    armed AROUND the current price, which is precisely the one that was never a retest.
+
+    Fails CLOSED: an unreadable price or zone never GRANTS a retest, but it also never
+    erases one already earned.
+    """
+    if already_left:
+        return True
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        return False
+    if px != px:                                  # NaN
+        return False
+    try:
+        lo = float(zone_lo)
+        hi = float(zone_hi)
+    except (TypeError, ValueError):
+        return False
+    if lo != lo or hi != hi or lo > hi:
+        return False
+    return px < lo or px > hi
+
+
 def price_in_entry_zone(price, zone_lo, zone_hi, is_long, tol_pct=0.0015):
     """True when price has genuinely REACHED its zone, not merely come close to it.
 
@@ -1554,7 +1594,7 @@ def sweep_hunt_expired(sweep_hunt_bar, patience, has_sweep, hard_ceiling_mult=2)
 
 
 def sniper_entry_allowed(zone_type, is_stale, has_momentum,
-                         candle_confirms, choch_aligned):
+                         candle_confirms, choch_aligned, opposing_candle=False):
     """(ok, reason) — may the 10-second sniper fire on this tap?
 
     The sniper and the 5-minute cycle are supposed to enforce the same entry rule. They
@@ -1588,6 +1628,14 @@ def sniper_entry_allowed(zone_type, is_stale, has_momentum,
     it again would be circular, and that path's entries were never the ones complained
     about. Everything else must show a real impulse at the tap AND a confirming candle.
     """
+    # A decisive bar AGAINST the trade vetoes every zone type, choch_fvg included.
+    # 2026-09-24: ASTER filled LONG at $0.7004 with the last candle a marubozu_bear, and
+    # DOGE armed on a shooting_star. tap_candle_opposes_bias existed and was wired into
+    # the 5-MINUTE cycle only — and this watcher polls every 10 seconds, so it wins
+    # nearly every race and the veto was effectively dead code. Buying a decisive down
+    # bar is not a thing the choch premise ever justified.
+    if opposing_candle:
+        return False, "the tap bar is decisively AGAINST the trade"
     if is_stale:
         return (True, "stale zone, fresh momentum confirmed") if has_momentum else \
                (False, "stale zone with no fresh displacement")
