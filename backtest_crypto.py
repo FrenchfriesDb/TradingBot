@@ -32,6 +32,7 @@ WHAT IT DELIBERATELY DOES NOT — read this before trusting a number
       STOP is assumed hit first (the pessimistic, honest assumption).
 """
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -71,13 +72,31 @@ def fetch_paginated(ex, symbol, timeframe, tf_secs, since_ms, total):
 
 class Trade:
     __slots__ = ("symbol", "side", "entry", "stop", "target", "qty",
-                 "entry_ts", "exit_ts", "exit", "reason", "pnl", "fees")
+                 "entry_ts", "exit_ts", "exit", "reason", "pnl", "fees",
+                 "partial_qty", "banked", "tp1")
 
     def __init__(self, symbol, side, entry, stop, target, qty, entry_ts):
         self.symbol, self.side = symbol, side
         self.entry, self.stop, self.target, self.qty = entry, stop, target, qty
         self.entry_ts, self.exit_ts, self.exit, self.reason, self.pnl = entry_ts, None, None, None, 0.0
         self.fees = 0.0
+        self.partial_qty, self.banked, self.tp1 = 0.0, 0.0, None
+
+    def take_partial(self, price, frac):
+        """Bank `frac` of the position at `price`. Returns True the first time only.
+
+        The removed live version took HALF at 1R, which clipped every winner while losers
+        still took the full stop — that asymmetry is why it was deleted. This models the
+        operator's version instead: a SMALLER tranche (1/3), and only when the target is
+        far enough that riding the whole position to it is the doubtful part.
+        """
+        if self.partial_qty or frac <= 0 or frac >= 1:
+            return False
+        q = self.qty * frac
+        gross = ((price - self.entry) if self.side == "LONG" else (self.entry - price)) * q
+        self.banked = gross - (self.entry + price) * q * TAKER_FEE_RATE
+        self.partial_qty, self.qty = q, self.qty - q
+        return True
 
     def close(self, price, ts, reason):
         self.exit, self.exit_ts, self.reason = price, ts, reason
@@ -86,7 +105,7 @@ class Trade:
         # each side. Without this the backtest reports the gross number that made the live
         # strategy look profitable while it sat exactly on its 0.245%/side break-even.
         self.fees = (self.entry + price) * self.qty * TAKER_FEE_RATE
-        self.pnl = gross - self.fees
+        self.pnl = gross - self.fees + self.banked
         return self
 
 
@@ -121,6 +140,14 @@ def backtest_symbol(ex, symbol, days, verbose=False):
             hi, lo = float(bar["high"]), float(bar["low"])
             hit_stop = (lo <= open_trade.stop) if open_trade.side == "LONG" else (hi >= open_trade.stop)
             hit_tgt  = (hi >= open_trade.target) if open_trade.side == "LONG" else (lo <= open_trade.target)
+            # TP1 first: a bar that reaches both TP1 and the stop is assumed to have hit
+            # TP1 on the way, which is the optimistic read — flagged rather than hidden,
+            # and it can only FLATTER the scale-out, so a negative result is safe.
+            if open_trade.tp1 is not None and not open_trade.partial_qty:
+                got_tp1 = ((hi >= open_trade.tp1) if open_trade.side == "LONG"
+                           else (lo <= open_trade.tp1))
+                if got_tp1:
+                    open_trade.take_partial(open_trade.tp1, SCALE_FRAC)
             if hit_stop:          # pessimistic: stop wins a same-bar tie
                 trades.append(open_trade.close(open_trade.stop, ts, "SL")); open_trade = None
             elif hit_tgt:
@@ -181,9 +208,15 @@ def backtest_symbol(ex, symbol, days, verbose=False):
             htf_closed, price + MIN_AI_RR * risk if is_long else price - MIN_AI_RR * risk,
             "bullish" if is_long else "bearish")
         target = indicators.structural_take_profit(price, risk, pool, is_long, MIN_AI_RR, MAX_AI_RR)
+        _tp1 = None
+        if SCALE_FRAC > 0 and risk > 0:
+            _rr = abs(target - price) / risk
+            if _rr >= SCALE_MIN_RR:            # only when the target is genuinely far
+                _tp1 = price + (target - price) * SCALE_TP1_FRAC
         qty = indicators.cap_qty_for_risk(MAX_RISK_DOLLARS / risk, risk, MAX_RISK_DOLLARS)
 
         open_trade = Trade(symbol, "LONG" if is_long else "SHORT", price, stop, target, qty, ts)
+        open_trade.tp1 = _tp1
         if verbose:
             print(f"    {ts:%m-%d %H:%M} {symbol:9} {open_trade.side:5} @ {price:>11,.4f} "
                   f"SL {stop:>11,.4f} TP {target:>11,.4f} (age {bars_wait}b)")
@@ -228,6 +261,12 @@ def report(all_trades, days):
         f"{k}={len(v)} ({sum(v):+,.0f})" for k, v in sorted(by_reason.items())))
     print("\n  Reminder: no AI gate, no news, no slippage (fees ARE modelled) — this is")
     print("  before filtering, and it is optimistic. Judge the sign, not the cents.")
+
+
+# Scale-out policy under test. 0 = the live behaviour (full position rides to target).
+SCALE_FRAC    = float(os.getenv("SCALE_FRAC", "0"))       # 0.333 = take a third at TP1
+SCALE_TP1_FRAC = float(os.getenv("SCALE_TP1_FRAC", "0.5"))  # TP1 at half the way to TP
+SCALE_MIN_RR  = float(os.getenv("SCALE_MIN_RR", "3.0"))     # "far" target only
 
 
 def main():
