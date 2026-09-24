@@ -103,6 +103,7 @@ from config import (BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET, BINANCE_CA
                     # stay entirely on the ccxt/Coinbase paper path.
                     API_KEY as ALPACA_KEY_FOR_NEWS,
                     API_SECRET as ALPACA_SECRET_FOR_NEWS)
+from bot import trade_ledger as _ledger
 from sheets_logger import (get_sheet_client, ensure_tabs, log_daily_snapshot, log_trade,
                             missing_snapshot_dates, MACRO_HEADER, LEDGER_HEADER)
 from chart_renderer import render_trade_chart, save_chart_locally
@@ -1096,6 +1097,26 @@ def _fetch_ohlcv_full(exchange, symbol, timeframe, tf_ms, since_ms, total_bars, 
 
 # ── Google Sheets trade ledger ──────────────────────────────────────────────────
 
+def _send_ledger_row(row):
+    """Hand one stored row to Sheets. True only on success, so a failure keeps it queued.
+
+    log_trade() swallows its own errors and returns None either way, so success is
+    inferred from it not raising AND a client existing — a None client means no
+    credentials, which is a failure to record, not a successful no-op.
+    """
+    client = get_sheet_client()
+    if client is None:
+        return False
+    log_trade(client, GOOGLE_SHEET_URL, "Crypto Ledger",
+              row.get("entry_time"), row.get("exit_time"), row.get("ticker"),
+              row.get("side"), row.get("entry_price"), row.get("stop_loss"),
+              row.get("take_profit"), row.get("exit_price"), row.get("size"),
+              row.get("margin"), row.get("notional"), row.get("leverage"),
+              row.get("pnl"), row.get("reason"), row.get("chart_url"),
+              fees=row.get("fees", 0.0), exit_reason=row.get("exit_reason", ""))
+    return True
+
+
 def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, state, exchange, fees=0.0,
                               exit_reason=""):
     """Fire-and-forget: append a completed round-trip row to the Crypto Ledger tab,
@@ -1151,11 +1172,26 @@ def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, 
     # was never actually taken (verified: 7 real trades showed fake RR of 21-37).
     # entry_stop_loss is a snapshot taken once at fill, never mutated afterward.
     ledger_sl = state.entry_stop_loss if state.entry_stop_loss is not None else state.stop_loss
-    log_trade(get_sheet_client(), GOOGLE_SHEET_URL, "Crypto Ledger",
-              (state.entry_time or now).astimezone().isoformat(), now.astimezone().isoformat(), base,
-              "LONG" if is_long else "SHORT", entry_price, ledger_sl, state.take_profit,
-              exit_price, qty, margin, notional, PAPER_LEVERAGE, pnl_total, reason, chart_ref,
-              fees=fees, exit_reason=exit_reason)
+    # DURABLE FIRST, Sheets second. log_trade() is fail-soft — correct, a Sheets outage
+    # must not crash the loop — but it was also fire-and-forget, so eight closed trades
+    # were lost outright to connection resets and one iCloud EDEADLK on the credentials
+    # file. The row now lands on local disk (outside the synced repo) before the network
+    # is involved, and a failed send simply leaves it pending for the next flush.
+    _row = dict(
+        entry_time=(state.entry_time or now).astimezone().isoformat(),
+        exit_time=now.astimezone().isoformat(), ticker=base,
+        side="LONG" if is_long else "SHORT", entry_price=entry_price, stop_loss=ledger_sl,
+        take_profit=state.take_profit, exit_price=exit_price, size=qty, margin=margin,
+        notional=notional, leverage=PAPER_LEVERAGE, pnl=pnl_total, reason=reason,
+        chart_url=chart_ref, fees=fees, exit_reason=exit_reason)
+    _lpath = _ledger.ledger_path("crypto")
+    if not _lpath or not _ledger.append_row(_lpath, _row):
+        print(f"[LEDGER] ⚠️ could not write {base} to the local ledger — "
+              f"falling back to a direct Sheets write only.", flush=True)
+    _sent, _pending = _ledger.flush_pending(_lpath, _send_ledger_row)
+    if _pending:
+        print(f"[LEDGER] {_sent} row(s) sent, {_pending} still pending "
+              f"(retried on the next close).", flush=True)
 
 
 # ── NVIDIA AI trade confirmation ───────────────────────────────────────────────
