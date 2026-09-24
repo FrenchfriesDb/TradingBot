@@ -1831,7 +1831,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     # everything the strict branch now rejects — which is exactly what happened after
     # 2026-09-04: 6 of 6 setups armed here, on zones with no displacement behind them.
     _g_ltf = indicators.displacement_gates(df_ltf, DISPLACEMENT_ATR_MULT,
-                                           DISPLACEMENT_MIN_PCT, MIN_FVG_PCT)
+                                           DISPLACEMENT_MIN_PCT, MIN_FVG_PCT, htf_atr=atr_1h)
     _g_htf = indicators.displacement_gates(df_htf, DISPLACEMENT_ATR_MULT,
                                            DISPLACEMENT_MIN_PCT, MIN_FVG_PCT)
     is_fvg_bull_ltf, fvg_bot_ltf, fvg_top_ltf = indicators.find_bullish_fvg(df_ltf, **_g_ltf)
@@ -1892,7 +1892,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         # Displacement candle range (the momentum bar that left the FVG)
         _dsp_found, _dsp_dir, _dsp_lo, _dsp_hi, _ = indicators.detect_displacement_fvg(
             df_ltf, **indicators.displacement_gates(df_ltf, DISPLACEMENT_ATR_MULT,
-                                                 DISPLACEMENT_MIN_PCT, MIN_FVG_PCT))
+                                                 DISPLACEMENT_MIN_PCT, MIN_FVG_PCT, htf_atr=atr_1h))
         state.disp_low  = float(_dsp_lo) if _dsp_found else None
         state.disp_high = float(_dsp_hi) if _dsp_found else None
 
@@ -2265,7 +2265,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         want = "bullish" if state.bias == "BULLISH" else "bearish"
         disp_found, disp_dir, disp_lo, disp_hi, _ = indicators.detect_displacement_fvg(
             df_ltf, **indicators.displacement_gates(df_ltf, DISPLACEMENT_ATR_MULT,
-                                                 DISPLACEMENT_MIN_PCT, MIN_FVG_PCT))
+                                                 DISPLACEMENT_MIN_PCT, MIN_FVG_PCT, htf_atr=atr_1h))
 
         if disp_found and disp_dir == want:
             state.amd_zone_type = "choch_fvg"      # mark: FVG == CHoCH → retest-rebounce entry

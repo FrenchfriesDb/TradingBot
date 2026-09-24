@@ -1008,7 +1008,8 @@ def round_trip_fee(entry_price, exit_price, qty, fee_rate, exit_fee_rate=None):
         return 0.0
 
 
-def displacement_gates(df, atr_mult=1.8, min_pct=0.0015, gap_pct=0.0015):
+def displacement_gates(df, atr_mult=1.8, min_pct=0.0015, gap_pct=0.0015,
+                       htf_atr=None, htf_mult=1.0):
     """Both size floors for detect_displacement_fvg, derived from one dataframe.
 
     Splat it at the call site — `**indicators.displacement_gates(df)` — so the crypto
@@ -1025,8 +1026,28 @@ def displacement_gates(df, atr_mult=1.8, min_pct=0.0015, gap_pct=0.0015):
             return {}
     except Exception:
         return {}
+    _floor = displacement_min_body(range_atr(df), price, atr_mult, min_pct)
+    # THIRD TERM: tie the displacement to the RISK, not just to a quiet 5m tape.
+    # The 5m ATR is measured over the same chop the gate is meant to exclude, so when the
+    # tape goes quiet the floor sinks with it. ASTER 2026-09-24 cleared 1.8x by ONE
+    # PERCENT (1.82x) on a bar worth 0.313% of price, against a trade risking 1.57%.
+    # The stop is floored off the 1H ATR and measures 1.3-1.6x it on real trades, so the
+    # operator's rule — "the candle should be 3/4 of the entry-to-stop box" — becomes
+    # body >= 0.75 x (1.3 to 1.6) x atr_1h, i.e. 0.98x to 1.21x atr_1h. Default 1.0 sits at
+    # the bottom of that band: exactly-3/4 passes at a typical stop (1.45x atr_1h -> 1.09x)
+    # and is marginally strict at the tightest observed one (1.30x -> 0.98x). Rounder than
+    # the fitted number and it states plainly: the displacement must be worth at least one
+    # 1H candle's average range. Asset-neutral, built from the same quantity as the stop.
+    # An unusable 1H read is IGNORED rather than treated as zero: a bad ATR must never
+    # become "no floor at all".
+    try:
+        _h = float(htf_atr)
+        if _h == _h and _h > 0:
+            _floor = max(_floor, float(htf_mult) * _h)
+    except (TypeError, ValueError):
+        pass
     return {
-        "min_body_abs": displacement_min_body(range_atr(df), price, atr_mult, min_pct),
+        "min_body_abs": _floor,
         "min_gap_abs":  gap_pct * price,
     }
 
