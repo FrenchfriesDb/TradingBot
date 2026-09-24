@@ -2,6 +2,7 @@ from lumibot.strategies import Strategy
 from lumibot.entities import Asset, Order
 from bot import indicators
 from bot import ai_model as _ai_model
+from bot import trade_ledger as _ledger
 from bot.market_clock import call_with_deadline
 from finbert_utils import estimate_sentiment
 from config import (NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALPACA_API_SECRET,
@@ -298,7 +299,12 @@ class DebbieLaSMC(Strategy):
         self.ranging_mode       = {s: False  for s in self.symbols}
         self.amd_phase          = {s: None   for s in self.symbols}
         self.amd_zone_type      = {s: None   for s in self.symbols}
-        self.zone_set_price     = {s: None   for s in self.symbols}  # price when trend_follow zone armed
+        self.zone_set_price     = {s: None   for s in self.symbols}
+        # Has price traded OUTSIDE the armed zone since it was armed? Until it has, there
+        # is nothing to "retest" — a displacement FVG IS the gap the impulse just made, so
+        # price is often still inside it when the zone is armed and the first touch is the
+        # impulse itself. binance_bot entered DOGE that way, in the same cycle it armed.
+        self.zone_left          = {s: False  for s in self.symbols}  # price when trend_follow zone armed
         # Flag-continuation only: the flag's own invalidation level, and the measured
         # move (flag edge + pole body) the detector computed. Both are None on every
         # other path, and the entry code falls back to its normal structural stop /
@@ -912,16 +918,50 @@ class DebbieLaSMC(Strategy):
 
         margin   = qty * entry_price / PAPER_LEVERAGE
         notional = qty * entry_price
-        log_trade(get_sheet_client(), GOOGLE_SHEET_URL, "Stock Ledger",
-                  entry_time_str, exit_time_str, symbol,
-                  "LONG" if is_long else "SHORT", entry_price, sl, tp, exit_price, qty,
-                  margin, notional, PAPER_LEVERAGE, pnl, reason, chart_ref,
-                  # Exits here fire at the BROKER (bracket OCO legs), so there is no label
-                  # to read — infer from which leg the fill landed on. No breakeven_moved
-                  # argument: unlike the crypto bot, this strategy has no break-even trail,
-                  # so that bucket cannot occur. Callers that DO know (the stale exit, the
-                  # EOD flatten) pass exit_reason explicitly and win over the inference.
-                  exit_reason=exit_reason or indicators.infer_exit_reason(exit_price, sl, tp))
+        # DURABLE FIRST, Sheets second — same as binance_bot. log_trade() is fail-soft,
+        # which is right (a Sheets outage must not crash the loop), but it was also
+        # fire-and-forget: on the crypto side eight closed trades were lost outright to
+        # connection resets and one iCloud EDEADLK on the credentials file. The row lands
+        # on local disk, outside the synced repo, before the network is involved.
+        _exit_reason_final = exit_reason or indicators.infer_exit_reason(exit_price, sl, tp)
+        _row = dict(entry_time=entry_time_str, exit_time=exit_time_str, ticker=symbol,
+                    side="LONG" if is_long else "SHORT", entry_price=entry_price,
+                    stop_loss=sl, take_profit=tp, exit_price=exit_price, size=qty,
+                    margin=margin, notional=notional, leverage=PAPER_LEVERAGE, pnl=pnl,
+                    reason=reason, chart_url=chart_ref, fees=0.0,
+                    exit_reason=_exit_reason_final)
+        _lpath = _ledger.ledger_path("stock")
+        if not _ledger.append_row(_lpath, _row):
+            self.log_message(f"[{symbol}] ⚠️ could not write to the local ledger — "
+                             f"Sheets write only.", color="red")
+        _sent, _pend = _ledger.flush_pending(_lpath, self._send_ledger_row)
+        if _pend:
+            self.log_message(f"[LEDGER] {_sent} row(s) sent, {_pend} still pending "
+                             f"(retried on the next close).", color="yellow")
+        return
+
+    def _send_ledger_row(self, row):
+        """Hand one stored row to Sheets. True only on success, so a failure keeps it
+        queued. A None client means no credentials — a failure to record, not a
+        successful no-op."""
+        client = get_sheet_client()
+        if client is None:
+            return False
+        log_trade(client, GOOGLE_SHEET_URL, "Stock Ledger",
+                  row.get("entry_time"), row.get("exit_time"), row.get("ticker"),
+                  row.get("side"), row.get("entry_price"), row.get("stop_loss"),
+                  row.get("take_profit"), row.get("exit_price"), row.get("size"),
+                  row.get("margin"), row.get("notional"), row.get("leverage"),
+                  row.get("pnl"), row.get("reason"), row.get("chart_url"),
+                  exit_reason=row.get("exit_reason", ""))
+        return True
+
+    # NOTE on exit_reason, preserved from the direct-write this replaced: exits here fire
+    # at the BROKER (bracket OCO legs), so there is no label to read — it is inferred from
+    # which leg the fill landed on. No breakeven_moved argument: unlike the crypto bot,
+    # this strategy has no break-even trail, so that bucket cannot occur. Callers that DO
+    # know (the stale exit, the EOD flatten) pass exit_reason explicitly and win over the
+    # inference. That inference now happens once, into _exit_reason_final above.
 
     def _reset(self, symbol):
         # Cancel the broker-side OCO/bracket legs (TP/SL) so they don't linger as orphans
@@ -947,6 +987,7 @@ class DebbieLaSMC(Strategy):
         self.fvg_low[symbol]         = None
         self.fvg_high[symbol]        = None
         self.fvg_set_iter[symbol]    = 0
+        self.zone_left[symbol]       = False   # re-earned per zone
         self.flag_stop_ref[symbol]   = None
         self.flag_target[symbol]     = None
         self.ote_zone[symbol]        = None
@@ -1170,6 +1211,9 @@ class DebbieLaSMC(Strategy):
                 "atr_pct":        atr_pct,
                 "atr_1h":         atr_1h,
                 "df":             df,
+                # Same rule on the 4H frame — every supply/demand/FVG zone below is a
+                # STORED level and must not be derived from a bar still in progress.
+                "df_closed":      indicators.drop_forming_candle(df),
             }
         except Exception as e:
             self.log_message(f"[{symbol}] HTF error: {e}")
@@ -1186,8 +1230,14 @@ class DebbieLaSMC(Strategy):
             df = bars.pandas_df
             is_sweep, support_level, sweep_wick_low = indicators.check_liquidity_sweep(df)
             is_mss, swing_high_broken = indicators.check_market_structure_shift(df)
-            is_fvg_bull, fvg_bottom, fvg_top = indicators.find_bullish_fvg(df)
-            is_fvg_bear, fvg_bear_bottom, fvg_bear_top = indicators.find_bearish_fvg(df)
+            # Zone edges come from CLOSED bars. A stored zone whose edge was taken from a
+            # still-forming bar keeps moving after it is armed — the bar prints a new
+            # high/low and the "same" finder returns a different level. binance_bot had
+            # this on its 6H frame and nowhere else; this bot had it on NEITHER frame.
+            # Live reads (price, ATR, sweeps, the tap candle) keep the forming bar below.
+            df_closed = indicators.drop_forming_candle(df)
+            is_fvg_bull, fvg_bottom, fvg_top = indicators.find_bullish_fvg(df_closed)
+            is_fvg_bear, fvg_bear_bottom, fvg_bear_top = indicators.find_bearish_fvg(df_closed)
             is_choch, choch_direction = indicators.detect_choch(df, lookback=5)
             return {
                 "sweep": is_sweep, "sweep_wick_low": sweep_wick_low,
@@ -1198,6 +1248,7 @@ class DebbieLaSMC(Strategy):
                 "fvg_bear_top": fvg_bear_top,
                 "choch": is_choch, "choch_direction": choch_direction,
                 "df": df,
+                "df_closed": df_closed,
             }
         except Exception as e:
             self.log_message(f"[{symbol}] LTF error: {e}")
@@ -1527,10 +1578,12 @@ class DebbieLaSMC(Strategy):
                             if htf.get("bos_near_sr") else "")
                 ch_tag   = f"  [{htf['channel']} channel]" if htf.get("channel") else ""
                 color    = "green" if direction == "bullish" else "red"
+                _hc = htf.get("df_closed") if htf.get("df_closed") is not None else htf["df"]
                 d_found, d_dir, d_lo, d_hi, _ = indicators.detect_displacement_fvg(
-                    htf["df"],
-                    **indicators.displacement_gates(htf["df"], DISPLACEMENT_ATR_MULT,
-                                                    DISPLACEMENT_MIN_PCT, MIN_FVG_PCT))
+                    _hc,
+                    **indicators.displacement_gates(_hc, DISPLACEMENT_ATR_MULT,
+                                                    DISPLACEMENT_MIN_PCT, MIN_FVG_PCT,
+                                                    htf_atr=htf.get("atr_1h")))
                 if d_found and d_dir == direction:
                     self.fvg_low[symbol]       = d_lo
                     self.fvg_high[symbol]      = d_hi
@@ -1567,7 +1620,7 @@ class DebbieLaSMC(Strategy):
                     # → real move will be DOWN — SHORT from supply zone above
                     if amd_phase == "manipulation_up" and daily_trend == "bearish":
                         found, sup_lo, sup_hi, sup_type = indicators.find_supply_zone(
-                            htf["df"], current_price
+                            htf.get("df_closed", htf["df"]), current_price
                         )
                         if found:
                             self.bias[symbol]          = "BEARISH"
@@ -1590,7 +1643,7 @@ class DebbieLaSMC(Strategy):
                     # → real move will be UP — LONG from demand zone below
                     elif amd_phase == "manipulation_down" and daily_trend == "bullish":
                         found, dem_lo, dem_hi, dem_type = indicators.find_demand_zone(
-                            htf["df"], current_price
+                            htf.get("df_closed", htf["df"]), current_price
                         )
                         if found:
                             self.bias[symbol]          = "BULLISH"
@@ -1641,7 +1694,7 @@ class DebbieLaSMC(Strategy):
                 if atr_pct >= MIN_ATR_PCT:
                     if daily_trend == "bullish":
                         found, dem_lo, dem_hi, dem_type = indicators.find_demand_zone(
-                            htf["df"], current_price, max_distance_pct=0.08
+                            htf.get("df_closed", htf["df"]), current_price, max_distance_pct=0.08
                         )
                         if found:
                             self.bias[symbol]            = "BULLISH"
@@ -1659,7 +1712,7 @@ class DebbieLaSMC(Strategy):
                             )
                     elif daily_trend == "bearish":
                         found, sup_lo, sup_hi, sup_type = indicators.find_supply_zone(
-                            htf["df"], current_price, max_distance_pct=0.08
+                            htf.get("df_closed", htf["df"]), current_price, max_distance_pct=0.08
                         )
                         if found:
                             self.bias[symbol]            = "BEARISH"
@@ -1747,10 +1800,15 @@ class DebbieLaSMC(Strategy):
             # Prefer the post-sweep displacement FVG (the CHoCH gap) — that's the gap the
             # reversal left behind. Fall back to a generic FVG/OB only with no clean gap.
             want = "bullish" if self.bias[symbol] == "BULLISH" else "bearish"
+            # The 1H-ATR term ties the displacement to the RISK. The 15m ATR is measured
+            # over the same chop the gate exists to exclude, so on a quiet tape an
+            # ordinary bar clears a multiple of its own collapsed ATR.
+            _lc = ltf.get("df_closed") if ltf.get("df_closed") is not None else ltf["df"]
             d_found, d_dir, d_lo, d_hi, _ = indicators.detect_displacement_fvg(
-                ltf["df"],
-                **indicators.displacement_gates(ltf["df"], DISPLACEMENT_ATR_MULT,
-                                                DISPLACEMENT_MIN_PCT, MIN_FVG_PCT))
+                _lc,
+                **indicators.displacement_gates(_lc, DISPLACEMENT_ATR_MULT,
+                                                DISPLACEMENT_MIN_PCT, MIN_FVG_PCT,
+                                                htf_atr=htf.get("atr_1h")))
             if d_found and d_dir == want:
                 self.fvg_low[symbol]       = d_lo
                 self.fvg_high[symbol]      = d_hi
@@ -1838,8 +1896,19 @@ class DebbieLaSMC(Strategy):
                          _zlo <= current_price <= _zhi)
             _bar_tap  = indicators.zone_tapped(ltf["df"], _zlo, _zhi, lookback=TAP_LOOKBACK_BARS)
 
+            # Sticky per zone. For the ordinary setup — demand armed BELOW price — this is
+            # already True at arming and nothing changes; it only holds back a zone armed
+            # AROUND price, which was never a retest.
+            self.zone_left[symbol] = indicators.zone_left_since_arming(
+                current_price, _zlo, _zhi, self.zone_left[symbol])
+
             in_fvg = False
-            if _bar_tap:
+            if _bar_tap and not self.zone_left[symbol]:
+                self.log_message(
+                    f"[{symbol}] ⏳ Not a retest yet — price {current_price:.2f} has not "
+                    f"left {_zlo:.2f}–{_zhi:.2f} since it was armed; this is the impulse, "
+                    f"not a return to it.", color="yellow")
+            elif _bar_tap:
                 # Detection widened, so price may have left the zone by now — and every
                 # downstream number (stop, risk, target, R:R) comes from the live price
                 # on a MARKET order. tap_chase_ok bounds the fill, asymmetrically: a long
