@@ -1816,6 +1816,14 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     # the fill only happened against the stale snapshot. Closed bars keep the zone stable
     # between recomputes, so what was armed still means what it meant.
     df_htf_closed = indicators.drop_forming_candle(df_htf)
+    # Same rule for the 5m frame, which never had it. A choch_fvg zone is [c1.high,
+    # c3.low], and c3 was allowed to be the STILL-FORMING bar — so the gap was
+    # snapshotted from a low that was still moving, and as that candle finished its wick
+    # extended down into the zone the bot had already armed. Exactly the incident this
+    # helper was written for on the 6H frame, left unfixed on the 5m one.
+    # Only ZONE DERIVATION uses this. Live price, ATR, the tap candle and sweep detection
+    # deliberately keep df_ltf: those have to describe now, not the last closed bar.
+    df_ltf_closed = indicators.drop_forming_candle(df_ltf)
     # Log/label form of the frame these candles actually are. Every "4H ..." string
     # below used to be a literal, which is how the bot spent weeks announcing
     # "4H low-sweep" over 6H bars.
@@ -1866,12 +1874,12 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     # Same size discipline as the displacement path. Without it this FALLBACK absorbs
     # everything the strict branch now rejects — which is exactly what happened after
     # 2026-09-04: 6 of 6 setups armed here, on zones with no displacement behind them.
-    _g_ltf = indicators.displacement_gates(df_ltf, DISPLACEMENT_ATR_MULT,
+    _g_ltf = indicators.displacement_gates(df_ltf_closed, DISPLACEMENT_ATR_MULT,
                                            DISPLACEMENT_MIN_PCT, MIN_FVG_PCT, htf_atr=atr_1h)
     _g_htf = indicators.displacement_gates(df_htf, DISPLACEMENT_ATR_MULT,
                                            DISPLACEMENT_MIN_PCT, MIN_FVG_PCT)
-    is_fvg_bull_ltf, fvg_bot_ltf, fvg_top_ltf = indicators.find_bullish_fvg(df_ltf, **_g_ltf)
-    is_fvg_bear_ltf, fvg_bear_bot_ltf, fvg_bear_top_ltf = indicators.find_bearish_fvg(df_ltf, **_g_ltf)
+    is_fvg_bull_ltf, fvg_bot_ltf, fvg_top_ltf = indicators.find_bullish_fvg(df_ltf_closed, **_g_ltf)
+    is_fvg_bear_ltf, fvg_bear_bot_ltf, fvg_bear_top_ltf = indicators.find_bearish_fvg(df_ltf_closed, **_g_ltf)
     is_fvg_bull_htf, fvg_bot_htf, fvg_top_htf = indicators.find_bullish_fvg(df_htf, **_g_htf)
     is_fvg_bear_htf, fvg_bear_bot_htf, fvg_bear_top_htf = indicators.find_bearish_fvg(df_htf, **_g_htf)
 
@@ -1927,7 +1935,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
 
         # Displacement candle range (the momentum bar that left the FVG)
         _dsp_found, _dsp_dir, _dsp_lo, _dsp_hi, _ = indicators.detect_displacement_fvg(
-            df_ltf, **indicators.displacement_gates(df_ltf, DISPLACEMENT_ATR_MULT,
+            df_ltf_closed, **indicators.displacement_gates(df_ltf_closed, DISPLACEMENT_ATR_MULT,
                                                  DISPLACEMENT_MIN_PCT, MIN_FVG_PCT, htf_atr=atr_1h))
         state.disp_low  = float(_dsp_lo) if _dsp_found else None
         state.disp_high = float(_dsp_hi) if _dsp_found else None
@@ -1938,7 +1946,8 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         # not a leg at all. It also used calculate_fib_levels()' 38.2-61.8 band, which is
         # not the OTE — on ADA's live swing the two bands did not even overlap — and
         # always measured DOWN from the high regardless of which end came last.
-        _leg = indicators.find_swing_leg(df_ltf)
+        _leg = indicators.find_swing_leg(df_ltf_closed)   # same reason: a leg anchored
+        # to a moving high/low redraws itself every tick
         _ote = indicators.optimal_trade_entry(*_leg) if _leg else None
         if _ote:
             state.ote_low, state.ote_high = _ote
@@ -2300,7 +2309,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         # only if no clean displacement gap exists yet.
         want = "bullish" if state.bias == "BULLISH" else "bearish"
         disp_found, disp_dir, disp_lo, disp_hi, _ = indicators.detect_displacement_fvg(
-            df_ltf, **indicators.displacement_gates(df_ltf, DISPLACEMENT_ATR_MULT,
+            df_ltf_closed, **indicators.displacement_gates(df_ltf_closed, DISPLACEMENT_ATR_MULT,
                                                  DISPLACEMENT_MIN_PCT, MIN_FVG_PCT, htf_atr=atr_1h))
 
         if disp_found and disp_dir == want:
