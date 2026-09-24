@@ -104,6 +104,14 @@ from config import (BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET, BINANCE_CA
                     API_KEY as ALPACA_KEY_FOR_NEWS,
                     API_SECRET as ALPACA_SECRET_FOR_NEWS)
 from bot import trade_ledger as _ledger
+from bot import close_requests as _closereq
+
+# Manual "close now" requests from the dashboard. The dashboard holds no exchange
+# credentials and only READS state, which is worth keeping — so the button records a
+# request here and THIS process, which already owns the position and its stops, acts on
+# it inside the 10-second watcher.
+CLOSE_REQUEST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "close_requests.json")
 from sheets_logger import (get_sheet_client, ensure_tabs, log_daily_snapshot, log_trade,
                             missing_snapshot_dates, MACRO_HEADER, LEDGER_HEADER)
 from chart_renderer import render_trade_chart, save_chart_locally
@@ -2970,6 +2978,47 @@ def run():
             time.sleep(10)
             for sym in symbols:
                 st = states[sym]
+
+                # ── MANUAL CLOSE from the dashboard ──────────────────────────────
+                # Checked before anything else: when the operator presses the button the
+                # only correct next action is out, at market, now.
+                try:
+                    if sym in _closereq.pending_closes(CLOSE_REQUEST_FILE):
+                        _held_m = paper.get_position(sym)
+                        _base_m = sym.split("/")[0]
+                        # Consume the request FIRST, whatever happens next. A request that
+                        # survives its own execution closes the next position too.
+                        _closereq.clear_close(CLOSE_REQUEST_FILE, sym)
+                        if abs(_held_m) > 1e-9:
+                            _long_m = _held_m > 0
+                            _fill_m = float(exchange.fetch_ticker(sym)["last"])
+                            _qty_m  = abs(_held_m)
+                            if _long_m:
+                                paper.sell(sym, _qty_m, _fill_m)
+                                _pnl_m = (_fill_m - st.entry_price) * _qty_m
+                            else:
+                                paper.buy(sym, _qty_m, _fill_m)
+                                _pnl_m = (st.entry_price - _fill_m) * _qty_m
+                            _fee_m = indicators.round_trip_fee(st.entry_price, _fill_m,
+                                                               _qty_m, TAKER_FEE_RATE)
+                            _pnl_m -= _fee_m
+                            trade_print(_base_m, "✋ MANUAL CLOSE (dashboard)", _fill_m,
+                                        pnl=_pnl_m, balance=paper.balance)
+                            alert(f"Manual close — {_base_m}",
+                                  f"@ ${_fill_m:,.4f}  P&L ${_pnl_m:+.2f}",
+                                  sound="Glass" if _pnl_m >= 0 else "Basso",
+                                  speak=f"{_base_m} closed manually")
+                            _log_trade_close_to_sheet(_base_m, _long_m, st.entry_price,
+                                                      _fill_m, _qty_m, _pnl_m, st, exchange,
+                                                      fees=_fee_m, exit_reason="MANUAL")
+                            st.reset()
+                            save_state(states, paper)
+                        else:
+                            print(f"  ✋ {_base_m}: manual close requested but no position "
+                                  f"is open — request discarded.", flush=True)
+                        continue
+                except Exception as _e_m:
+                    print(f"  ⚠️ manual-close check failed for {sym}: {_e_m}", flush=True)
 
                 # ── 10-second entry sniper ────────────────────────────────────
                 # PAUSE_NEW_ENTRIES also blocks this — a zone armed BEFORE the pause

@@ -13,6 +13,11 @@ from jinja2 import Template
 from bot.live_candle import patch_live_candle
 
 CRYPTO_STATE   = "crypto_state.json"
+# Manual close requests. This process holds NO exchange credentials and never places an
+# order — it records the operator's intent here and binance_bot's own 10-second watcher,
+# which already owns the position and its stops, acts on it. Keeping the credentials out
+# of the web process is the point, not an accident.
+CLOSE_REQUESTS = "close_requests.json"
 TEST_STATE     = "test_state.json"
 STRATEGY_STATE = "strategy_state.json"
 PORT           = 8888
@@ -223,7 +228,10 @@ HTML = r"""<!DOCTYPE html>
   select{background:#2a2e39;color:#d1d4dc;border:1px solid #363a45;padding:5px 10px;border-radius:4px;font-size:13px;cursor:pointer;outline:none}
   select:hover{border-color:#4c5261}
   #bal{font-size:13px;color:#787b86;margin-left:4px}
-  #journal-link{margin-left:auto;background:#2a2e39;color:#d1d4dc;border:1px solid #363a45;padding:5px 12px;border-radius:4px;font-size:13px;text-decoration:none;display:flex;align-items:center;gap:6px;transition:border-color .15s,color .15s}
+  #close-btn{margin-left:auto;background:#3a2226;color:#ff7b7b;border:1px solid #6b2b32;padding:5px 12px;border-radius:4px;font-size:13px;cursor:pointer;display:none;align-items:center;gap:6px;font-family:inherit;transition:background .15s,color .15s}
+  #close-btn:hover{background:#5c2b31;color:#fff}
+  #close-btn:disabled{opacity:.5;cursor:default}
+  #journal-link{background:#2a2e39;color:#d1d4dc;border:1px solid #363a45;padding:5px 12px;border-radius:4px;font-size:13px;text-decoration:none;display:flex;align-items:center;gap:6px;transition:border-color .15s,color .15s}
   #journal-link:hover{border-color:#22d3ee;color:#fff}
   #info{display:flex;gap:0;background:#1a1d27;border-bottom:1px solid #2a2e39;flex-shrink:0;overflow-x:auto}
   .icard{padding:10px 18px;border-right:1px solid #2a2e39;min-width:120px}
@@ -249,6 +257,7 @@ HTML = r"""<!DOCTYPE html>
   </select>
   <select id="symSel"></select>
   <span id="bal"></span>
+  <button id="close-btn" title="Close this position at market">✋ Close Position</button>
   <a id="journal-link" href="/journal" target="_blank" rel="noopener">📓 Journal</a>
 </div>
 
@@ -701,6 +710,35 @@ async function refresh(){
   const sm       = botData?.state_machine?.[sym] || null;
   const pool     = bot==='test' ? botData?.pools?.[sym] || null : null;
   const lastTime = lastCandleTimes.length ? lastCandleTimes[lastCandleTimes.length-1] : null;
+
+  // The close button exists only while THIS symbol on THIS bot actually holds a position,
+  // and only for the crypto bot, which is the one that honours the request. Showing it
+  // otherwise invites a click that silently does nothing.
+  (function(){
+    const btn = document.getElementById('close-btn');
+    if(!btn) return;
+    const canClose = !!pos && bot==='smc';
+    btn.style.display = canClose ? 'flex' : 'none';
+    if(!canClose) return;
+    btn.disabled = false;
+    btn.textContent = '✋ Close ' + sym.split('/')[0];
+    btn.onclick = async () => {
+      // Irreversible and it spends real (paper) P&L, so it asks first and names the
+      // symbol and the live P&L in the prompt — a mis-click on the wrong symbol is the
+      // realistic failure here, not a mis-click on the button.
+      const pnl = (pos.unrealized_pnl ?? 0).toFixed(2);
+      if(!confirm(`Close ${sym} at market now?\n\nSide: ${pos.side}\nUnrealised P&L: $${pnl}\n\nThis cannot be undone.`)) return;
+      btn.disabled = true; btn.textContent = 'closing…';
+      try{
+        const r = await fetch('/api/close', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({symbol: sym})});
+        const j = await r.json();
+        btn.textContent = j.ok ? 'queued — closing…' : ('failed: ' + (j.error||'?'));
+      }catch(e){ btn.disabled = false; btn.textContent = 'failed — retry'; }
+    };
+  })();
+
   if(pos){
     const isLong = pos.side==='LONG';
     drawLines(pos.entry_price, pos.stop_loss, pos.take_profit);
@@ -930,6 +968,41 @@ def render_journal_page(account):
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
+
+    def do_POST(self):
+        """Only one thing is writable from the browser: 'close this position now'.
+
+        Bound to 127.0.0.1 like the rest of the server, so it is reachable from this
+        machine only. It cannot open a trade, change a stop, or move size — the single
+        irreversible action it can ask for is an exit, which is the one an operator
+        needs to be able to take instantly.
+        """
+        from urllib.parse import urlparse as _up
+        path = _up(self.path).path
+        if path != "/api/close":
+            self.send_response(404); self.end_headers(); return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            symbol = str(body.get("symbol") or "").strip()
+        except Exception:
+            symbol = ""
+        if not symbol:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(b'{"ok":false,"error":"symbol required"}')
+            return
+        from bot import close_requests as _cr
+        ok = _cr.request_close(CLOSE_REQUESTS, symbol)
+        self.send_response(200 if ok else 500)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "ok": bool(ok),
+            "symbol": symbol,
+            "note": "queued — the bot closes it within ~10s",
+        }).encode())
 
     def do_GET(self):
         path = urlparse(self.path).path
