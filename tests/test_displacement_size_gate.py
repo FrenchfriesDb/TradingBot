@@ -11,6 +11,18 @@ no absolute size check anywhere in its path.
 
 Default is 0.0 (no floor) so every pre-existing caller keeps its old behaviour.
 """
+
+# ── NOTE, added 2026-09-24 ────────────────────────────────────────────────────
+# detect_displacement_fvg now ALSO requires candle 3 to close in the direction of the
+# displacement (require_c3_direction, default True). That is a QUALITY filter, not part
+# of the geometric definition of an FVG, and the tests below pin the DEFINITION — several
+# of them use real candles whose c3 closed against the move, including the real ADA
+# 2026-08-06 bars (c3 opened 0.20443 and closed 0.20093, red, after a +6% displacement).
+# They therefore pass require_c3_direction=False explicitly: they are asserting "this IS
+# an imbalance", while the bot separately asks "is it one worth trading". Both are true,
+# and keeping them apart is what stops a future edit from concluding the geometry broke.
+# The filter's own behaviour is pinned in tests/test_third_candle_direction.py.
+
 import pandas as pd
 import pytest
 
@@ -42,7 +54,7 @@ def _aster_df():
 
 def test_default_behaviour_is_unchanged():
     """No floor passed -> identical to before this parameter existed."""
-    found, direction, lo, hi, _ = detect_displacement_fvg(_aster_df())
+    found, direction, lo, hi, _ = detect_displacement_fvg(_aster_df(), require_c3_direction=False)
     assert found is True and direction == "bullish"
     assert lo == pytest.approx(0.6810)
     assert hi == pytest.approx(0.6910)
@@ -51,7 +63,7 @@ def test_default_behaviour_is_unchanged():
 def test_a_genuinely_big_candle_still_passes_a_floor():
     """ASTER's body is 0.0610 — comfortably past any sane ATR-based floor."""
     body = abs(ASTER_DISP["close"] - ASTER_DISP["open"])
-    found, _, _, _, _ = detect_displacement_fvg(_aster_df(), min_body_abs=body * 0.5)
+    found, _, _, _, _ = detect_displacement_fvg(_aster_df(), min_body_abs=body * 0.5, require_c3_direction=False)
     assert found is True, "a 9% displacement was rejected by a floor half its own body"
 
 

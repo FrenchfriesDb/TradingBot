@@ -15,6 +15,18 @@ consecutive candles, so C2.low is nearly always at or below C1.high. Proof it ma
 BTC's real +5.75% 6h displacement on 2026-08-19 left a $3,521 gap and was REJECTED
 because C2's low sat $72 under C1's high. Those real candles are pinned below.
 """
+
+# ── NOTE, added 2026-09-24 ────────────────────────────────────────────────────
+# detect_displacement_fvg now ALSO requires candle 3 to close in the direction of the
+# displacement (require_c3_direction, default True). That is a QUALITY filter, not part
+# of the geometric definition of an FVG, and the tests below pin the DEFINITION — several
+# of them use real candles whose c3 closed against the move, including the real ADA
+# 2026-08-06 bars (c3 opened 0.20443 and closed 0.20093, red, after a +6% displacement).
+# They therefore pass require_c3_direction=False explicitly: they are asserting "this IS
+# an imbalance", while the bot separately asks "is it one worth trading". Both are true,
+# and keeping them apart is what stops a future edit from concluding the geometry broke.
+# The filter's own behaviour is pinned in tests/test_third_candle_direction.py.
+
 import pandas as pd
 import pytest
 
@@ -57,7 +69,7 @@ def test_real_ada_2026_08_06_displacement_is_also_a_valid_fvg():
     disp  = _candle(0.19220, 0.21146, 0.19006, 0.20437)
     nxt   = _candle(0.20443, 0.20740, 0.19935, 0.20093)
     df = _bars(15, prior, disp, nxt, baseline=0.1900)
-    found, direction, lo, hi, _ = detect_displacement_fvg(df)
+    found, direction, lo, hi, _ = detect_displacement_fvg(df, require_c3_direction=False)
     assert found is True
     assert direction == "bullish"
     assert (lo, hi) == (pytest.approx(0.19289), pytest.approx(0.19935))
@@ -86,7 +98,7 @@ def test_bearish_gap_is_the_mirror():
     prior = _candle(101.0, 101.2, 100.0, 100.5)
     disp  = _candle(100.2, 100.4, 97.5, 98.0)       # body 2.2 / range 2.9 = 76%
     nxt   = _candle(99.0, 99.5, 98.6, 99.0)
-    found, direction, lo, hi, _ = detect_displacement_fvg(_bars(15, prior, disp, nxt))
+    found, direction, lo, hi, _ = detect_displacement_fvg(_bars(15, prior, disp, nxt), require_c3_direction=False)
     assert found is True and direction == "bearish"
     assert (lo, hi) == (pytest.approx(99.5), pytest.approx(100.0))
 

@@ -1074,7 +1074,7 @@ def reachable_target(entry, stop, target, htf_atr, max_atr_mult=1.5, min_rr=2.0)
 
 
 def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40,
-                            clearance=0.0015, min_body_abs=0.0, min_gap_abs=0.0):
+                            clearance=0.0015, min_body_abs=0.0, min_gap_abs=0.0, require_c3_direction=True):
     """
     Finds the FVG left behind by the displacement that broke structure — the
     'CHoCH FVG'. This is the heart of the sweep → displacement → retest model:
@@ -1141,7 +1141,19 @@ def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40,
         # it silently disabled detection, rejecting BTC's real +5.75% 6h displacement on
         # 2026-08-19 ($3,521 gap) because C2's low sat $72 under C1's high.
         # See tests/test_displacement_fvg.py, which pins those real candles.
+        # CANDLE 3 MUST CLOSE WITH THE DISPLACEMENT. The detector read exactly one
+        # number off c3 — its low — so a gap armed even when c3 closed hard against the
+        # move. DOGE 2026-09-24: c2 was +1.89x ATR up, c3 opened 0.09597 and closed
+        # 0.09592 (red), the zone armed, and price collapsed through it. Measured over
+        # 49 armed setups on 13 symbols, outcome = 2R before 1R within 24 bars:
+        #     c3 agrees   n=19  win 89%
+        #     c3 opposes  n=24  win 54%
+        # and 55% of what the bot armed was in the losing bucket. A doji counts as
+        # opposing: close == open is not "in the direction of" anything.
+        _c3_up   = float(nxt['close']) > float(nxt['open'])
+        _c3_down = float(nxt['close']) < float(nxt['open'])
         if (disp['close'] > disp['open']
+                and (_c3_up or not require_c3_direction)
                 and disp['close'] > swing_high * (1 + clearance)
                 and float(prior['high']) < float(nxt['low'])):
             lo, hi = float(prior['high']), float(nxt['low'])
@@ -1155,6 +1167,7 @@ def detect_displacement_fvg(df, lookback=20, window=10, min_body_pct=0.40,
 
         # Bearish displacement: mirror — C1.low > C3.high.
         if (disp['close'] < disp['open']
+                and (_c3_down or not require_c3_direction)
                 and disp['close'] < swing_low * (1 - clearance)
                 and float(prior['low']) > float(nxt['high'])):
             lo, hi = float(nxt['high']), float(prior['low'])
