@@ -3,6 +3,7 @@ from lumibot.entities import Asset, Order
 from bot import indicators
 from bot import ai_model as _ai_model
 from bot import trade_ledger as _ledger
+from bot import shadow_ledger as _shadow
 from bot.market_clock import call_with_deadline
 from finbert_utils import estimate_sentiment
 from config import (NVIDIA_API_KEY, API_KEY as ALPACA_API_KEY, API_SECRET as ALPACA_API_SECRET,
@@ -1908,6 +1909,12 @@ class DebbieLaSMC(Strategy):
                     f"[{symbol}] ⏳ Not a retest yet — price {current_price:.2f} has not "
                     f"left {_zlo:.2f}–{_zhi:.2f} since it was armed; this is the impulse, "
                     f"not a return to it.", color="yellow")
+                # SHADOW ONLY — recorded, never traded. See bot/shadow_ledger.
+                _shadow.record_refusal(
+                    symbol, "LONG" if self.bias[symbol] == "BULLISH" else "SHORT",
+                    current_price, _zlo, _zhi, None, None,
+                    ts=datetime.now().astimezone().isoformat(),
+                    extra={"zone_type": self.amd_zone_type[symbol], "bot": "stock"})
             elif _bar_tap:
                 # Detection widened, so price may have left the zone by now — and every
                 # downstream number (stop, risk, target, R:R) comes from the live price

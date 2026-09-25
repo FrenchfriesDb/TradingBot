@@ -105,6 +105,7 @@ from config import (BINANCE_API_KEY, BINANCE_SECRET, BINANCE_TESTNET, BINANCE_CA
                     API_SECRET as ALPACA_SECRET_FOR_NEWS)
 from bot import trade_ledger as _ledger
 from bot import close_requests as _closereq
+from bot import shadow_ledger as _shadow
 
 # Manual "close now" requests from the dashboard. The dashboard holds no exchange
 # credentials and only READS state, which is worth keeping — so the button records a
@@ -2575,6 +2576,15 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             print(f"[{base}] ⏳ Not a retest yet — price ${price:,.4f} has not left "
                   f"${state.fvg_low:,.4f}–${state.fvg_high:,.4f} since it was armed; "
                   f"this is the impulse, not a return to it.")
+            # SHADOW ONLY — recorded, never traded. 13% of setups never retest and those
+            # do run, but nothing visible at arm time separated them on a sample of five.
+            # Logging every refusal turns that five into a real sample in a few weeks.
+            _shadow.record_refusal(
+                symbol, "LONG" if state.bias == "BULLISH" else "SHORT", price,
+                state.fvg_low, state.fvg_high, state.stop_loss, state.take_profit,
+                ts=datetime.now(timezone.utc).isoformat(),
+                extra={"zone_type": state.amd_zone_type, "fvg_tf": state.fvg_tf,
+                       "bars_armed": state.bars_in_entry_wait})
 
         if in_fvg and state.zone_left:
             is_long = state.bias == "BULLISH"
