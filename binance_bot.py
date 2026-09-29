@@ -9,6 +9,7 @@ ever built a Kraken client — connect_exchange() constructs ccxt.coinbase, or c
 when a key is present.)
 """
 
+import re
 import time
 import math
 import os
@@ -175,7 +176,17 @@ def _load_heavy_libs_inner():
 threading.Thread(target=_load_heavy_libs, daemon=True, name="lib-loader").start()
 
 SLEEP_SECONDS = 5 * 60
-STALE_TRADE_HOURS = 6   # intraday SMC: if trade hasn't resolved in 6h, setup is stale — exit
+# MEASURED 2026-09-29, n=895 zone taps on 1h: at a 6h hold, 58% of trades time out
+# (the live log shows 51% STALE) and gross expectancy is +0.14R. Extending the window:
+#     6h  15% hit 2R  27% stopped  58% timed out  +0.14R
+#    12h  24%         33%          43%            +0.24R
+#    18h  29%         37%          33%            +0.28R   <- plateau starts here
+#    24h  32%         40%          27%            +0.28R
+#    72h  40%         52%           8%            +0.30R
+# 18h roughly DOUBLES gross expectancy; past 24h timeouts convert into stops about as
+# fast as into targets. It does NOT make the strategy profitable — ~0.33R of round-trip
+# fees still leaves it near break-even — but it stops yanking trades mid-move.
+STALE_TRADE_HOURS = int(os.getenv("STALE_TRADE_HOURS", "18"))
 FVG_EXPIRY_BARS     = 12   # reset ENTRY_WAIT if price hasn't tapped FVG within this many iterations
 AMD_ENTRY_WAIT_BARS = 96   # AMD supply/demand zones can take up to 8h to reach — longer patience
 PAPER_BALANCE = 10_000.0
@@ -291,7 +302,6 @@ MIN_FVG_PCT            = float(os.getenv("MIN_FVG_PCT", "0.0015"))
 # so a target beyond this × the HTF ATR needs several average HTF candles of travel
 # inside the span of one. It cannot resolve — it just prints a flattering R:R on the way
 # in and exits on the timer. POL: target 13.3% away vs a 2.755% 6H ATR, reported 1:9.4.
-MAX_TARGET_ATR_MULT    = float(os.getenv("MAX_TARGET_ATR_MULT", "1.5"))
 # The timeframes, named once. tf_tag used to say "4H" while line ~1717 fetched "6h", so
 # every log line and chart label describing an HTF level named the wrong chart.
 HTF_TIMEFRAME          = os.getenv("HTF_TIMEFRAME", "6h")
@@ -299,6 +309,25 @@ HTF_TIMEFRAME          = os.getenv("HTF_TIMEFRAME", "6h")
 # and the fetch requesting it must never be able to disagree.
 BYBIT_HTF_TIMEFRAME    = os.getenv("BYBIT_HTF_TIMEFRAME", "4h")
 LTF_TIMEFRAME          = os.getenv("LTF_TIMEFRAME", "5m")
+
+# DERIVED from the hold window, not set independently. reachable_target() trims a target
+# to what the hold can deliver, and its 1.5 default was calibrated to "one HTF candle"
+# when STALE_TRADE_HOURS was 6 and the HTF was 6h. Raising the hold without raising this
+# would keep refusing targets the longer window can now actually reach — the two numbers
+# are one decision. 18h against a 6h HTF is three candles, so 1.5 -> 4.5.
+def _tf_hours(tf, default=6):
+    """Hours in a ccxt timeframe string. Parsed, never a lookup table of literals —
+    tests/test_no_hardcoded_timeframe_labels.py bans those, and it caught the table."""
+    m = re.fullmatch(r"(\d+)([mhdw])", str(tf).strip().lower())
+    if not m:
+        return default
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"m": 1/60, "h": 1, "d": 24, "w": 168}[unit]
+
+
+_HTF_HOURS             = _tf_hours(HTF_TIMEFRAME)
+MAX_TARGET_ATR_MULT    = float(os.getenv(
+    "MAX_TARGET_ATR_MULT", f"{1.5 * max(1.0, STALE_TRADE_HOURS / _HTF_HOURS):g}"))
 # How far a swept level may sit from price and still be treated as THIS move's
 # inducement. Volatility-relative, with the percentage as a floor so a dead ATR read
 # tightens the gate rather than opening it. 2.5x/2% refuses the 2026-09-17 entries

@@ -50,7 +50,7 @@ def test_the_htf_term_raises_the_floor_when_the_5m_tape_is_quiet():
     with_htf = displacement_gates(quiet, 1.8, 0.0015, 0.0015,
                                   htf_atr=0.00849)["min_body_abs"]
     assert with_htf > without
-    assert with_htf == pytest.approx(1.0 * 0.00849)
+    assert with_htf == pytest.approx(0.5 * 0.00849)   # default relaxed 1.0 -> 0.5
 
 
 def test_asters_real_displacement_is_refused_by_the_new_floor():
@@ -60,11 +60,26 @@ def test_asters_real_displacement_is_refused_by_the_new_floor():
     assert 0.00220 < g["min_body_abs"]
 
 
-def test_doges_real_displacement_is_refused_by_the_new_floor():
-    """body 0.00090 vs a floor of 1.1 x 0.00152 = 0.00167."""
+def test_doge_now_passes_the_FLOOR_and_is_blocked_by_candle_3_instead():
+    """The division of labour changed on 2026-09-29 and this records it.
+
+    DOGE's displacement was 0.00090 against a 1H ATR of 0.00152 = 0.59x. At the original
+    1.0 floor the SIZE gate refused it. At the relaxed 0.5 floor it passes size — and is
+    still refused, because its candle 3 closed red. That matters: the floor was starving
+    the bot (2 armed zones in 25h of tape across 8 symbols, zero trades for five days)
+    while c3 cost almost nothing in arming. The blunt gate was loosened and the precise
+    one kept."""
     g = displacement_gates(_df(rng=0.000477, price=0.0959), 1.8, 0.0015, 0.0015,
                            htf_atr=0.00152)
-    assert 0.00090 < g["min_body_abs"]
+    assert 0.00090 >= g["min_body_abs"], "0.59x should now clear a 0.5x floor"
+    # and the trade is STILL refused, by the rule that actually caught it
+    import pandas as pd
+    from bot.indicators import detect_displacement_fvg
+    rows = [(100.0, 100.4, 99.6, 100.0)] * 20
+    rows += [(100.0, 100.5, 99.9, 100.2), (100.2, 106.0, 100.1, 105.8),
+             (105.0, 105.9, 101.0, 104.0)]          # c3 closes RED, as DOGE's did
+    df = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    assert not detect_displacement_fvg(df)[0], "c3 must still block a red third candle"
 
 
 def test_a_genuinely_large_displacement_still_passes():

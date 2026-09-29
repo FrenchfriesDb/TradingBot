@@ -1009,7 +1009,7 @@ def round_trip_fee(entry_price, exit_price, qty, fee_rate, exit_fee_rate=None):
 
 
 def displacement_gates(df, atr_mult=1.8, min_pct=0.0015, gap_pct=0.0015,
-                       htf_atr=None, htf_mult=1.0):
+                       htf_atr=None, htf_mult=0.5):
     """Both size floors for detect_displacement_fvg, derived from one dataframe.
 
     Splat it at the call site — `**indicators.displacement_gates(df)` — so the crypto
@@ -1038,6 +1038,15 @@ def displacement_gates(df, atr_mult=1.8, min_pct=0.0015, gap_pct=0.0015,
     # and is marginally strict at the tightest observed one (1.30x -> 0.98x). Rounder than
     # the fitted number and it states plainly: the displacement must be worth at least one
     # 1H candle's average range. Asset-neutral, built from the same quantity as the stop.
+    #
+    # RELAXED 1.0 -> 0.5 on 2026-09-29. At 1.0 the crypto bot armed 2 zones across 8
+    # symbols and ~25h of tape and took ZERO trades for five days. Measured arming:
+    #     htf_mult  1.0 -> 2 zones   0.8 -> 3   0.6 -> 3   0.5 -> 5   0.4 -> 9   0.0 -> 9
+    # 0.5 restores ~2.5x the setups and still refuses ASTER's 0.26x displacement. DOGE's
+    # 0.59x would now pass this gate — but its candle 3 closed RED, so require_c3_direction
+    # still blocks it, and c3 costs almost nothing in arming (removing it changed 2 zones
+    # to 2). The strict filter that catches the bad trade is kept; the blunt one that was
+    # starving the bot is loosened.
     # An unusable 1H read is IGNORED rather than treated as zero: a bad ATR must never
     # become "no floor at all".
     try:
