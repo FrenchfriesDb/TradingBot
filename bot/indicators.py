@@ -1875,7 +1875,7 @@ def cap_qty_for_risk(qty, risk_per_unit, max_risk_dollars):
 
 
 def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12,
-                      max_age_bars=30, min_width_pct=0.0015):
+                      max_age_bars=30, min_width_pct=0.0015, return_all=False):
     """
     Scans the 4H chart for supply zones (bearish imbalances) ABOVE current price.
 
@@ -1983,11 +1983,16 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     _prio = {'bearish_breaker': 3, 'bearish_fvg': 2, 'ifvg': 1, 'bearish_ob': 0}
     candidates.sort(key=lambda x: (x[0], -_prio.get(x[2], 0)))
     z_lo, z_hi, z_type = candidates[0]
+    # Measurement hook: hand back EVERY qualifying zone, not just the winner, so a
+    # different selection policy can be scored against this one on the same candidates.
+    # Off by default — the chosen zone is byte-for-byte what it was.
+    if return_all:
+        return True, z_lo, z_hi, z_type, [dict(lo=a, hi=b, kind=c) for a, b, c in candidates]
     return True, z_lo, z_hi, z_type
 
 
 def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12,
-                      max_age_bars=30, min_width_pct=0.0015):
+                      max_age_bars=30, min_width_pct=0.0015, return_all=False):
     """
     Scans the 4H chart for demand zones (bullish imbalances) BELOW current price.
     Mirror of find_supply_zone for LONG setups.
@@ -2075,6 +2080,11 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     _prio = {'bullish_breaker': 3, 'bullish_fvg': 2, 'ifvg_support': 1, 'bullish_ob': 0}
     candidates.sort(key=lambda x: (-x[1], -_prio.get(x[2], 0)))
     z_lo, z_hi, z_type = candidates[0]
+    # Measurement hook: hand back EVERY qualifying zone, not just the winner, so a
+    # different selection policy can be scored against this one on the same candidates.
+    # Off by default — the chosen zone is byte-for-byte what it was.
+    if return_all:
+        return True, z_lo, z_hi, z_type, [dict(lo=a, hi=b, kind=c) for a, b, c in candidates]
     return True, z_lo, z_hi, z_type
 
 # ============================================================================
