@@ -251,7 +251,18 @@ def run_live_trading():
     print("🔴 DEBBIE-LA INSTITUTIONAL SMC - LIVE PAPER TRADING")
     print("=" * 80)
     print(f"🔗 Connected to: {BASE_URL}")
-    watchlist = ["AAPL", "QQQ", "SPY", "NVDA", "TSLA", "GOOGL", "META", "MSFT"]
+    # Added 2026-09-29. Daily ATR% at the time, which is what decides whether a target
+    # can be reached inside one session (measured: high-ATR taps 62% at 1R / +0.24R,
+    # low-ATR 45% / -0.10R):
+    #     BE 5.98%  AMD 3.44%  PLTR 2.96%  NFLX 2.37%  AMG 2.23%  AMZN 1.82%
+    # BE, AMD and PLTR clear every existing name except META. AMZN does NOT — at 1.82% it
+    # sits below META, TSLA, GOOGL, MSFT and AAPL, so it is here on structure, not on
+    # volatility. NFLX's "high dollar ATR" does not help either: sizing is risk-based, so
+    # a $1,200 share moving $28 is the same 2.37% trade as a $30 share moving $0.71.
+    # AMG is Affiliated Managers Group (NYSE) — the only reading of "amg" that is a US
+    # equity; say so if something else was meant.
+    watchlist = ["AAPL", "QQQ", "SPY", "NVDA", "TSLA", "GOOGL", "META", "MSFT",
+                 "AMZN", "AMD", "PLTR", "NFLX", "BE", "AMG"]
     print(f"📈 Watchlist: {', '.join(watchlist)}")
     print(f"⏱️  HTF: 4H | LTF: 15m | Execution Interval: 15 minutes")
     print(f"💰 Risk per trade: 3% total (~0.5% per symbol)")
