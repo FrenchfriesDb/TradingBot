@@ -2594,6 +2594,16 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         in_fvg = indicators.price_in_entry_zone(
             price, state.fvg_low, state.fvg_high, state.bias == "BULLISH")
 
+        # Same release rule as the stock bot: a zone price has broken THROUGH is dead and
+        # must not occupy the symbol until the staleness timer expires.
+        if state.state == "ENTRY_WAIT" and not has_position and indicators.zone_broken(
+                price, state.fvg_low, state.fvg_high,
+                state.bias == "BULLISH", indicators.range_atr(df_ltf)):
+            print(f"[{base}] 🧹 Zone broken — price ${price:,.4f} is through "
+                  f"${state.fvg_low:,.4f}–${state.fvg_high:,.4f}; releasing to re-hunt.")
+            state.reset()
+            return price
+
         # A retest requires price to have LEFT the zone first. Tracked every cycle, sticky
         # once earned. For the ordinary setup (demand armed below price) this is already
         # True at arming and nothing changes; it only holds back the case where the zone

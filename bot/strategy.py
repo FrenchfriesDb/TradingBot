@@ -1887,6 +1887,24 @@ class DebbieLaSMC(Strategy):
                     self._reset(symbol)
                     return
 
+            # A zone price has broken THROUGH is dead — release the symbol so it can hunt
+            # fresh structure. The ran_away check above is one-sided: it handles price
+            # running UP away from a demand zone and has no case for price breaking DOWN
+            # through it, which is the invalidation that actually happens. On 2026-09-29
+            # five of six armed symbols were holding broken zones, TSLA's by 6.3% for two
+            # sessions, none of them fillable, all of them occupying the symbol until the
+            # 96-iteration expiry (~4 sessions).
+            _zb_atr = indicators.range_atr(ltf["df"]) if ltf.get("df") is not None else 0.0
+            if indicators.zone_broken(current_price, self.fvg_low[symbol],
+                                      self.fvg_high[symbol],
+                                      self.bias[symbol] == "BULLISH", _zb_atr):
+                self.log_message(
+                    f"[{symbol}] 🧹 Zone broken — price {current_price:.2f} is through "
+                    f"{self.fvg_low[symbol]:.2f}–{self.fvg_high[symbol]:.2f} and not coming "
+                    f"back; releasing the symbol to re-hunt.", color="yellow")
+                self._reset(symbol)
+                return
+
             # A tap is something that HAPPENED during the bar, not something true at the
             # instant of a poll. `self.fvg_low <= current_price <= self.fvg_high` sampled
             # the last price once every 15 minutes, so a dip that began and ended between

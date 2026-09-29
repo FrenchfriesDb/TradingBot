@@ -1514,6 +1514,44 @@ def drop_forming_candle(df):
     return df.iloc[:-1]
 
 
+def zone_broken(price, zone_lo, zone_hi, is_long, atr, atr_mult=1.0, min_pct=0.002):
+    """Has price traded DECISIVELY through the zone, invalidating it?
+
+    2026-09-29: five of six armed stock symbols were holding demand zones price had
+    already fallen through — TSLA's by 6.3%, armed two sessions earlier. None could ever
+    fill, because tap_chase_ok correctly refuses a long below its own demand zone and
+    said so on every poll. Nothing acted on it, so the symbol sat in ENTRY_WAIT until
+    AMD_ENTRY_WAIT_ITERS expired: 96 iterations at 15 minutes is ~4 sessions. The bot was
+    not refusing good trades, it was OCCUPYING most of its watchlist with dead setups.
+
+    The existing abandon check is one-sided — it releases a demand zone when price runs
+    UP and away ("the move left without us") and has no case for price breaking DOWN
+    through it, which is the one that actually invalidates the setup.
+
+    A WICK THROUGH MUST NOT COUNT. A tap is supposed to poke into the zone; breaking on
+    that would delete the entry this whole path exists for. So the tolerance is
+    atr_mult x ATR beyond the far edge, with min_pct as a floor so a dead ATR does not
+    collapse it to zero and break a zone on any tick.
+
+    Fails CLOSED in the safe direction: unreadable input reports NO break, and the zone
+    simply expires on the old timer as it did before.
+    """
+    try:
+        px = float(price); lo = float(zone_lo); hi = float(zone_hi)
+    except (TypeError, ValueError):
+        return False
+    if px != px or lo != lo or hi != hi or lo > hi or px <= 0:
+        return False
+    try:
+        a = float(atr)
+        if a != a or a < 0:
+            a = 0.0
+    except (TypeError, ValueError):
+        a = 0.0
+    tol = max(a * float(atr_mult), px * float(min_pct))
+    return (px < lo - tol) if is_long else (px > hi + tol)
+
+
 def zone_left_since_arming(price, zone_lo, zone_hi, already_left):
     """Has price traded OUTSIDE this zone since it was armed? Sticky once True.
 
