@@ -1,5 +1,6 @@
 # bot/indicators.py
 import math
+import os
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -1921,6 +1922,27 @@ def cap_qty_for_risk(qty, risk_per_unit, max_risk_dollars):
     return min(qty, max_risk_dollars / risk_per_unit)
 
 
+ZONE_SORT = os.getenv("ZONE_SORT", "nearest")
+
+
+def _zone_sort_key(prio, nearest_first):
+    """Sort key for zone candidates. ZONE_SORT=conviction flips the precedence.
+
+    "nearest" (default) takes the zone closest to price and uses conviction only to break
+    ties. That is the shallowest zone, which is also the first one a pullback breaks — on
+    2026-09-28 all four armed stock zones were sliced through (QQQ -0.45%, GOOGL -0.77%,
+    META -3.04%, TSLA -5.16%).
+
+    "conviction" takes the heaviest zone type first (breaker > fvg > ifvg > ob) and uses
+    distance only to break ties. MEASURED and it was WORSE on a tapped-then-held proxy:
+    nearest 37% hold over n=389, conviction 31% over n=293. Kept switchable because a
+    full backtest is better evidence than that proxy, and this is the knob it needs.
+    """
+    if str(ZONE_SORT).lower().startswith("conv"):
+        return (lambda x: (-prio.get(x[2], 0), x[0] if nearest_first else -x[1]))
+    return (lambda x: (x[0] if nearest_first else -x[1], -prio.get(x[2], 0)))
+
+
 def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance_pct=0.12,
                       max_age_bars=30, min_width_pct=0.0015, return_all=False):
     """
@@ -2028,7 +2050,7 @@ def find_supply_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
     # Nearest zone above price (lowest zone_low); tie-break by conviction
     # (a breaker = confirmed structural flip, higher conviction than a plain OB).
     _prio = {'bearish_breaker': 3, 'bearish_fvg': 2, 'ifvg': 1, 'bearish_ob': 0}
-    candidates.sort(key=lambda x: (x[0], -_prio.get(x[2], 0)))
+    candidates.sort(key=_zone_sort_key(_prio, nearest_first=True))
     z_lo, z_hi, z_type = candidates[0]
     # Measurement hook: hand back EVERY qualifying zone, not just the winner, so a
     # different selection policy can be scored against this one on the same candidates.
@@ -2125,7 +2147,7 @@ def find_demand_zone(df_htf, current_price, min_distance_pct=0.001, max_distance
 
     # Nearest zone below price = highest zone_high; tie-break by conviction (breaker first).
     _prio = {'bullish_breaker': 3, 'bullish_fvg': 2, 'ifvg_support': 1, 'bullish_ob': 0}
-    candidates.sort(key=lambda x: (-x[1], -_prio.get(x[2], 0)))
+    candidates.sort(key=_zone_sort_key(_prio, nearest_first=False))
     z_lo, z_hi, z_type = candidates[0]
     # Measurement hook: hand back EVERY qualifying zone, not just the winner, so a
     # different selection policy can be scored against this one on the same candidates.
