@@ -123,6 +123,14 @@ def sandbox_strategy(use_ai: bool):
 
     # ── State files: a backtest must not read or clobber LIVE position state ──
     tmp = tempfile.mkdtemp(prefix="bt_state_")
+    # Ledgers MUST be redirected, not just Sheets. bot/strategy.py appends every close to
+    # the durable local ledger and every retest refusal to the shadow ledger BEFORE any
+    # network call, so an un-sandboxed backtest writes simulated rows into the real files.
+    # It already did: 27 of 51 shadow rows were backtest artifacts, identifiable only
+    # because the live stock bot had logged zero refusals that day.
+    from bot import trade_ledger as _tl, shadow_ledger as _sl
+    _tl.DEFAULT_DIR = os.path.join(tmp, "ledger")
+    _sl.shadow_path = lambda base_dir=None: os.path.join(tmp, "ledger", "shadow.jsonl")
     S.STRATEGY_STATE_FILE = os.path.join(tmp, "strategy_state.json")
     S.LOGGED_CLOSES_FILE  = os.path.join(tmp, "logged_closes.json")
 
@@ -205,7 +213,8 @@ def pair_round_trips(fills):
     return trades
 
 
-FUNNEL = Counter()   # state-transition tallies, filled when --funnel is on
+FUNNEL = Counter()
+GATES = Counter()   # state-transition tallies, filled when --funnel is on
 
 
 def instrument_funnel(S):
@@ -217,6 +226,25 @@ def instrument_funnel(S):
     points at WHICH gate leaks. We read self.state rather than hooking internals so
     this stays valid if _process_symbol is refactored.
     """
+    # Gate-level tally. The transition counts below tell you setups armed and never
+    # converted; they do NOT tell you WHICH gate ate them, which is the whole question a
+    # zero-trade run raises. Wrapping the pure gates answers it: on 2026-09-29 this
+    # localised the wall to has_displacement, 2 passes out of 264, matching the live log.
+    from bot import indicators as _I
+    for _name in ("zone_tapped", "tap_chase_ok", "zone_left_since_arming",
+                  "has_displacement", "zone_broken", "price_in_entry_zone"):
+        _f = getattr(_I, _name, None)
+        if _f is None:
+            continue
+
+        def _mk(n, f):
+            def _w(*a, **k):
+                r = f(*a, **k)
+                GATES[f"{n}:{'pass' if (r[0] if isinstance(r, tuple) else r) else 'FAIL'}"] += 1
+                return r
+            return _w
+        setattr(_I, _name, _mk(_name, _f))
+
     orig = S.DebbieLaSMC._process_symbol
 
     def wrapped(self, symbol):
@@ -239,6 +267,32 @@ def report_funnel():
     for k, v in sorted(FUNNEL.items()):
         if k != "iterations":
             print(f"    {k:<34}{v}")
+    if GATES:
+        # zone_broken is INVERTED: a "pass" there means the zone WAS broken and the
+        # symbol was released, so a low rate is healthy, not a bottleneck. Excluded from
+        # the tightest-gate pick and labelled, or it wins the ranking every time.
+        INVERTED = {"zone_broken"}
+        print("\n  Gates (pass/FAIL at each check):")
+        names = sorted({k.rsplit(":", 1)[0] for k in GATES})
+        for n in names:
+            p_, f_ = GATES.get(f"{n}:pass", 0), GATES.get(f"{n}:FAIL", 0)
+            tot = p_ + f_
+            if not tot:
+                continue
+            bar = "#" * int(round(20 * p_ / tot))
+            tag = "  (inverted: pass = released)" if n in INVERTED else ""
+            print(f"    {n:<26}{p_:5d} pass /{f_:5d} FAIL  {p_/tot*100:3.0f}% {bar}{tag}")
+        worst = min((n for n in names
+                     if n not in INVERTED
+                     and GATES.get(f"{n}:pass", 0) + GATES.get(f"{n}:FAIL", 0) >= 20),
+                    key=lambda n: GATES.get(f"{n}:pass", 0) /
+                                  max(1, GATES.get(f"{n}:pass", 0) + GATES.get(f"{n}:FAIL", 0)),
+                    default=None)
+        if worst:
+            p_ = GATES.get(f"{worst}:pass", 0)
+            t_ = p_ + GATES.get(f"{worst}:FAIL", 0)
+            print(f"\n    -> tightest gate: {worst} ({p_}/{t_} pass). A zero-trade run is "
+                  f"that gate,\n       not an absence of setups.")
     if not FUNNEL.get("ENTRY_WAIT -> POSITION_OPEN"):
         print("    -> zones armed but never converted: price never tapped the zone,")
         print("       or the R:R floor / stop distance rejected every attempt.")
