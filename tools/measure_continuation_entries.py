@@ -17,6 +17,7 @@ CAVEATS, because the headline gradient is partly explained by them:
   * Deeper entries miss more often (nofill rises 1 -> 6), so the edge costs frequency.
 """
 import sys; sys.path.insert(0, "/Users/usahealthlife/Desktop/TradingBot")
+import os
 import datetime as dt, pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -72,7 +73,14 @@ for sym in SYMS:
         fut = d.iloc[i+1:]
         for name, frac in styles.items():
             entry = (hi - (hi-lo)*frac) if is_long else (lo + (hi-lo)*frac)
-            stop  = lo if is_long else hi                # impulse invalidation
+            # STOP_MODE=atr gives every style the SAME R, which is the control that
+            # showed the depth gradient was mostly stop placement, not timing.
+            if os.getenv("STOP_MODE") == "atr":
+                _a = range_atr(w)
+                if _a <= 0: continue
+                stop = (entry - 1.5*_a) if is_long else (entry + 1.5*_a)
+            else:
+                stop = lo if is_long else hi             # impulse invalidation
             b = best_r(fut, entry, stop, is_long)
             if b is None: nofill[name] += 1
             else: res[name].append(b)
