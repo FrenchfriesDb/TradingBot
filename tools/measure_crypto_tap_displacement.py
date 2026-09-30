@@ -50,6 +50,32 @@ not enough to measure expectancy here.
 
 Related dead ends on the same drag: 33f5ec5 (wider stops -- fee drag collapses and the
 edge collapses with it) and e6cca6f (maker fills -- work mechanically, still do not pay).
+
+BREAK-EVEN CURVE (--fees, one collection pass; fees are linear in the rate).
+Net expectancy per tap, * = positive:
+
+        gate   passes   0.250%   0.150%   0.100%   0.075%   0.050%   0.025%
+        none    85401    -0.28    -0.14    -0.07    -0.03   +0.01*   +0.04*
+   veto only    58353    -0.24    -0.10    -0.03   +0.01*   +0.04*   +0.08*
+    0.5x ATR    23907    -0.21    -0.08    -0.01   +0.03*   +0.06*   +0.10*
+    1.0x ATR     9875    -0.21    -0.07   +0.00*   +0.04*   +0.07*   +0.11*
+    1.4x ATR     4411    -0.18    -0.03   +0.04*   +0.08*   +0.12*   +0.15*
+    1.8x ATR     2037    -0.22    -0.07   +0.01*   +0.05*   +0.09*   +0.13*
+
+THE OPTIMAL GATE IS A FUNCTION OF THE FEE RATE. Ranked by total R (net exp x passes):
+
+    0.250% -> 1.8x ATR   -448R        0.075% -> 0.5x ATR   +717R
+    0.150% -> 1.4x ATR   -132R        0.050% -> veto only +2334R
+    0.100% -> 1.4x ATR   +176R        0.025% -> veto only +4668R
+
+A fee is a FIXED cost per trade, so expensive execution forces selectivity and cheap
+execution pays for volume. That is why the stock bot (commission-free) and this one reach
+opposite conclusions about the same gate, and why no single threshold is "correct" here
+until the execution cost is known.
+
+Nothing is net positive until roughly 0.10%/side. At 0.150% — an ordinary mid-tier retail
+rate — every row still loses. And SLIPPAGE AND SPREAD ARE NOT MODELLED, so the true
+crossover sits somewhere worse than this table shows.
 """
 import argparse
 import sys
@@ -175,6 +201,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--symbols", type=str, default=",".join(DEFAULT_SYMBOLS))
+    ap.add_argument("--fees", type=str, default="0.25,0.15,0.10,0.075,0.05,0.025",
+                    help="taker %%/side to score at. Fees are LINEAR in the rate and the "
+                         "per-tap value is stored, so the whole curve comes from ONE "
+                         "collection pass — no refetching per rate.")
     args = ap.parse_args()
     ex = ccxt.coinbase({"enableRateLimit": True})
     taps, stops = [], []
@@ -212,6 +242,31 @@ def main():
     print("  " + "-" * 82)
     for thr in (0.5, 0.8, 1.0, 1.4, 1.8, 2.5):
         print(row(f"{thr}x ATR", [t for t in taps if t[0] >= thr], n))
+    # ── break-even curve ──────────────────────────────────────────────────────────────
+    rates = [float(x) / 100 for x in args.fees.split(",") if x.strip()]
+    gates = [("none", taps), ("veto only", [t for t in taps if not t[3]])] + \
+            [(f"{thr}x ATR", [t for t in taps if t[0] >= thr]) for thr in (0.5, 1.0, 1.4, 1.8)]
+    print(f"\n  NET EXPECTANCY (R per tap) BY TAKER FEE — the model's {TAKER_FEE_RATE*100:.3f}% "
+          f"is an ASSUMPTION, not a cost this account pays")
+    print(f"  {'gate':>12} {'passes':>8} " + " ".join(f"{r*100:>8.3f}%" for r in rates))
+    print("  " + "-" * (22 + 10 * len(rates)))
+    for label, sel in gates:
+        if len(sel) < 20:
+            continue
+        w = sum(1 for t in sel if t[1] == "WIN") / len(sel)
+        gross = w * 2 - (1 - w)
+        base = sum(t[2] for t in sel) / len(sel)          # fee R at TAKER_FEE_RATE
+        cells = []
+        for r in rates:
+            net = gross - base * (r / TAKER_FEE_RATE)
+            cells.append(f"{net:>+8.2f}" + ("*" if net > 0 else " "))
+        print(f"  {label:>12} {len(sel):>8} " + " ".join(cells))
+    print("  " + "-" * (22 + 10 * len(rates)))
+    print("  * = net positive. Gross expectancy is unchanged across the row; only the fee")
+    print("  term moves, and it is linear in the rate.")
+    print("  SLIPPAGE AND SPREAD ARE NOT MODELLED. They act like additional fee, so a row")
+    print("  that only just turns positive here would not survive real fills.")
+
     print("\n  'veto only' is what binance_bot does TODAY on the direct-tap path: enter unless")
     print("  the tap bar is a decisively opposing candle. Rows below add a fresh-displacement")
     print("  requirement instead. 'total' is net exp x passes — the frequency-vs-quality call.")

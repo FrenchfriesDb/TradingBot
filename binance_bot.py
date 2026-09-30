@@ -424,6 +424,22 @@ MAX_RISK_DOLLARS = 20.0  # fixed-risk sizing: every stop-out loses ~$20. Positio
 # notional, against taker fees of 0.25-0.60% PER SIDE. Break-even was 0.245%/side, i.e.
 # the strategy sat exactly on the fee line while the dashboard showed it clearly green.
 # Fees are charged on NOTIONAL (qty x price), both entry and exit — not on margin.
+# A SIMULATION BENCHMARK, NOT A MEASURED EXECUTION COST (labelled 2026-09-30).
+# This bot is paper-only (PaperTrader) and .env holds no exchange credentials at all —
+# Alpaca and NVIDIA only — so nothing here has ever paid a fee. 0.25%/side is Coinbase
+# Advanced Trade's entry-level RETAIL taker rate, i.e. deliberately pessimistic: the worst
+# tier at one venue. It is not a tier this account is on, because there is no account.
+#
+# It is nonetheless load-bearing for every crypto measurement in tools/. The 60-day tap
+# study found the direct-tap population gross-POSITIVE (+0.08R to +0.19R) and net-NEGATIVE
+# purely on this number, and the break-even it implies is:
+#     veto only  <= 0.076%/side        1.4x ATR  <= 0.125%/side
+# Read those as a SPEC for what execution would have to cost, not as a verdict that the
+# setup loses money. Override with TAKER_FEE_RATE to re-score against a real venue; the
+# tools accept --fees to sweep it without touching code.
+#
+# Note also that the tools model fees but NOT slippage or spread, which act like extra
+# fee and are what usually consumes an edge this thin.
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0025"))   # 0.25%/side default
 # Maker rate, for orders that REST on the book instead of crossing it. Defaults to the
 # TAKER rate on purpose: assuming a discount the account has not been verified to get is
