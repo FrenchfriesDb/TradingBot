@@ -47,6 +47,7 @@ from binance_bot import (
     STALE_ZONE_BARS, MIN_AI_RR, MAX_AI_RR, MAX_RISK_DOLLARS,
     SL_ATR_MULT, MIN_STOP_ATR_MULT_HTF, SWING_LOOKBACK, STALE_TRADE_HOURS,
     DEFAULT_SYMBOLS,
+    DISPLACEMENT_BODY_FRAC, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -68,9 +69,10 @@ FUNNEL_STAGES = [
     "6 armed, waiting",
     "7 zone not expired",
     "8 price TAPS the zone",
-    "9 tap is fresh",
-    "A atr readable",
-    "B risk > 0  -> ENTRY",
+    "9 stale tap, needs displacement",
+    "A staleness gate passed",
+    "B atr readable",
+    "C risk > 0  -> ENTRY",
 ]
 
 LTF_TF, LTF_SECS = "5m", 300
@@ -219,9 +221,24 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         if not indicators.price_in_entry_zone(price, z_lo, z_hi, is_long):
             continue
         FUNNEL["8 price TAPS the zone"] += 1
-        if bars_wait > STALE_ZONE_BARS:          # tapped, but the zone is stale
-            last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
-        FUNNEL["9 tap is fresh"] += 1
+
+        # STALENESS — mirrors binance_bot.py:2717, which this used to get wrong.
+        # A stale zone is NOT discarded live. It survives and demands a FRESH displacement
+        # candle in the trade direction (<=3 bars back), same call as the sniper at :3135.
+        # The old line here threw the zone away on a stale tap, which is strictly harsher
+        # than production — that is why a 7-day run scored 100% of taps as refused.
+        if bars_wait > STALE_ZONE_BARS:
+            FUNNEL["9 stale tap, needs displacement"] += 1
+            _rng = ltf_upto["high"] - ltf_upto["low"]
+            _atr_t = float(_rng.rolling(14).mean().iloc[-1])
+            _px_t  = float(ltf_upto["close"].iloc[-1])
+            if pd.isna(_atr_t) or not indicators.has_displacement(
+                    ltf_upto.tail(3)[["open", "high", "low", "close"]].values.tolist(),
+                    is_long, min_body_frac=DISPLACEMENT_BODY_FRAC,
+                    min_body_abs=indicators.displacement_min_body(
+                        _atr_t, _px_t, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT)):
+                continue          # keep waiting — do NOT discard the zone
+        FUNNEL["A staleness gate passed"] += 1
 
         # ── structural stop / target, same helpers as live ─────────────────────
         rng5 = ltf_upto["high"] - ltf_upto["low"]
@@ -230,7 +247,7 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         atr6 = float(rng6.rolling(14).mean().iloc[-1])
         if not atr5 or not atr6 or pd.isna(atr5) or pd.isna(atr6):
             continue
-        FUNNEL["A atr readable"] += 1
+        FUNNEL["B atr readable"] += 1
         swing = (float(ltf_upto["low"].tail(SWING_LOOKBACK).min()) * 0.999 if is_long
                  else float(ltf_upto["high"].tail(SWING_LOOKBACK).max()) * 1.001)
         zone_lvl = indicators.crypto_zone_stop_level(
@@ -239,7 +256,7 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         risk = abs(price - stop)
         if risk <= 0:
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
-        FUNNEL["B risk > 0  -> ENTRY"] += 1
+        FUNNEL["C risk > 0  -> ENTRY"] += 1
         pool = indicators.find_next_liquidity_target(
             htf_closed, price + MIN_AI_RR * risk if is_long else price - MIN_AI_RR * risk,
             "bullish" if is_long else "bearish")
