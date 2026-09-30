@@ -34,6 +34,7 @@ WHAT IT DELIBERATELY DOES NOT — read this before trusting a number
 import argparse
 import os
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -47,6 +48,30 @@ from binance_bot import (
     SL_ATR_MULT, MIN_STOP_ATR_MULT_HTF, SWING_LOOKBACK, STALE_TRADE_HOURS,
     DEFAULT_SYMBOLS,
 )
+
+# Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
+# be the ONLY thing this tool said about a BTC sweep the operator watched happen — the
+# same defect backtest_stocks.py had until 6b2da44. A zero here is a finding, but it is
+# only useful if it names the gate that produced it.
+FUNNEL = Counter()
+
+# Every stage, pre-seeded to zero. Without this the stages that NEVER fire are simply
+# absent from the Counter, so the table stops at the last stage that happened and the
+# biggest drop in the chain — the one that matters — is invisible. That is how the first
+# version of this report claimed the binding constraint was a gate that discarded nothing.
+FUNNEL_STAGES = [
+    "1 bars seen",
+    "2 htf warm",
+    "3 idle, hunting",
+    "4 6h displacement BOS",
+    "5 FVG agrees with BOS",
+    "6 armed, waiting",
+    "7 zone not expired",
+    "8 price TAPS the zone",
+    "9 tap is fresh",
+    "A atr readable",
+    "B risk > 0  -> ENTRY",
+]
 
 LTF_TF, LTF_SECS = "5m", 300
 HTF_TF, HTF_SECS = "6h", 6 * 3600
@@ -159,19 +184,24 @@ def backtest_symbol(ex, symbol, days, verbose=False):
 
         # HTF frame as the live bot sees it: only candles CLOSED by this moment.
         htf_upto = htf[htf["ts"] <= bar["ts"]]
+        FUNNEL["1 bars seen"] += 1
         if len(htf_upto) < 40:
             continue
+        FUNNEL["2 htf warm"] += 1
         htf_closed = indicators.drop_forming_candle(htf_upto)
         ltf_upto = ltf.iloc[max(0, i - 200):i + 1]
 
         # ── arm a zone (IDLE) ──────────────────────────────────────────────────
         if zone is None:
+            FUNNEL["3 idle, hunting"] += 1
             is_bos, direction, _lvl = indicators.detect_displacement_bos(htf_closed, lookback=15)
             if not (is_bos and direction):
                 continue
+            FUNNEL["4 6h displacement BOS"] += 1
             found, d, z_lo, z_hi, _ = indicators.detect_displacement_fvg(htf_closed)
             if not (found and d == direction):
                 continue
+            FUNNEL["5 FVG agrees with BOS"] += 1
             bias = "BULLISH" if direction == "bullish" else "BEARISH"
             bars_wait = indicators.carried_zone_age(z_lo, z_hi, *last_zone)
             zone = (z_lo, z_hi, bias)
@@ -182,12 +212,16 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         bars_wait += 1
         is_long = bias == "BULLISH"
 
+        FUNNEL["6 armed, waiting"] += 1
         if bars_wait > 48:                       # zone expired
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
+        FUNNEL["7 zone not expired"] += 1
         if not indicators.price_in_entry_zone(price, z_lo, z_hi, is_long):
             continue
+        FUNNEL["8 price TAPS the zone"] += 1
         if bars_wait > STALE_ZONE_BARS:          # tapped, but the zone is stale
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
+        FUNNEL["9 tap is fresh"] += 1
 
         # ── structural stop / target, same helpers as live ─────────────────────
         rng5 = ltf_upto["high"] - ltf_upto["low"]
@@ -196,6 +230,7 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         atr6 = float(rng6.rolling(14).mean().iloc[-1])
         if not atr5 or not atr6 or pd.isna(atr5) or pd.isna(atr6):
             continue
+        FUNNEL["A atr readable"] += 1
         swing = (float(ltf_upto["low"].tail(SWING_LOOKBACK).min()) * 0.999 if is_long
                  else float(ltf_upto["high"].tail(SWING_LOOKBACK).max()) * 1.001)
         zone_lvl = indicators.crypto_zone_stop_level(
@@ -204,6 +239,7 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         risk = abs(price - stop)
         if risk <= 0:
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
+        FUNNEL["B risk > 0  -> ENTRY"] += 1
         pool = indicators.find_next_liquidity_target(
             htf_closed, price + MIN_AI_RR * risk if is_long else price - MIN_AI_RR * risk,
             "bullish" if is_long else "bearish")
@@ -226,10 +262,62 @@ def backtest_symbol(ex, symbol, days, verbose=False):
     return trades
 
 
+def report_funnel():
+    """Where the candles died. A sequential chain, so each row is a subset of the one above
+    and the big drop between two rows IS the binding constraint."""
+    if not FUNNEL:
+        return
+    rows = [(nm, FUNNEL.get(nm, 0)) for nm in FUNNEL_STAGES]
+
+    # Two phases, and they do NOT nest. Stages 1-5 count bars while IDLE (hunting for a
+    # zone); stages 6-B count bars while a zone is ALREADY ARMED, which is a different
+    # population — one armed zone contributes many waiting bars. Printing them as one
+    # chain produced a "-54.1% lost" row, i.e. a drop-off table reporting a gain. Split
+    # them, and compute each phase's drops only within itself.
+    def _phase(title, chunk, unit):
+        if not chunk:
+            return None
+        print(f"\n  {title}   ({unit})")
+        top = chunk[0][1] or 1
+        prev = None
+        for name, n in chunk:
+            lost = ""
+            if prev is not None:
+                pct = (1 - n / prev) * 100 if prev else 0.0
+                lost = f"  -{prev - n:,} ({pct:5.1f}% lost)"
+            print(f"    {name[2:]:<26} {n:>8,}  {n/top*100:5.1f}%{lost}")
+            prev = n
+        # Rank by SHARE lost, not raw count. A stage that takes the funnel to zero is the
+        # binding one even if an earlier stage discarded more bars in absolute terms —
+        # ranking by count reported a 42.9% gate over one losing 100%.
+        drops = [((chunk[i-1][1] - chunk[i][1]) / chunk[i-1][1],
+                  chunk[i-1][1] - chunk[i][1], chunk[i][0][2:], chunk[i-1][1])
+                 for i in range(1, len(chunk)) if chunk[i-1][1] > 0]
+        if not drops:
+            return None
+        share, lost, name, reaching = max(drops)
+        return (lost, name, reaching, share)
+
+    print("\n" + "=" * 62)
+    print("  FUNNEL — where the bars stopped")
+    print("=" * 62)
+    w1 = _phase("ARMING", rows[:5], "bars while idle, hunting for a zone")
+    w2 = _phase("ENTRY",  rows[5:], "bars while a zone is armed — NOT a subset of above")
+    for w in (x for x in (w1, w2) if x and x[0]):
+        lost, name, reaching, share = w
+        tag = "  ← TAKES THE FUNNEL TO ZERO" if share >= 1.0 else ""
+        print(f"\n  BINDING CONSTRAINT: '{name}' — discards {lost:,} of the {reaching:,} "
+              f"bars reaching it ({share*100:.1f}%).{tag}")
+    print("\n  CAVEAT: this replays ONE of the live bot's arming paths (displacement BOS +\n"
+          "  agreeing FVG). binance_bot.py has 11. A zero here does NOT mean the live bot\n"
+          "  would have stood aside — it means THIS path would have.")
+
+
 def report(all_trades, days):
     if not all_trades:
         print("\nNo trades generated — the entry rules never triggered over this window.")
         print("That is a RESULT, not a failure: rules this selective may simply be rare.")
+        report_funnel()
         return
     pnls = [t.pnl for t in all_trades]
     wins = [p for p in pnls if p > 0]
@@ -261,6 +349,7 @@ def report(all_trades, days):
         f"{k}={len(v)} ({sum(v):+,.0f})" for k, v in sorted(by_reason.items())))
     print("\n  Reminder: no AI gate, no news, no slippage (fees ARE modelled) — this is")
     print("  before filtering, and it is optimistic. Judge the sign, not the cents.")
+    report_funnel()
 
 
 # Scale-out policy under test. 0 = the live behaviour (full position rides to target).
