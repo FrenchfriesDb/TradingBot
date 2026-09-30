@@ -12,6 +12,29 @@ Answers four questions, in the order they can kill a zone:
   2. How many arm already expired (carried_zone_age >= the 48-bar cap)?
   3. Of the rest, how FAR is price from the zone when it arms?
   4. Of the reachable ones, how many does price ever actually touch?
+
+RESULT (2026-09-30, 60d, all 13 symbols at full coverage):
+
+    armings                              8,355
+    distinct zone levels                   120     <- re-armed 70x each
+    DEAD ON ARRIVAL (carried age >= 48)  8,235     <- 98.6%
+    arms alive                             120
+    tap-bars                               244
+    zones EVER touched                      16     <- 16 of 120
+
+    distance at arming   p10 2.7 ATR | p50 7.1 ATR | p90 14.5 ATR
+                         0.8% of arms had price already inside the zone
+
+So ~60 real zones and ~8 touches per 30 days across the whole watchlist. The first run of
+this tool reported 32 zones / 3 touches per 30 days; it was on truncated history (see
+0334a74, e77c1e5). The SHAPE was right and did not depend on the data — 98.6% of armings
+die on the bar they are created, because carried_zone_age hands back an age already past
+the 48-bar cap and the 6h frame returns the identical zone five minutes later. The
+magnitudes were all understated, and the touch rate is 13.3%, not 9.4%.
+
+DO NOT use this as a case for widening zone catchment. Those touches were measured at
+-0.24R each net of fees (tools/measure_crypto_tap_displacement.py, 85,176 taps). More
+access multiplies a negative expectancy.
 """
 import argparse
 import sys

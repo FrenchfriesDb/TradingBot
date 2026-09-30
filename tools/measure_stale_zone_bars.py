@@ -12,6 +12,22 @@ Those two timescales were never reconciled by measurement, which is what this fi
 
     python3 tools/measure_stale_zone_bars.py --days 30
 
+RESULT (2026-09-30, 30d, 13 symbols, full coverage after e77c1e5):
+
+     bars  zones  tap-bars  stale  entries   win   exp R   tot R    net $   fees $
+        3   3154       150    149        2   50%   -0.35    -0.7   -13.95    4.94
+        6   3154       150    149        2   50%   -0.35    -0.7   -13.95    4.94  <- live
+       12   3071       115    113        3   67%   -0.17    -0.5   -10.08    9.20
+       24   2977        36     31        6   33%   -0.29    -1.8   -35.13   16.14
+       36   2791        21     13        9   44%   -0.04    -0.4    -7.81   21.47
+       48   2744        10      0       10   30%   -0.14    -1.4   -27.93   22.73
+
+STILL UNSETTLED, and now also moot. Two to ten trades per configuration cannot decide
+anything, exactly as the first (truncated) run could not — clean data raised the counts
+without making them usable. And every row is net negative for the same reason the tap
+table is: at 36 bars the gross is +$13.66 across 9 trades while fees are $21.47. The
+constant selects among taps whose net expectancy is -0.24R; no value of it rescues that.
+
 Scored in R (pnl / dollars-risked-at-entry), so it is comparable with the tap-threshold
 sweep. Fees ARE modelled; the AI gate and news are not, and only ONE of the live bot's 11
 arming paths is replayed — see backtest_crypto's own caveat. Read the shape, not the cents.
