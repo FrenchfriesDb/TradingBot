@@ -82,7 +82,18 @@ PER_CALL_CAP = 300          # Coinbase hard-caps a single fetch_ohlcv at 300 can
 
 def fetch_paginated(ex, symbol, timeframe, tf_secs, since_ms, total):
     """Coinbase returns at most 300 candles per call regardless of `limit`, so walk
-    forward in pages until we have the full window."""
+    forward in pages until we have the full window.
+
+    DO NOT re-add a "short page means we are done" break (2026-09-30). Coinbase returns a
+    SHORT first page the further back you ask — 280 bars at -60d on AVAX, 272 at -90d —
+    and the old code treated that as end-of-data and stopped the whole walk. Symptom: a
+    60-day run returned FEWER bars than a 14-day one (DOGE 1,625 taps -> 908; AVAX 1,937
+    -> 0), which is impossible from market data. Every long-window crypto measurement was
+    silently running on truncated history.
+
+    Only two things end the walk now: an EMPTY page (past the present, or a real gap with
+    nothing beyond it), or a cursor that fails to advance (guards against an infinite loop
+    if an exchange ever returns the same bar forever)."""
     out, cursor = [], since_ms
     while len(out) < total:
         batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor,
@@ -90,9 +101,10 @@ def fetch_paginated(ex, symbol, timeframe, tf_secs, since_ms, total):
         if not batch:
             break
         out.extend(batch)
-        cursor = batch[-1][0] + tf_secs * 1000
-        if len(batch) < min(total - len(out) + len(batch), PER_CALL_CAP):
+        nxt = batch[-1][0] + tf_secs * 1000
+        if nxt <= cursor:
             break
+        cursor = nxt
     df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"])
     return df.drop_duplicates(subset="ts").reset_index(drop=True)
 
