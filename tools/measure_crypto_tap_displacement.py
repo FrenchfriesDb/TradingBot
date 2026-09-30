@@ -20,7 +20,36 @@ the stock version did NOT model are added because crypto makes them decisive:
   • the CURRENT live gate (the opposing-bar veto) as its own row, so "what we do now" is
     on the same table as "what we could do".
 
-    python3 tools/measure_crypto_tap_displacement.py --days 14
+    python3 tools/measure_crypto_tap_displacement.py --days 60
+
+RESULT (2026-09-30, 85,176 taps, all 13 symbols at a true 60 days):
+
+            gate  passes  %kept   win    gross    fees   net exp      total
+ none (LIVE-ish)   85176    100%   36%   +0.08R   0.36R   -0.28R   -23994R
+veto only (LIVE)   58188     68%   37%   +0.11R   0.36R   -0.24R   -14071R
+        0.5x ATR   23829     28%   38%   +0.13R   0.34R   -0.21R    -5098R
+        1.0x ATR    9843     12%   38%   +0.14R   0.35R   -0.21R    -2042R
+        1.4x ATR    4406      5%   40%   +0.19R   0.38R   -0.18R     -808R
+        1.8x ATR    2039      2%   39%   +0.17R   0.40R   -0.22R     -458R
+        2.5x ATR     697      1%   35%   +0.05R   0.45R   -0.40R     -282R
+
+Every row is net negative. The gross edge is real but small (+0.08R to +0.19R) and fee
+drag is 0.34-0.45R — two to four times larger. No displacement threshold closes that,
+because a gate moves gross by ~0.1R at best and does nothing to fees.
+
+So the question this tool was built to answer ("should the direct tap require fresh
+momentum?") has no useful answer: the path is not tradeable at 0.25%/side either way.
+Break-even is linear in the fee rate:
+
+    veto only  <= 0.076%/side   (3.3x cheaper than now)
+    1.4x ATR   <= 0.125%/side   (2.0x cheaper)
+
+DO NOT quote the 14-day version of this table (veto only +0.09R net, +847R total). It was
+a favourable window — 46% win vs 36% over 60 days — not a finding. Two weeks of crypto is
+not enough to measure expectancy here.
+
+Related dead ends on the same drag: 33f5ec5 (wider stops -- fee drag collapses and the
+edge collapses with it) and e6cca6f (maker fills -- work mechanically, still do not pay).
 """
 import argparse
 import sys
