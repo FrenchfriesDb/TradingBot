@@ -75,6 +75,22 @@ DISPLACEMENT_BODY_FRAC = 0.5   # displacement body must be >= 50% of its range
 # Keep the two bots on the same numbers -- they have silently diverged before.
 DISPLACEMENT_ATR_MULT  = float(os.getenv("DISPLACEMENT_ATR_MULT", "1.8"))
 DISPLACEMENT_MIN_PCT   = float(os.getenv("DISPLACEMENT_MIN_PCT", "0.0015"))
+# Separate multiple for the TAP-TIME momentum recheck (added 2026-09-29). Formation and
+# tap are different questions and 1.8x was only ever measured for formation, so the tap
+# reused it by accident, not by evidence. tools/measure_tap_displacement.py swept it over
+# n=8289 taps (12 symbols, 15m, session-capped, scored 2R-before-1R):
+#     0.0x  8289 taps  29% win  -0.12R   <- no gate at all: the raw setup LOSES
+#     0.8x  1174 taps  35% win  +0.04R
+#     1.0x   820 taps  38% win  +0.14R   <- total-R peak (+115R)
+#     1.8x   282 taps  39% win  +0.17R   (+48R)  <- what formation uses
+#     2.5x   157 taps  40% win  +0.21R   (+33R)
+# Per-trade expectancy keeps creeping up past 1.0x, but +0.14R vs +0.17R is well inside
+# the noise at these counts, and 1.8x throws away two thirds of the qualifying taps. The
+# case for 1.0x is FREQUENCY at statistically indistinguishable quality — 2.9x the trades
+# for the same edge. DO NOT collapse this back into DISPLACEMENT_ATR_MULT: that constant
+# also sizes zone formation here and is mirrored in binance_bot.py, so one shared value
+# would silently loosen three other things to buy this one.
+TAP_DISPLACEMENT_ATR_MULT = float(os.getenv("TAP_DISPLACEMENT_ATR_MULT", "1.0"))
 # Minimum FVG width -- a thinner gap is a line, not a zone.
 MIN_FVG_PCT            = float(os.getenv("MIN_FVG_PCT", "0.0015"))
 # Targets beyond this x the HTF ATR cannot resolve before STALE_TRADE_HOURS / the EOD
@@ -2008,9 +2024,13 @@ class DebbieLaSMC(Strategy):
                 # binance_bot has demanded this since the 'armed long ago, entered on
                 # nothing' incidents; the stock bot never had it. Nothing here rechecked
                 # that the bar actually filling the zone is decisive, so a zone armed on
-                # thin structure could fill into chop with no opposition. Same thresholds
-                # as the crypto path: body >= 50% of range AND >= 0.6x ATR of this
-                # timeframe, in the trade direction, within the last 3 bars.
+                # thin structure could fill into chop with no opposition.
+                #
+                # Body >= DISPLACEMENT_BODY_FRAC of range AND >= TAP_DISPLACEMENT_ATR_MULT
+                # x ATR of this timeframe, in the trade direction, within the last 3 bars.
+                # The ATR multiple is the TAP one (1.0x), not the formation one (1.8x) --
+                # measured, see the constant. This gate is what makes the setup profitable
+                # at all: without it the same taps run -0.12R.
                 try:
                     _ltf_atr  = indicators.range_atr(ltf["df"])
                     _ltf_px   = float(ltf["df"]["close"].iloc[-1])
@@ -2019,7 +2039,7 @@ class DebbieLaSMC(Strategy):
                         is_long=_is_long,
                         min_body_frac=DISPLACEMENT_BODY_FRAC,
                         min_body_abs=indicators.displacement_min_body(
-                            _ltf_atr, _ltf_px, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT))
+                            _ltf_atr, _ltf_px, TAP_DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT))
                 except Exception as _e:
                     # Fail CLOSED, matching the crypto sniper: an unverifiable momentum
                     # read must not become a free pass to enter.
@@ -2029,8 +2049,8 @@ class DebbieLaSMC(Strategy):
                 if not _fresh:
                     self.log_message(
                         f"[{symbol}] 🚫 No fresh displacement at tap — needs a body ≥"
-                        f"{DISPLACEMENT_BODY_FRAC:.0%} of range AND ≥{DISPLACEMENT_ATR_MULT}×ATR "
-                        f"(${indicators.displacement_min_body(_ltf_atr, _ltf_px, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT):.2f})"
+                        f"{DISPLACEMENT_BODY_FRAC:.0%} of range AND ≥{TAP_DISPLACEMENT_ATR_MULT}×ATR "
+                        f"(${indicators.displacement_min_body(_ltf_atr, _ltf_px, TAP_DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT):.2f})"
                         f" in the last 3 bars. Standing aside.",
                         color="yellow")
                     return

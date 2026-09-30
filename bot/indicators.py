@@ -777,6 +777,14 @@ def displacement_min_body(atr, price, atr_mult=1.8, min_pct=0.0015):
     whether a market is tradeable at all (ATR_GATE), and reusing it here would let a
     market that is volatile daily but dead right now keep arming zones — which is the
     exact mismatch that produced the POL entry.
+
+    "> 1.0x" above is the rule for ARMING, where the question is whether a decisive move
+    built the zone. The stock bot's TAP-TIME recheck runs at exactly 1.0x
+    (strategy.TAP_DISPLACEMENT_ATR_MULT), and that is deliberate and measured: by then a
+    zone with real structure already exists, so the filling bar only has to prove it is
+    not shrinking into it. Sweeping the tap from 0.0x to 2.5x over 8289 taps put the
+    total-R peak at 1.0x — see tests/test_tap_displacement_threshold.py. Do not "fix" the
+    two to match; they answer different questions.
     """
     try:
         atr = float(atr) if atr and atr == atr else 0.0
