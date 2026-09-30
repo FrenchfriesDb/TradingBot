@@ -39,26 +39,27 @@ MAXB = int(STALE_TRADE_HOURS * 3600 / 300)      # the bot's own hold cap, in 5m 
 
 
 def fetch(ex, symbol, tf, secs, days):
+    """bc.fetch_paginated handles its own transient retries and stops at the present."""
     need = int(days * 24 * 3600 / secs) + 100
     since = int((pd.Timestamp.utcnow() - pd.Timedelta(seconds=need * secs)).timestamp() * 1000)
-    for attempt in range(5):
-        try:
-            return bc.fetch_paginated(ex, symbol, tf, secs, since, need)
-        except ccxt.RateLimitExceeded:
-            time.sleep(2 ** attempt)
-    raise RuntimeError("rate limited")
+    return bc.fetch_paginated(ex, symbol, tf, secs, since, need)
 
 
 def collect(ex, symbol, days):
     d = fetch(ex, symbol, "5m", 300, days)
     if d is None or len(d) < 300:
-        return [], []
+        return [], [], None
     # 1H ATR — the live stop is FLOORED against it (MIN_STOP_ATR_MULT_HTF). Without this
     # the stop collapses onto the zone height (~0.28% of price) and the modelled fee drag
     # comes out 3.4x too large. The real ETH trade on 2026-09-30 had a 0.95% stop.
     h1 = fetch(ex, symbol, "1h", 3600, days + 3)
     a1 = ((h1["high"] - h1["low"]).rolling(14).mean()).to_numpy()
     t1 = h1["ts"].to_numpy()
+    # ACTUAL coverage, reported per symbol. Three separate fetch bugs in one day each
+    # removed symbols from the sample silently; the fix that sticks is making the span
+    # visible, not trying to guarantee it.
+    span = (pd.to_datetime(d["ts"].iloc[0], unit="ms"),
+            pd.to_datetime(d["ts"].iloc[-1], unit="ms"), len(d))
     out, stop_pcts = [], []
     for i in range(60, len(d) - MAXB - 1):
         w = d.iloc[:i + 1]
@@ -126,7 +127,7 @@ def collect(ex, symbol, days):
             continue
         fee_r = 2 * TAKER_FEE_RATE * entry / R if R > 0 else 0.0
         out.append((best, out2, fee_r, vetoed))
-    return out, stop_pcts
+    return out, stop_pcts, span
 
 
 def row(label, sel, total_n):
@@ -150,10 +151,17 @@ def main():
     taps, stops = [], []
     for s in [x.strip() for x in args.symbols.split(",") if x.strip()]:
         try:
-            got, sp = collect(ex, s, args.days)
+            got, sp, span = collect(ex, s, args.days)
             taps += got
             stops += sp
-            print(f"  {s:12} {len(got):>5} taps", flush=True)
+            if span:
+                lo, hi, nb = span
+                cov = (hi - lo).total_seconds() / 86400
+                flag = "" if cov >= args.days * 0.9 else "   <-- SHORT COVERAGE"
+                print(f"  {s:12} {len(got):>6} taps  {nb:>6} bars  "
+                      f"{lo:%m-%d} to {hi:%m-%d} ({cov:.0f}d){flag}", flush=True)
+            else:
+                print(f"  {s:12} {'0':>6} taps  (insufficient history)", flush=True)
         except Exception as e:
             print(f"  ! {s}: {type(e).__name__}: {e}", flush=True)
     if not taps:

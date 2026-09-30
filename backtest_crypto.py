@@ -34,9 +34,11 @@ WHAT IT DELIBERATELY DOES NOT — read this before trusting a number
 import argparse
 import os
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
+import ccxt
 import pandas as pd
 
 from bot import indicators
@@ -91,13 +93,35 @@ def fetch_paginated(ex, symbol, timeframe, tf_secs, since_ms, total):
     -> 0), which is impossible from market data. Every long-window crypto measurement was
     silently running on truncated history.
 
-    Only two things end the walk now: an EMPTY page (past the present, or a real gap with
-    nothing beyond it), or a cursor that fails to advance (guards against an infinite loop
-    if an exchange ever returns the same bar forever)."""
+    Walk ends on: reaching the PRESENT, an EMPTY page, a cursor that fails to advance, or
+    having `total` bars. Transient errors are retried, not fatal.
+
+    The now-guard is not optional (added after the first fix overshot). Dropping the
+    short-page break let the cursor run past the present, and Coinbase answers a future
+    `start` with BadRequest "start must not be in the future" — which RAISES, killing the
+    whole symbol. That silently removed DOGE, AVAX and POL from a 60-day run, leaving only
+    the five majors. A walk that ends cleanly at the present cannot make that request.
+
+    Transient retries cover ccxt.NetworkError, which is the base class of RequestTimeout,
+    ExchangeNotAvailable, DDoSProtection and RateLimitExceeded — catching only the last of
+    those let one timeout delete HYPE, INJ, SEI, DRIFT and ASTER from the same run.
+
+    On exhausted retries this RAISES rather than returning short. Silent partial history is
+    the failure this whole function has now produced twice; a loud one the caller reports is
+    strictly better."""
+    now_ms = int(time.time() * 1000)
     out, cursor = [], since_ms
-    while len(out) < total:
-        batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor,
-                               limit=min(total - len(out), PER_CALL_CAP))
+    while len(out) < total and cursor < now_ms:
+        batch = None
+        for attempt in range(5):
+            try:
+                batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor,
+                                       limit=min(total - len(out), PER_CALL_CAP))
+                break
+            except ccxt.NetworkError:
+                if attempt == 4:
+                    raise
+                time.sleep(2 ** attempt)
         if not batch:
             break
         out.extend(batch)
