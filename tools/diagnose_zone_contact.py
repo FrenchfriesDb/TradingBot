@@ -35,19 +35,20 @@ def diagnose(ex, symbol, days):
     htf_needed = int(days * 24 * 3600 / bc.HTF_SECS) + 200
     since_ltf = int((now - pd.Timedelta(seconds=ltf_needed * bc.LTF_SECS)).timestamp() * 1000)
     since_htf = int((now - pd.Timedelta(seconds=htf_needed * bc.HTF_SECS)).timestamp() * 1000)
-    def _fetch(tf, secs, since, need):
-        # Coinbase 429s on a sustained sweep even with enableRateLimit; back off and retry
-        # rather than silently dropping a symbol from the sample.
-        for attempt in range(5):
-            try:
-                return bc.fetch_paginated(ex, symbol, tf, secs, since, need)
-            except ccxt.RateLimitExceeded:
-                time.sleep(2 ** attempt)
-        raise
-    ltf = _fetch(bc.LTF_TF, bc.LTF_SECS, since_ltf, ltf_needed)
-    htf = _fetch(bc.HTF_TF, bc.HTF_SECS, since_htf, htf_needed)
+    # bc.fetch_paginated now retries every transient ccxt.NetworkError itself and stops at
+    # the present; the local RateLimitExceeded-only backoff that used to live here was
+    # exactly the too-narrow catch that deleted five symbols from a 60-day run.
+    ltf = bc.fetch_paginated(ex, symbol, bc.LTF_TF, bc.LTF_SECS, since_ltf, ltf_needed)
+    htf = bc.fetch_paginated(ex, symbol, bc.HTF_TF, bc.HTF_SECS, since_htf, htf_needed)
     if len(ltf) < 100 or len(htf) < 60:
         return None
+    # Report REAL coverage. The first version of this diagnosis ran on silently truncated
+    # history and its headline numbers (1,861 armings / 32 zones / 3 touched) were wrong.
+    _lo = pd.to_datetime(ltf["ts"].iloc[0], unit="ms")
+    _hi = pd.to_datetime(ltf["ts"].iloc[-1], unit="ms")
+    _cov = (_hi - _lo).total_seconds() / 86400
+    print(f"  {symbol:12} {len(ltf):>6} ltf bars  {_lo:%m-%d} to {_hi:%m-%d} "
+          f"({_cov:.0f}d){'' if _cov >= days * 0.9 else '   <-- SHORT COVERAGE'}", flush=True)
 
     st = Counter()
     distinct = set()
