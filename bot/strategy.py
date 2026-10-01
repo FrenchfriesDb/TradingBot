@@ -123,8 +123,28 @@ HTF_BARS               = int(os.getenv("HTF_BARS", "60"))
 DATA_FETCH_TIMEOUT     = float(os.getenv("DATA_FETCH_TIMEOUT", "120"))
 
 MIN_STOP_ATR_MULT = 1.5
-MIN_TP_RR = 2.0
-MAX_TP_RR = 4.0
+# TARGET BAND — moved 2:1 -> 1:1 on 2026-10-01, on measurement.
+#
+# These were 2.0/4.0 on the stated reasoning that "1:2 keeps TP reachable intraday on 15m
+# entries". tools/measure_tap_displacement.py, re-run with the LIVE 1.5x-1H-ATR stop
+# instead of the raw zone height, shows that reasoning was false. Over 8,289 taps:
+#
+#    gate   passes   win@1R   exp@1R  total@1R   win@2R   exp@2R  total@2R
+#    0.0x     8289      49%   -0.03R     -249R      17%   -0.49R    -4062R
+#    1.0x      820      57%   +0.14R     +115R      24%   -0.28R     -230R
+#    1.8x      282      57%   +0.14R      +39R      31%   -0.06R      -17R
+#
+# A 2R target resolves 17-24% of the time inside a session at a realistic stop width, so
+# every displacement threshold under 2.5x LOSES at 2R while the same entries are clearly
+# profitable at 1R. tools/measure_hold_time.py reached the same wall independently (~18%).
+# The edge was never missing; the target was out of reach in the time the bot allows.
+#
+# min == max on purpose: that pins the target at exactly 1R, which is what was measured.
+# It also makes the liquidity-pool pinning in structural_take_profit a no-op (a pool past
+# 1R is capped to 1R, a nearer one defaults to 1R) — deliberate, not an oversight. Raise
+# MAX_TP_RR to let structure choose again, and the unreachable-target problem comes back.
+MIN_TP_RR = float(os.getenv("MIN_TP_RR", "1.0"))
+MAX_TP_RR = float(os.getenv("MAX_TP_RR", "1.0"))
 
 # ── TEMPORARY risk throttle (while the new crypto logic is being proven) ──────────
 # Hard-cap the ACTUAL dollar loss at the stop — measured AFTER leverage, since sizing
@@ -134,7 +154,12 @@ MAX_TP_RR = 4.0
 # the edge is proven. Set to None to disable.
 MAX_STOCK_RISK_DOLLARS = 30.0
 
-MIN_AI_RR = 2.0   # hard floor — 1:2 minimum keeps TP reachable intraday on 15m entries
+# Floor on the R:R the AI may ask for, and the fallback target when no AI is available.
+# Tracks MIN_TP_RR — if the bot targets 1R, the AI must not be told to demand 2R, and the
+# no-AI fallback at line ~1358 must not plant a target the session cannot reach. The old
+# comment here claimed "1:2 minimum keeps TP reachable intraday"; the 8,289-tap re-run
+# above measured that as 17-24% reachable, i.e. the opposite.
+MIN_AI_RR = float(os.getenv("MIN_AI_RR", "1.0"))
 MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
 
 # ── Simulated leverage (paper perps / margin mode) ────────────────────────────
