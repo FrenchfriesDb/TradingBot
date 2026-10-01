@@ -14,11 +14,16 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bot.watchdog import (silence_verdict, is_active_now,
+from bot.watchdog import (silence_verdict, is_active_now, newest_log,
                           CRYPTO_MAX_SILENCE, STOCK_MAX_SILENCE)
 from bot.indicators import is_regular_session
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# BOTH log locations. A bot relaunched by hand writes only the repo one (tee_stdout_to
+# runs inside Python); launchd writes only its own. Statting one path alone is what made
+# this watchdog scream SILENT for 1534m about a bot that was trading perfectly.
 LOGS = os.path.join(os.path.expanduser("~"), "Library", "Logs", "debbiela")
+REPO_LOGS = os.path.join(REPO, "logs")
 STATE = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
                      "debbiela", "watchdog_state.json")
 
@@ -78,10 +83,15 @@ def main():
     et = datetime.now(ZoneInfo("America/New_York"))
     state = _load_state()
     for name, kind, pattern, limit in BOTS:
+        src, mtime = newest_log([
+            ("launchd", _mtime(os.path.join(LOGS, f"{name}.log"))),
+            ("BARE",    _mtime(os.path.join(REPO_LOGS, f"{name}.log"))),
+        ])
         active = is_active_now(kind, et.weekday(), et.hour, et.minute, is_regular_session)
         alarm, why = silence_verdict(
-            now, _mtime(os.path.join(LOGS, f"{name}.log")), limit, active,
-            last_alarm_ts=state.get(name), alive=_alive(pattern))
+            now, mtime, limit, active,
+            last_alarm_ts=state.get(name), alive=_alive(pattern),
+            source=None if src == "launchd" else src)
         if alarm:
             _alarm(name, why)
             state[name] = now

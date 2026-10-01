@@ -23,6 +23,33 @@ The decisions live here as pure functions so they can be tested against fixed cl
 instead of by waiting three hours for a real outage.
 """
 
+def newest_log(entries):
+    """(label, mtime) of the freshest log, or (None, None) if none exist.
+
+    A bot writes to TWO places and they disagree depending on how it was launched
+    (found the hard way on 2026-10-01):
+
+      • <repo>/logs/<bot>.log         — written by tee_stdout_to() from inside Python, so
+                                        it works under ANY launch, bare or supervised.
+      • ~/Library/Logs/debbiela/...   — the launchd plist's stdout redirect, written ONLY
+                                        while launchd owns the process.
+
+    This watchdog used to stat the launchd path alone. A bot relaunched by hand in a
+    terminal therefore read as `SILENT for 1534m` forever while trading perfectly — a
+    FALSE ALARM, the exact opposite of the outage this file was written to catch, and it
+    also led to a flatly wrong "both bots have been dead for 25 hours" diagnosis.
+
+    `entries` is [(label, mtime_or_None), ...]; ties keep the first listed.
+    """
+    best_label, best_mtime = None, None
+    for label, mtime in entries:
+        if mtime is None:
+            continue
+        if best_mtime is None or mtime > best_mtime:
+            best_label, best_mtime = label, mtime
+    return best_label, best_mtime
+
+
 CRYPTO_MAX_SILENCE = 15 * 60      # 5m loop, so three missed cycles
 STOCK_MAX_SILENCE  = 25 * 60      # 15m loop, so ~1.5 missed cycles
 REPEAT_AFTER       = 30 * 60
@@ -43,11 +70,16 @@ def is_active_now(kind, weekday, hour, minute, is_regular_session):
 
 
 def silence_verdict(now_ts, log_mtime, max_silence, active,
-                    last_alarm_ts=None, repeat_after=REPEAT_AFTER, alive=True):
+                    last_alarm_ts=None, repeat_after=REPEAT_AFTER, alive=True,
+                    source=None):
     """(should_alarm, reason). Pure: no clock, no filesystem, no notifications.
 
     A dead process during its active window alarms IMMEDIATELY — waiting out the silence
     window would add 15 quiet minutes to an outage already in progress.
+
+    `source` labels WHICH log supplied the mtime (see newest_log). It is surfaced in the
+    reason because a bot whose freshest log is the repo one is running BARE — healthy, but
+    unsupervised and with no launchd auto-restart. That is worth seeing, not hiding.
     """
     if not active:
         return False, "outside its active window"
@@ -62,11 +94,12 @@ def silence_verdict(now_ts, log_mtime, max_silence, active,
             return False, "no log (already alarmed)"
         return True, "log file missing"
     silent = now_ts - log_mtime
+    where = f" [{source}]" if source else ""
     if silent < max_silence:
-        return False, f"last wrote {silent/60:.1f}m ago"
+        return False, f"last wrote {silent/60:.1f}m ago{where}"
     if _muted(now_ts, last_alarm_ts, repeat_after):
-        return False, f"silent {silent/60:.0f}m (already alarmed)"
-    return True, f"SILENT for {silent/60:.0f}m (limit {max_silence/60:.0f}m)"
+        return False, f"silent {silent/60:.0f}m (already alarmed){where}"
+    return True, f"SILENT for {silent/60:.0f}m (limit {max_silence/60:.0f}m){where}"
 
 
 def _muted(now_ts, last_alarm_ts, repeat_after):
