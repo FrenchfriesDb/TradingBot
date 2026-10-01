@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot.watchdog import (silence_verdict, is_active_now, newest_log,
+                          coverage_gap_verdict,
                           CRYPTO_MAX_SILENCE, STOCK_MAX_SILENCE)
 from bot.indicators import is_regular_session
 
@@ -82,6 +83,12 @@ def main():
     now = time.time()
     et = datetime.now(ZoneInfo("America/New_York"))
     state = _load_state()
+    # Our OWN heartbeat, recorded before anything else can fail. The distance between
+    # consecutive runs is the only evidence that a sleep gap ever happened — on wake both
+    # `now` and the bots' log mtimes have jumped forward together, so the logs look fine.
+    last_run = state.get("_last_run")
+    state["_last_run"] = now
+
     for name, kind, pattern, limit in BOTS:
         src, mtime = newest_log([
             ("launchd", _mtime(os.path.join(LOGS, f"{name}.log"))),
@@ -97,6 +104,17 @@ def main():
             state[name] = now
         else:
             print(f"[WATCHDOG] {name}: {why}", flush=True)
+            # Healthy NOW — but was anyone WATCHING? A sleep gap leaves the logs looking
+            # perfectly fresh (2026-09-29: 77 minutes, zero alarms), so it is a separate
+            # question from "is this bot talking", asked only when the bot looks fine.
+            gap_alarm, gap_why = coverage_gap_verdict(
+                now, last_run, limit, active,
+                last_alarm_ts=state.get(f"{name}:gap"))
+            if gap_alarm:
+                _alarm(name, gap_why)
+                state[f"{name}:gap"] = now
+            elif gap_why:
+                print(f"[WATCHDOG] {name}: {gap_why}", flush=True)
     _save_state(state)
 
 

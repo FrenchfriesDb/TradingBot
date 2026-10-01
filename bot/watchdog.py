@@ -102,6 +102,55 @@ def silence_verdict(now_ts, log_mtime, max_silence, active,
     return True, f"SILENT for {silent/60:.0f}m (limit {max_silence/60:.0f}m){where}"
 
 
+def coverage_gap_verdict(now_ts, last_run_ts, max_silence, active,
+                         last_alarm_ts=None, repeat_after=REPEAT_AFTER,
+                         expected_interval=300.0):
+    """(should_alarm, reason) for a stretch where NOBODY WAS WATCHING.
+
+    THE SLEEP BLIND SPOT, and why silence_verdict cannot see it. On 2026-09-29 the machine
+    slept 77 minutes mid-session ("Entering Sleep state ... 4654 secs", on battery, lid
+    shut). The bot was frozen for all of it and missed a BTC sweep the operator watched
+    happen on the chart. Zero alarms fired, because:
+
+      • the watchdog is launchd StartInterval=300, so it does not run while asleep either;
+      • on wake the BOT resumes within seconds, so log mtime is fresh again;
+      • silence_verdict only ever compares `now` to that mtime. Both clocks jumped forward
+        together, so the gap is invisible — it leaves no trace in the only signal we read.
+
+    The gap IS visible in one place: the distance between consecutive watchdog runs. We
+    are supposed to run every `expected_interval`; if the previous run was 77 minutes ago,
+    nothing was observed for 77 minutes, whatever the logs now say. No pmset needed — the
+    absence of our own heartbeat is the evidence.
+
+    Deliberately reported as a COVERAGE gap, not a bot outage, because that is what is
+    actually known: during it the machine was asleep or this watchdog was not running, and
+    in either case the bots were not being watched and (if the machine slept) not trading.
+
+    `active` gates it the same way silence_verdict does, so a laptop shut overnight does
+    not alarm for the stock bot. Crypto is always active and will alarm — correct: a 24/7
+    bot frozen for 77 minutes is a real outage, and the repeat_after mute keeps one sleep
+    to one notification.
+    """
+    if not active or last_run_ts is None:
+        return False, None
+    try:
+        gap = now_ts - float(last_run_ts)
+    except (TypeError, ValueError):
+        return False, None
+    # NaN compares False against everything, so an unguarded NaN heartbeat falls straight
+    # through the threshold check below and manufactures an alarm out of nothing.
+    if gap != gap:
+        return False, None
+    # Allow generous slack over the schedule: launchd fires late under load, and a couple
+    # of minutes of drift is not an outage.
+    if gap <= max(max_silence, expected_interval * 2):
+        return False, None
+    if _muted(now_ts, last_alarm_ts, repeat_after):
+        return False, f"coverage gap {gap/60:.0f}m (already alarmed)"
+    return True, (f"NOT WATCHED for {gap/60:.0f}m — machine asleep or watchdog down; "
+                  f"the bots were frozen or unobserved for that window")
+
+
 def _muted(now_ts, last_alarm_ts, repeat_after):
     if last_alarm_ts is None:
         return False
