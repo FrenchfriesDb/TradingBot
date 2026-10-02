@@ -166,8 +166,12 @@ print(f"\n  BREAKOUT vs RETEST — {flags} flag breakouts, {len(SYMS)} symbols, 
       f"{START:%Y-%m-%d}..{END:%Y-%m-%d}, 15m, session-capped")
 print(f"  live stop model (floored at {MIN_STOP_ATR_MULT}x 1H ATR); "
       f"net@2R at fees " + ", ".join(f"{f*100:.2f}%" for f in FEES))
-print(f"  {'entry':<8} {'n':>6} {'win@1R':>7} {'exp@1R':>9} {'tot@1R':>9} "
-      f"{'win@2R':>7} {'exp@2R':>9} {'tot@2R':>9}  {'stop':>10}  net@2R by fee")
+# NOT the tap table's "win@2R". Unresolved trades are flattened at the close for their
+# realized R, so "pos%" means FINISHED POSITIVE, not "hit the target before the stop" —
+# which is why the 1R and 2R columns agree for every flattened trade. The two tables are
+# therefore NOT comparable on win rate. Expectancy still is.
+print(f"  {'entry':<8} {'n':>6} {'pos%1R':>7} {'exp@1R':>9} {'tot@1R':>9} "
+      f"{'pos%2R':>7} {'exp@2R':>9} {'tot@2R':>9}  {'stop':>10}  net@2R by fee")
 print("  " + "-" * 118)
 report("BREAK", brk)
 report("RETEST", rtst)
