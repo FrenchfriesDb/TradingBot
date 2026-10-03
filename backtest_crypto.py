@@ -62,6 +62,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import ccxt
+import numpy as np
 import pandas as pd
 
 from bot import indicators
@@ -74,7 +75,7 @@ from binance_bot import (
     DEFAULT_SYMBOLS,
     DISPLACEMENT_BODY_FRAC, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT,
     TAP_DISPLACEMENT_ATR_MULT, atr_gate_for,
-    ENABLE_TREND_FOLLOW,
+    ENABLE_TREND_FOLLOW, MAX_TARGET_ATR_MULT,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -102,8 +103,15 @@ FUNNEL_STAGES = [
     "9 tap reached momentum check",
     "A tap momentum passed",
     "B atr readable",
-    "C risk > 0  -> ENTRY",
+    "C risk > 0",
+    "E target reachable -> TRADE",
 ]
+
+# MEASUREMENT-ONLY override. Defaults to the LIVE flag, so a plain run replays exactly
+# what production arms. Set REPLAY_TREND_FOLLOW=1 only to widen the sample for a
+# structural question (e.g. "does 6H crypto travel 2R in 18h?"); a result from that run
+# is NOT a statement about the live bot.
+_REPLAY_TREND_FOLLOW = (os.getenv("REPLAY_TREND_FOLLOW") == "1") or ENABLE_TREND_FOLLOW
 
 LTF_TF, LTF_SECS = "5m", 300
 HTF_TF, HTF_SECS = "6h", 6 * 3600
@@ -164,7 +172,7 @@ def fetch_paginated(ex, symbol, timeframe, tf_secs, since_ms, total):
 class Trade:
     __slots__ = ("symbol", "side", "entry", "stop", "target", "qty",
                  "entry_ts", "exit_ts", "exit", "reason", "pnl", "fees",
-                 "partial_qty", "banked", "tp1")
+                 "partial_qty", "banked", "tp1", "mfe_r", "mae_r", "hrs_to_mfe")
 
     def __init__(self, symbol, side, entry, stop, target, qty, entry_ts):
         self.symbol, self.side = symbol, side
@@ -172,6 +180,32 @@ class Trade:
         self.entry_ts, self.exit_ts, self.exit, self.reason, self.pnl = entry_ts, None, None, None, 0.0
         self.fees = 0.0
         self.partial_qty, self.banked, self.tp1 = 0.0, 0.0, None
+        # Excursion tracking, in units of R (R = |entry - stop|). mfe_r answers the
+        # question "how far did this setup EVER go our way before it died", which is
+        # what distinguishes "the target was too far" from "the structure picked the
+        # wrong direction". Updated only on bars that did NOT hit the stop, so a
+        # favourable wick on the stop bar can never inflate it.
+        self.mfe_r, self.mae_r, self.hrs_to_mfe = 0.0, 0.0, 0.0
+
+    @property
+    def risk_per_unit(self):
+        return abs(self.entry - self.stop)
+
+    @property
+    def target_r(self):
+        r = self.risk_per_unit
+        return abs(self.target - self.entry) / r if r else 0.0
+
+    def track_excursion(self, hi, lo, ts):
+        r = self.risk_per_unit
+        if not r:
+            return
+        fav = ((hi - self.entry) if self.side == "LONG" else (self.entry - lo)) / r
+        adv = ((self.entry - lo) if self.side == "LONG" else (hi - self.entry)) / r
+        if fav > self.mfe_r:
+            self.mfe_r = fav
+            self.hrs_to_mfe = (ts - self.entry_ts).total_seconds() / 3600
+        self.mae_r = max(self.mae_r, adv)
 
     def take_partial(self, price, frac):
         """Bank `frac` of the position at `price`. Returns True the first time only.
@@ -214,9 +248,32 @@ def backtest_symbol(ex, symbol, days, verbose=False):
     # backtest did not replay at all until 2026-10-03.
     since_day = int((now - timedelta(days=int(days) + 120)).timestamp() * 1000)
     day = fetch_paginated(ex, symbol, "1d", 86400, since_day, int(days) + 120)
+    # 1H bars. binance_bot.py:2594 and :2863 floor the structural stop against the 1H
+    # ATR (`atr_1h or _atr_s`). This replay floored it against the 6H ATR instead, which
+    # made every stop ~2.4x wider than live, every 2R target ~2.4x further away, and
+    # turned the 18h timer into the only reachable exit. Found 2026-10-03 while asking
+    # why no setup ever resolved: the answer was partly that this file never replayed the
+    # bot's actual stop.
+    h1_needed = int(days * 24) + 200
+    since_h1 = int((now - timedelta(hours=h1_needed)).timestamp() * 1000)
+    h1 = fetch_paginated(ex, symbol, "1h", 3600, since_h1, h1_needed)
     if len(ltf) < 100 or len(htf) < 60:
         print(f"  {symbol}: insufficient history ({len(ltf)} ltf / {len(htf)} htf) — skipped")
         return []
+
+    # Rolling-14 1H ATR as a flat array + its open-times, so each 5m bar can look up the
+    # last FULLY CLOSED 1H candle in O(log n) — the frame live sees after
+    # drop_forming_candle. A 1H candle with open time T is closed once T+3600s <= now.
+    _h1_ts = h1["ts"].to_numpy() if len(h1) else np.empty(0, dtype="int64")
+    _h1_atr = ((h1["high"] - h1["low"]).rolling(14).mean().to_numpy()
+               if len(h1) else np.empty(0))
+
+    def atr_1h_at(bar_ts):
+        k = int(np.searchsorted(_h1_ts, bar_ts - 3_600_000, side="right")) - 1
+        if k < 14:
+            return None
+        v = _h1_atr[k]
+        return float(v) if v == v and v > 0 else None
 
     trades, open_trade = [], None
     # Zone state, mirroring SymbolState's fields that actually affect entries.
@@ -243,6 +300,8 @@ def backtest_symbol(ex, symbol, days, verbose=False):
                            else (lo <= open_trade.tp1))
                 if got_tp1:
                     open_trade.take_partial(open_trade.tp1, SCALE_FRAC)
+            if not hit_stop:      # pessimistic: a stop bar contributes no favourable R
+                open_trade.track_excursion(hi, lo, ts)
             if hit_stop:          # pessimistic: stop wins a same-bar tie
                 trades.append(open_trade.close(open_trade.stop, ts, "SL")); open_trade = None
             elif hit_tgt:
@@ -284,7 +343,7 @@ def backtest_symbol(ex, symbol, days, verbose=False):
             # 402 for the AMD priority engine — so the measured population was almost
             # entirely a path nobody runs, and Route C only ever saw leftovers. Mirroring
             # the live flag is the only way this file measures the live bot.
-            if armed_by is None and ENABLE_TREND_FOLLOW:
+            if armed_by is None and _REPLAY_TREND_FOLLOW:
                 dly = day[day["ts"] <= bar["ts"]]
                 dtrend = indicators.get_daily_trend(dly) if len(dly) >= 52 else None
                 if dtrend == "bullish":
@@ -382,15 +441,28 @@ def backtest_symbol(ex, symbol, days, verbose=False):
                  else float(ltf_upto["high"].tail(SWING_LOOKBACK).max()) * 1.001)
         zone_lvl = indicators.crypto_zone_stop_level(
             price, is_long, z_lo if is_long else z_hi, SL_ATR_MULT * atr5, swing)
-        stop = indicators.structural_stop_price(price, zone_lvl, atr6, is_long, MIN_STOP_ATR_MULT_HTF)
+        _atr_1h = atr_1h_at(int(bar["ts"]))
+        stop = indicators.structural_stop_price(
+            price, zone_lvl, _atr_1h or atr5, is_long, MIN_STOP_ATR_MULT_HTF)
         risk = abs(price - stop)
         if risk <= 0:
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
-        FUNNEL["C risk > 0  -> ENTRY"] += 1
+        FUNNEL["C risk > 0"] += 1
         pool = indicators.find_next_liquidity_target(
             htf_closed, price + MIN_AI_RR * risk if is_long else price - MIN_AI_RR * risk,
             "bullish" if is_long else "bearish")
         target = indicators.structural_take_profit(price, risk, pool, is_long, MIN_AI_RR, MAX_AI_RR)
+        # binance_bot.py:1688 CLAMPS the target to what the hold window can deliver and
+        # SKIPS the trade when the honest target no longer pays MIN_AI_RR. This replay
+        # had no such gate, so it opened trades live refuses and then scored them dying
+        # on the timer — which is exactly the "setups never resolve" symptom.
+        target, _rr_reach, _reach_ok = indicators.reachable_target(
+            price, price - risk if is_long else price + risk, target,
+            indicators.range_atr(htf_closed), MAX_TARGET_ATR_MULT, MIN_AI_RR)
+        if not _reach_ok:
+            FUNNEL["D reachability veto (live skips)"] += 1
+            last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
+        FUNNEL["E target reachable -> TRADE"] += 1
         _tp1 = None
         if SCALE_FRAC > 0 and risk > 0:
             _rr = abs(target - price) / risk
@@ -432,7 +504,7 @@ def report_funnel():
             if prev is not None:
                 pct = (1 - n / prev) * 100 if prev else 0.0
                 lost = f"  -{prev - n:,} ({pct:5.1f}% lost)"
-            print(f"    {name[2:]:<26} {n:>8,}  {n/top*100:5.1f}%{lost}")
+            print(f"    {name[2:].strip():<26} {n:>8,}  {n/top*100:5.1f}%{lost}")
             prev = n
         # Rank by SHARE lost, not raw count. A stage that takes the funnel to zero is the
         # binding one even if an earlier stage discarded more bars in absolute terms —
@@ -448,16 +520,88 @@ def report_funnel():
     print("\n" + "=" * 62)
     print("  FUNNEL — where the bars stopped")
     print("=" * 62)
+    # THREE groups, not two. The previous split put "5b trend-follow zone" at the head of
+    # the ENTRY chunk, and that row is 0 whenever the path is gated off — so `top` fell
+    # back to 1 and every row below it printed as 410800%. Worse, 5b/5c count ZONES while
+    # 6..E count BARS, so they could never share a denominator at all. Zone counts are
+    # now printed as counts, and ENTRY is based on the armed-bar population.
     w1 = _phase("ARMING", rows[:5], "bars while idle, hunting for a zone")
-    w2 = _phase("ENTRY",  rows[5:], "bars while a zone is armed — NOT a subset of above")
+    print("\n  ZONES ARMED   (count of zones, by route — not bars)")
+    for name, n in rows[5:7]:
+        print(f"    {name[2:].strip():<26} {n:>8,}")
+    w2 = _phase("ENTRY",  rows[7:], "bars while a zone is armed — NOT a subset of above")
     for w in (x for x in (w1, w2) if x and x[0]):
         lost, name, reaching, share = w
         tag = "  ← TAKES THE FUNNEL TO ZERO" if share >= 1.0 else ""
         print(f"\n  BINDING CONSTRAINT: '{name}' — discards {lost:,} of the {reaching:,} "
               f"bars reaching it ({share*100:.1f}%).{tag}")
-    print("\n  CAVEAT: this replays ONE of the live bot's arming paths (displacement BOS +\n"
-          "  agreeing FVG). binance_bot.py has 11. A zero here does NOT mean the live bot\n"
-          "  would have stood aside — it means THIS path would have.")
+    print("\n  CAVEAT: this replays route A (displacement BOS + agreeing FVG) and route C\n"
+          "  (AMD sweep) — the two binance_bot.py actually arms on — plus route B behind\n"
+          "  REPLAY_TREND_FOLLOW=1. Live has 9 arming sites; 5 are gated OFF by\n"
+          "  ENABLE_TREND_FOLLOW / ENABLE_WEDGE_BREAKOUT. The wedge-RETEST path is still\n"
+          "  unreplayed, so a zero here is strong evidence but not proof of a stand-aside.")
+
+
+def report_resolution(all_trades):
+    """Why don't setups resolve? Compare how far price actually travelled our way
+    (MFE, in R) against how far the target was asked to be.
+
+    The counterfactual win rates below are a FIRST-ORDER estimate: a trade whose MFE
+    reached X R would have paid X R at a target of X R. It does not model the knock-on
+    effect that exiting sooner frees the one-position slot earlier, which would add
+    trades — so treat the trade COUNT as fixed and the direction of the result as the
+    signal, not the exact dollars.
+    """
+    ts = [t for t in all_trades if t.risk_per_unit]
+    if not ts:
+        return
+    import statistics as st
+    mfe = sorted(t.mfe_r for t in ts)
+    tgt = sorted(t.target_r for t in ts)
+
+    def pct(xs, q):
+        return xs[min(len(xs) - 1, int(q * len(xs)))]
+
+    print("\n" + "=" * 62)
+    print("  WHY SETUPS DON'T RESOLVE — travel vs. target")
+    print("=" * 62)
+    print(f"  trades measured            {len(ts)}")
+    print(f"  target asked (median)      {st.median(tgt):.2f} R"
+          f"   [p10 {pct(tgt,.1):.2f}  p90 {pct(tgt,.9):.2f}]")
+    print(f"  best travel reached        {st.median(mfe):.2f} R"
+          f"   [p10 {pct(mfe,.1):.2f}  p90 {pct(mfe,.9):.2f}  max {mfe[-1]:.2f}]")
+    print(f"  median hours to that peak  {st.median([t.hrs_to_mfe for t in ts]):.1f}h"
+          f"   (timer fires at {STALE_TRADE_HOURS}h)")
+    print(f"  median adverse excursion   {st.median([t.mae_r for t in ts]):.2f} R")
+    _veto = FUNNEL.get("D reachability veto (live skips)", 0)
+    if _veto:
+        print(f"  setups live REFUSES        {_veto:,} (target unreachable inside "
+              f"{STALE_TRADE_HOURS}h) — this replay now refuses them too")
+
+    print("\n  HOW FAR DID PRICE GET? (share of trades whose peak reached each level)")
+    print(f"    {'level':>7} {'reached':>9} {'share':>7}")
+    for lvl in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0):
+        n = sum(1 for t in ts if t.mfe_r >= lvl)
+        print(f"    {lvl:>6.2f}R {n:>9} {n / len(ts):>6.0%}")
+
+    print("\n  COUNTERFACTUAL — if the target had been fixed at X R")
+    print("  (fees charged at the SAME rate; trades that never reached X keep their real exit)")
+    print(f"    {'target':>7} {'win%':>6} {'exp R':>8} {'tot R':>8} {'net $':>10}")
+    for lvl in (0.5, 0.75, 1.0, 1.5, 2.0):
+        rs, net = [], 0.0
+        for t in ts:
+            if t.mfe_r >= lvl:
+                rs.append(lvl)
+                gross = lvl * t.risk_per_unit * t.qty
+                fee = (t.entry + (t.entry + (lvl if t.side == "LONG" else -lvl)
+                                  * t.risk_per_unit)) * t.qty * TAKER_FEE_RATE
+                net += gross - fee
+            else:
+                rs.append(t.pnl / (t.risk_per_unit * t.qty) if t.qty else 0.0)
+                net += t.pnl
+        wins = sum(1 for r in rs if r > 0)
+        print(f"    {lvl:>6.2f}R {wins / len(rs):>5.0%} {sum(rs) / len(rs):>8.2f} "
+              f"{sum(rs):>8.1f} {net:>10.2f}")
 
 
 def report(all_trades, days):
@@ -536,6 +680,7 @@ def report(all_trades, days):
 
     print("\n  Reminder: no AI gate, no news, no slippage (fees ARE modelled) — this is")
     print("  before filtering, and it is optimistic. Judge the sign, not the cents.")
+    report_resolution(all_trades)
     report_funnel()
 
 
