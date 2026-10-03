@@ -402,6 +402,39 @@ def report(all_trades, days):
         by_reason.setdefault(t.reason, []).append(t.pnl)
     print("  exits:          " + "  ".join(
         f"{k}={len(v)} ({sum(v):+,.0f})" for k, v in sorted(by_reason.items())))
+    # ── PER-SYMBOL AND PER-MONTH, in R ────────────────────────────────────────────────
+    # Added 2026-10-03, mirroring backtest_stocks. The stock side showed a 64% win rate
+    # whose profit was 99% two symbols, with the most recent third of the window negative
+    # — neither visible from net P&L. Same two questions here: is the edge broad, and is
+    # it still working? R, not dollars, because $-risk per trade varies with sizing.
+    def _r(t):
+        risk = abs(t.entry - t.stop)
+        return (t.pnl / (risk * t.qty)) if risk and t.qty else None
+
+    def _bucket(title, keyfn, order=None):
+        b = {}
+        for t in all_trades:
+            r = _r(t)
+            if r is None:
+                continue
+            b.setdefault(keyfn(t), []).append((r, t.pnl))
+        if not b:
+            return
+        keys = order(b) if order else sorted(b)
+        print(f"\n  {title}")
+        print(f"    {'key':<10} {'n':>4} {'win%':>6} {'exp R':>8} {'tot R':>8} {'net $':>9}")
+        for k in keys:
+            v = b[k]
+            w = sum(1 for r, _ in v if r > 0)
+            e = sum(r for r, _ in v) / len(v)
+            print(f"    {str(k):<10} {len(v):>4} {w/len(v)*100:>5.0f}% {e:>+8.2f} "
+                  f"{e*len(v):>+8.1f} {sum(x for _, x in v):>+9.2f}")
+
+    _bucket("PER SYMBOL — is the edge broad?", lambda t: t.symbol,
+            order=lambda b: sorted(b, key=lambda k: -sum(r for r, _ in b[k])))
+    _bucket("PER MONTH — is it still working?",
+            lambda t: t.entry_ts.strftime("%Y-%m") if t.entry_ts else "?")
+
     print("\n  Reminder: no AI gate, no news, no slippage (fees ARE modelled) — this is")
     print("  before filtering, and it is optimistic. Judge the sign, not the cents.")
     report_funnel()
