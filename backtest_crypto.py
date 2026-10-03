@@ -1,5 +1,28 @@
 """Replay-based backtester for binance_bot.py's SMC entry logic.
 
+CORRECTION 2026-10-03, read before trusting commit e43f738. That commit added "Route B"
+(trend-follow demand/supply), measured 239 trades with all 13 symbols negative, and
+concluded the LIVE bot runs it and that this explained the live losses. THAT CONCLUSION IS
+WRONG. binance_bot.py:368 sets ENABLE_TREND_FOLLOW = False — the path is gated OFF in
+production and has been, with a comment naming the same failure the backtest found ("the
+dip-buy in consolidation that bleeds to the 6h timer"). Route B's 239 trades describe a
+code path nobody is running.
+
+What that measurement IS good for: it independently confirms the earlier decision to gate
+that path was correct, on 239 trades rather than intuition. Keep it behind a flag here too.
+
+LIVE REALITY, which also corrects the "we only replay 1 of 11 arming paths" claim repeated
+throughout 2026-10-03. There are 9 real arming sites (two of the eleven amd_zone_type
+assignments are a state restore and a reset). Of those 9, FIVE ARE DELIBERATELY OFF:
+ENABLE_TREND_FOLLOW gates 4, ENABLE_WEDGE_BREAKOUT gates 1. The bot runs in "pure-sniper
+mode" — the AMD liquidity-sweep engine and the BOS displacement retest only.
+
+So the crypto bot's low trade count is NOT an artifact of under-measurement. It is the
+design. The remaining replay gap is the AMD sweep-gated demand/supply path
+(binance_bot.py:2208 and :2231), which is the priority engine and the one worth building
+next — not "the other ten paths".
+
+
     python3 backtest_crypto.py                      # default: 30d, all symbols
     python3 backtest_crypto.py --days 60 --symbols BTC/USD,ETH/USD
     python3 backtest_crypto.py --days 14 --verbose  # print every trade
