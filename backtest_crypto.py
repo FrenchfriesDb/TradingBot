@@ -69,6 +69,7 @@ FUNNEL_STAGES = [
     "3 idle, hunting",
     "4 6h displacement BOS",
     "5 FVG agrees with BOS",
+    "5b trend-follow zone",
     "6 armed, waiting",
     "7 zone not expired",
     "8 price TAPS the zone",
@@ -183,6 +184,10 @@ def backtest_symbol(ex, symbol, days, verbose=False):
     since_htf = int((now - timedelta(seconds=htf_needed * HTF_SECS)).timestamp() * 1000)
     ltf = fetch_paginated(ex, symbol, LTF_TF, LTF_SECS, since_ltf, ltf_needed)
     htf = fetch_paginated(ex, symbol, HTF_TF, HTF_SECS, since_htf, htf_needed)
+    # DAILY bars for get_daily_trend — needed by the TREND-FOLLOW arming route, which this
+    # backtest did not replay at all until 2026-10-03.
+    since_day = int((now - timedelta(days=int(days) + 120)).timestamp() * 1000)
+    day = fetch_paginated(ex, symbol, "1d", 86400, since_day, int(days) + 120)
     if len(ltf) < 100 or len(htf) < 60:
         print(f"  {symbol}: insufficient history ({len(ltf)} ltf / {len(htf)} htf) — skipped")
         return []
@@ -233,14 +238,40 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         # ── arm a zone (IDLE) ──────────────────────────────────────────────────
         if zone is None:
             FUNNEL["3 idle, hunting"] += 1
+            # TWO arming routes, not one. binance_bot has 9 real arming sites built from
+            # three detector families: displacement-FVG (4 sites), demand/supply zones
+            # (4 sites) and a wedge retest (1). This replayed ONLY the displacement-FVG
+            # family until 2026-10-03, which is why nine of thirteen symbols showed zero
+            # trades and every crypto frequency number described a fraction of the bot.
+            armed_by = None
+            # Route A — displacement BOS + an agreeing FVG (what this always did).
             is_bos, direction, _lvl = indicators.detect_displacement_bos(htf_closed, lookback=15)
-            if not (is_bos and direction):
+            if is_bos and direction:
+                FUNNEL["4 6h displacement BOS"] += 1
+                found, d, z_lo, z_hi, _ = indicators.detect_displacement_fvg(htf_closed)
+                if found and d == direction:
+                    FUNNEL["5 FVG agrees with BOS"] += 1
+                    armed_by = "fvg"
+            # Route B — TREND-FOLLOW demand/supply (binance_bot.py:2302). No sweep
+            # required: a daily trend plus a zone on the correct side of price. The
+            # loosest of the demand/supply sites, so the one most likely to carry volume.
+            if armed_by is None:
+                dly = day[day["ts"] <= bar["ts"]]
+                dtrend = indicators.get_daily_trend(dly) if len(dly) >= 52 else None
+                if dtrend == "bullish":
+                    f2, z_lo, z_hi, _k = indicators.find_demand_zone(
+                        htf_closed, price, max_distance_pct=0.08)
+                    if f2:
+                        direction, armed_by = "bullish", "trend"
+                elif dtrend == "bearish":
+                    f2, z_lo, z_hi, _k = indicators.find_supply_zone(
+                        htf_closed, price, max_distance_pct=0.08)
+                    if f2:
+                        direction, armed_by = "bearish", "trend"
+                if armed_by == "trend":
+                    FUNNEL["5b trend-follow zone"] += 1
+            if armed_by is None:
                 continue
-            FUNNEL["4 6h displacement BOS"] += 1
-            found, d, z_lo, z_hi, _ = indicators.detect_displacement_fvg(htf_closed)
-            if not (found and d == direction):
-                continue
-            FUNNEL["5 FVG agrees with BOS"] += 1
             bias = "BULLISH" if direction == "bullish" else "BEARISH"
             bars_wait = indicators.carried_zone_age(z_lo, z_hi, *last_zone)
             zone = (z_lo, z_hi, bias)
