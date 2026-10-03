@@ -295,6 +295,22 @@ DISPLACEMENT_ATR_MULT  = float(os.getenv("DISPLACEMENT_ATR_MULT", "1.8"))
 # 1.8× a dead ATR can be invisible — POL's 5m ATR was 0.169% of price while its 6H ATR
 # (2.755%) sailed through ATR_GATE. That timeframe mismatch is what this floor closes.
 DISPLACEMENT_MIN_PCT   = float(os.getenv("DISPLACEMENT_MIN_PCT", "0.0015"))
+
+# TAP-TIME momentum floor — the bar that FILLS the zone must itself be decisive.
+# Added 2026-10-02 after SOL and DOGE both entered LONG on a dying tape and both stopped:
+#   SOL  08:40 0.87x DOWN | 08:45 0.30x DOWN | 08:50 0.33x DOWN | 08:55 0.14x UP  <- entered
+#   DOGE 08:40 0.41x DOWN | 08:45 0.56x DOWN | 08:50 0.77x DOWN | 08:56 0.36x UP  <- entered
+# Three down bars then a doji, bought both times, -$45.79 for the day. The operator has
+# been reporting exactly this failure for months; the gate existed (has_displacement) and
+# was wired into the STOCK bot on 2026-09-29 but never onto this one's fresh-tap path,
+# where tap_candle_opposes_bias is only a VETO and lets `normal` and `doji` through.
+#
+# 1.4x is the best NET-expectancy row in the 60-day, 85k-tap study
+# (tools/measure_crypto_tap_displacement.py): -0.18R at 0.25% fees vs -0.24R for veto-only,
+# and +0.04R vs -0.03R at 0.10%. I originally read that table by TOTAL R and concluded "no
+# gate" — wrong criterion for a bot that takes ~3 trades a month, where per-trade
+# expectancy is the only thing it ever experiences.
+TAP_DISPLACEMENT_ATR_MULT = float(os.getenv("TAP_DISPLACEMENT_ATR_MULT", "1.4"))
 # Minimum FVG width. A thinner gap is a LINE, not a zone: price grazes it on any tick and
 # the retest carries no information. POL armed on a gap 0.00001 wide — 0.011% of price.
 MIN_FVG_PCT            = float(os.getenv("MIN_FVG_PCT", "0.0015"))
@@ -2732,6 +2748,32 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             #    technically-qualifying signal from a dead tape. Fresh zones are untouched.
             is_fresh = state.bars_in_entry_wait <= STALE_ZONE_BARS
             rebounce = confirms or choch_aligned
+
+            # ── Fresh momentum is now required on EVERY tap path, not only the stale one.
+            # A zone being freshly armed says the SETUP is recent; it says nothing about
+            # the bar actually filling it. SOL/DOGE 2026-10-02 filled fresh zones on 0.14x
+            # and 0.36x ATR bars after three down bars each, and both stopped. Fails CLOSED:
+            # an unreadable tape refuses rather than waving the entry through.
+            _tap_mom = False
+            try:
+                _rng_t  = df_ltf_closed["high"] - df_ltf_closed["low"]
+                _atr_t  = float(_rng_t.rolling(14).mean().iloc[-1])
+                _px_t   = float(df_ltf_closed["close"].iloc[-1])
+                _tap_mom = indicators.has_displacement(
+                    df_ltf_closed.tail(3)[["open", "high", "low", "close"]].values.tolist(),
+                    is_long, min_body_frac=DISPLACEMENT_BODY_FRAC,
+                    min_body_abs=indicators.displacement_min_body(
+                        _atr_t, _px_t, TAP_DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT))
+            except Exception as _e:
+                print(f"[{base}] ⚠️ Could not read tap momentum ({type(_e).__name__}) — standing aside.")
+                return price
+            if not _tap_mom:
+                if _tap_changed:
+                    print(f"[{base}] 🚫 Weak tap — the filling bar is not decisive "
+                          f"(needs body ≥{DISPLACEMENT_BODY_FRAC:.0%} of range AND "
+                          f"≥{TAP_DISPLACEMENT_ATR_MULT}×ATR, in the trade's direction, "
+                          f"within 3 bars). Waiting for a real rebounce.")
+                return price
 
             if state.amd_zone_type == "choch_fvg" and is_fresh:
                 # The displacement gap IS the change of character, so no positive

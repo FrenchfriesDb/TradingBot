@@ -115,10 +115,22 @@ def test_formation_still_uses_the_formation_multiple():
             "measured for the FILLING bar only")
 
 
-def test_crypto_bot_is_not_touched_by_this_change():
-    """binance_bot's tap was never measured; it keeps 1.8x until it is."""
-    assert "TAP_DISPLACEMENT_ATR_MULT" not in CRYPTO_SRC
-    assert _assigned_default(ast.parse(CRYPTO_SRC), "DISPLACEMENT_ATR_MULT") == "1.8"
+def test_each_bot_carries_its_own_measured_tap_value():
+    """UPDATED 2026-10-02. This used to assert crypto had NO tap constant, which was right
+    while its tap was unmeasured. It has since been measured (85k taps, 60d) and wired at
+    1.4x — the best NET-expectancy row there — after SOL and DOGE both filled fresh zones
+    on 0.14x and 0.36x ATR bars and stopped.
+
+    The intent the original test protected still holds and is what is pinned now: the two
+    bots are tuned SEPARATELY, from their own data. Stock is commission-free and peaks at
+    1.0x; crypto pays 0.25%/side and needs 1.4x to clear the fee drag. One shared number
+    would be wrong for both."""
+    crypto_tree = ast.parse(CRYPTO_SRC)
+    assert _assigned_default(crypto_tree, "TAP_DISPLACEMENT_ATR_MULT") == "1.4"
+    assert _assigned_default(TREE, "TAP_DISPLACEMENT_ATR_MULT") == "1.0"
+    # zone FORMATION stays at 1.8x in both — a different question from the tap.
+    assert _assigned_default(crypto_tree, "DISPLACEMENT_ATR_MULT") == "1.8"
+    assert _assigned_default(TREE, "DISPLACEMENT_ATR_MULT") == "1.8"
 
 
 # ── What the number actually does to a bar ────────────────────────────────────────────
