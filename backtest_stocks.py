@@ -152,12 +152,21 @@ def sandbox_strategy(use_ai: bool):
     def _on_filled(self, position, order, price, quantity, multiplier):
         try:
             sym = getattr(getattr(order, "asset", None), "symbol", None) or str(order.asset)
+            # Capture the STOP the strategy planned for this symbol. Without it a
+            # round-trip's P&L can only be read in DOLLARS, and dollars cannot tell
+            # "R is asymmetric" apart from "position sizes differ" — risk is capped at
+            # $30/trade but sized in WHOLE shares, so every trade risks a different
+            # amount. A 45d run came back avg win +$16.77 vs avg loss -$22.09 and that
+            # gap is unreadable without R. (It also disproved the EOD-truncation theory:
+            # 0 of 14 exits were in the flatten window.)
             FILLS.append({
                 "symbol": sym,
                 "side":   str(getattr(order, "side", "")).lower(),
                 "price":  float(price),
                 "qty":    abs(float(quantity)),
                 "dt":     self.get_datetime(),
+                "stop":   (self.stop_loss or {}).get(sym),
+                "target": (self.take_profit or {}).get(sym),
             })
         except Exception:
             pass          # never let bookkeeping break the run
@@ -185,7 +194,7 @@ def pair_round_trips(fills):
         lots = open_lots[sym]
         # Same direction as the resting lot (or none) -> opening/adding.
         if not lots or lots[0][0] == side:
-            lots.append([side, qty, px, dt])
+            lots.append([side, qty, px, dt, f.get("stop")])
             continue
         # Opposite direction -> close against the oldest lot(s).
         remaining = qty
@@ -203,13 +212,14 @@ def pair_round_trips(fills):
                 "pnl":    pnl,
                 "entry_iso": lot[3],
                 "exit_iso":  dt,
+                "stop":   lot[4],          # planned at ENTRY, so R is the risk taken on
             })
             lot[1] -= take
             remaining -= take
             if lot[1] <= 1e-9:
                 lots.popleft()
         if remaining > 1e-9:            # flipped straight through flat into a reversal
-            lots.append(["buy" if side == "buy" else "sell", remaining, px, dt])
+            lots.append(["buy" if side == "buy" else "sell", remaining, px, dt, f.get("stop")])
     return trades
 
 
@@ -338,6 +348,79 @@ def report(trades, start, end, symbols):
         per.setdefault(t["symbol"], []).append(t["pnl"])
     print("  per symbol:     " + "  ".join(
         f"{k}={len(v)} ({sum(v):+,.0f})" for k, v in sorted(per.items())))
+
+    # ── R SYMMETRY ────────────────────────────────────────────────────────────────────
+    # At a 1:1 target, wins and losses must be the SAME SIZE IN R. Dollars cannot show
+    # that (whole-share sizing varies the risk per trade), so score each round-trip
+    # against the stop that was planned at ENTRY.
+    rs = []
+    for t in trades:
+        try:
+            stop = float(t.get("stop"))
+            R = abs(float(t["entry"]) - stop)
+            if R <= 0:
+                continue
+            d = (float(t["exit"]) - float(t["entry"]))
+            rs.append(d / R if t["side"] == "LONG" else -d / R)
+        except (TypeError, ValueError):
+            continue
+    if rs:
+        w = [r for r in rs if r > 0]
+        l = [r for r in rs if r <= 0]
+        print(f"\n  in R (n={len(rs)} of {len(trades)} with a recorded stop):")
+        print(f"    avg win   {sum(w)/len(w):>+6.2f}R" if w else "    avg win   n/a")
+        print(f"    avg loss  {sum(l)/len(l):>+6.2f}R" if l else "    avg loss  n/a")
+        print(f"    expectancy{sum(rs)/len(rs):>+6.2f}R")
+        if w and l:
+            sym = abs(sum(w)/len(w)) / abs(sum(l)/len(l))
+            print(f"    win/loss size ratio {sym:.2f}  "
+                  f"({'symmetric — the dollar gap was SIZING' if 0.85 <= sym <= 1.15 else 'ASYMMETRIC — wins really are smaller'})")
+    else:
+        print("\n  (no stops recorded — R symmetry unavailable)")
+
+    # ── EXIT TIMING ───────────────────────────────────────────────────────────────────
+    # Added 2026-10-03. The 45d run came back 50% win with the average LOSS 32% bigger
+    # than the average WIN — impossible if the bot were taking clean +1R wins against
+    # clean -1R losses at a 1:1 target. The suspect is the EOD flatten truncating winners
+    # while losers run the full distance to the stop: a position up +0.4R at 15:45 books
+    # +0.4R, a losing one takes the whole -1R.
+    #
+    # The fills carry no exit REASON, but they carry the exit TIME, and that is enough:
+    # anything closing inside the flatten window was closed by the clock, not by the
+    # setup. Split the P&L on that line and the asymmetry either explains itself or does
+    # not.
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+        from bot.strategy import EOD_FLATTEN_MIN
+        _ET = ZoneInfo("America/New_York")
+        buckets = {"EOD flatten": [], "intraday": [], "unknown": []}
+        for t in trades:
+            try:
+                x = t["exit_iso"]
+                x = x if hasattr(x, "astimezone") else _dt.fromisoformat(str(x))
+                et = x.astimezone(_ET)
+                mins_left = (16 * 60) - (et.hour * 60 + et.minute)
+                key = "EOD flatten" if 0 <= mins_left <= EOD_FLATTEN_MIN else "intraday"
+            except Exception:
+                key = "unknown"
+            buckets[key].append(t["pnl"])
+        shown = {k: v for k, v in buckets.items() if v}
+        if shown:
+            print(f"\n  exits by TIMING (flatten window = last {EOD_FLATTEN_MIN} min):")
+            print(f"  {'bucket':>14} {'n':>4} {'share':>7} {'net $':>10} {'avg $':>9} "
+                  f"{'W/L':>8}")
+            for k, v in sorted(shown.items(), key=lambda kv: -len(kv[1])):
+                w = sum(1 for x in v if x > 0)
+                print(f"  {k:>14} {len(v):>4} {len(v)/len(trades)*100:>6.0f}% "
+                      f"{sum(v):>+10.2f} {sum(v)/len(v):>+9.2f} {w:>3}W/{len(v)-w:<3}L")
+            eod = shown.get("EOD flatten", [])
+            if eod and len(eod) / len(trades) > 0.3:
+                print(f"  -> {len(eod)/len(trades)*100:.0f}% of trades are closed by the CLOCK, "
+                      f"not by the setup. A 1:1 target cannot pay if most")
+                print(f"     winners are cut before they reach it while losers run to the stop.")
+    except Exception as _e:
+        print(f"\n  (exit-timing breakdown unavailable: {type(_e).__name__}: {_e})")
 
     print("\n  Caveats — read before trusting the sign:")
     print("   * Slippage/commission only modelled if --fee-pct was passed; fills are otherwise ideal.")

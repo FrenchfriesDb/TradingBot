@@ -50,6 +50,7 @@ from binance_bot import (
     SL_ATR_MULT, MIN_STOP_ATR_MULT_HTF, SWING_LOOKBACK, STALE_TRADE_HOURS,
     DEFAULT_SYMBOLS,
     DISPLACEMENT_BODY_FRAC, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT,
+    TAP_DISPLACEMENT_ATR_MULT,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -71,8 +72,8 @@ FUNNEL_STAGES = [
     "6 armed, waiting",
     "7 zone not expired",
     "8 price TAPS the zone",
-    "9 stale tap, needs displacement",
-    "A staleness gate passed",
+    "9 tap reached momentum check",
+    "A tap momentum passed",
     "B atr readable",
     "C risk > 0  -> ENTRY",
 ]
@@ -258,23 +259,24 @@ def backtest_symbol(ex, symbol, days, verbose=False):
             continue
         FUNNEL["8 price TAPS the zone"] += 1
 
-        # STALENESS — mirrors binance_bot.py:2717, which this used to get wrong.
-        # A stale zone is NOT discarded live. It survives and demands a FRESH displacement
-        # candle in the trade direction (<=3 bars back), same call as the sniper at :3135.
-        # The old line here threw the zone away on a stale tap, which is strictly harsher
-        # than production — that is why a 7-day run scored 100% of taps as refused.
-        if bars_wait > STALE_ZONE_BARS:
-            FUNNEL["9 stale tap, needs displacement"] += 1
-            _rng = ltf_upto["high"] - ltf_upto["low"]
-            _atr_t = float(_rng.rolling(14).mean().iloc[-1])
-            _px_t  = float(ltf_upto["close"].iloc[-1])
-            if pd.isna(_atr_t) or not indicators.has_displacement(
-                    ltf_upto.tail(3)[["open", "high", "low", "close"]].values.tolist(),
-                    is_long, min_body_frac=DISPLACEMENT_BODY_FRAC,
-                    min_body_abs=indicators.displacement_min_body(
-                        _atr_t, _px_t, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT)):
-                continue          # keep waiting — do NOT discard the zone
-        FUNNEL["A staleness gate passed"] += 1
+        # TAP MOMENTUM — mirrors binance_bot.py:2752. This has now been wrong TWICE:
+        #   1. it DISCARDED a stale zone outright (live keeps it) — fixed 2026-09-30;
+        #   2. it demanded displacement only when STALE, while live (2026-10-02) demands
+        #      it on EVERY tap, at TAP_DISPLACEMENT_ATR_MULT (1.4x), not the formation
+        #      1.8x. Measuring the looser rule would have scored a bot that does not exist.
+        # The live change came from SOL and DOGE both filling FRESH zones on 0.14x and
+        # 0.36x ATR bars after three down bars each, and both stopping.
+        FUNNEL["9 tap reached momentum check"] += 1
+        _rng = ltf_upto["high"] - ltf_upto["low"]
+        _atr_t = float(_rng.rolling(14).mean().iloc[-1])
+        _px_t  = float(ltf_upto["close"].iloc[-1])
+        if pd.isna(_atr_t) or not indicators.has_displacement(
+                ltf_upto.tail(3)[["open", "high", "low", "close"]].values.tolist(),
+                is_long, min_body_frac=DISPLACEMENT_BODY_FRAC,
+                min_body_abs=indicators.displacement_min_body(
+                    _atr_t, _px_t, TAP_DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT)):
+            continue              # keep waiting — do NOT discard the zone
+        FUNNEL["A tap momentum passed"] += 1
 
         # ── structural stop / target, same helpers as live ─────────────────────
         rng5 = ltf_upto["high"] - ltf_upto["low"]
