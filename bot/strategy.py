@@ -1,3 +1,5 @@
+import time
+
 from lumibot.strategies import Strategy
 from lumibot.entities import Asset, Order
 from bot import indicators
@@ -121,6 +123,29 @@ HTF_BARS               = int(os.getenv("HTF_BARS", "60"))
 # trend zone that day. 120s is ~2.5x the worst observed cold fetch and still bounds a
 # fully-stalled iteration (8 symbols x 2 HTF fetches) to ~32 minutes instead of 8h16m.
 DATA_FETCH_TIMEOUT     = float(os.getenv("DATA_FETCH_TIMEOUT", "120"))
+
+# Loop cadence. Dropped 15M -> 5M on 2026-10-02 on measurement, not preference.
+# tools/measure_chase_budget.py reconstructed 1,466 real zone taps from 1-MINUTE bars and
+# asked what the bot would have SEEN at each cadence, at the live 0.5x chase budget:
+#     15m   910 trades  +0.05R     median chase 0.31x ATR
+#      5m  1239 trades  +0.19R     median chase 0.00x ATR
+#      1m  1334 trades  +0.22R     median chase 0.00x ATR
+# 36% more trades at ~4x the expectancy, and FREE in R:R — a fill closer to the zone means
+# a TIGHTER stop, not a wider one. The biggest refusal in the log ("the move left without
+# us", 12 of 30 one session) was never the chase guard being strict; it was a 15-minute
+# loop arriving after good setups had left, with the guard then correctly refusing a stale
+# fill. Loosening the budget instead does the opposite: across the 15m row it ADDS trades
+# and destroys edge (+0.10R at 0.25x -> +0.02R unbounded).
+# 1m is deliberately NOT taken: +0.03R over 5m for 15x the API rate, on a feed that has
+# already stalled.
+LOOP_INTERVAL          = os.getenv("LOOP_INTERVAL", "5M")
+# Fraction of the interval one pass may consume before it defers the rest. There is a
+# per-FETCH deadline above but there was NO per-ITERATION one, so a bad network minute ran
+# 14 symbols x several fetches far past the loop's own interval: 2026-10-02 saw a single
+# pass take 1591s (26.5 min) on a 15-minute loop, and the bot completed 16 of ~26 possible
+# passes that session. At 5M that overrun costs five passes instead of two, so this bound
+# is a PRECONDITION of the cadence change, not a nicety.
+ITERATION_BUDGET_FRAC  = float(os.getenv("ITERATION_BUDGET_FRAC", "0.8"))
 
 MIN_STOP_ATR_MULT = 1.5
 # TARGET BAND — moved 2:1 -> 1:1 on 2026-10-01, on measurement.
@@ -314,7 +339,7 @@ class DebbieLaSMC(Strategy):
     def initialize(self, symbols: list = None, cash_at_risk: float = 0.03,
                    timeframe_htf: str = "4 hours", timeframe_ltf: str = "15 minutes"):
         self.symbols = symbols or ["AAPL", "QQQ", "SPY", "NVDA", "TSLA", "GOOGL"]
-        self.sleeptime = "15M"
+        self.sleeptime = LOOP_INTERVAL
         self.timeframe_htf = timeframe_htf
         self.timeframe_ltf = timeframe_ltf
         self.cash_at_risk_per_symbol = cash_at_risk / len(self.symbols)
@@ -2496,9 +2521,43 @@ class DebbieLaSMC(Strategy):
             self._log_daily_snapshot_if_new_day()
             return
 
-        for symbol in self.symbols:
+        # ── Bounded, FAIR pass over the watchlist ────────────────────────────────
+        # Rotation matters as much as the budget. Always starting at index 0 means a slow
+        # tape starves the TAIL of the watchlist every single time — exactly the
+        # 2026-09-21 failure where the bot "saw 3 of its 8 symbols all session". Rotating
+        # the start spreads a short pass across the list instead of permanently sacrificing
+        # whatever sits at the end of it.
+        _budget = self._iteration_budget_sec()
+        _t0 = time.monotonic()
+        _n = len(self.symbols)
+        _shift = (self._iter_count % _n) if _n else 0
+        _order = self.symbols[_shift:] + self.symbols[:_shift]
+        _done = 0
+        for symbol in _order:
+            if _budget and (time.monotonic() - _t0) > _budget:
+                self.log_message(
+                    f"⏱️ Iteration budget {_budget:.0f}s spent after {_done}/{_n} symbols — "
+                    f"deferring {', '.join(_order[_done:])}; they lead the next pass.",
+                    color="yellow")
+                break
             self._process_symbol(symbol)
+            _done += 1
         self._log_daily_snapshot_if_new_day()
+
+    def _iteration_budget_sec(self):
+        """Seconds one pass may spend before deferring the rest, from the live interval.
+
+        Derived from self.sleeptime rather than hardcoded, so changing the cadence cannot
+        leave a stale budget behind. Returns 0.0 (unbounded) if the interval is unparseable
+        — a budget we cannot compute must not silently truncate the watchlist.
+        """
+        try:
+            raw = str(self.sleeptime).strip().upper()
+            mult = {"S": 1, "M": 60, "H": 3600}.get(raw[-1:], 60)
+            secs = float(raw[:-1] if raw[-1:].isalpha() else raw) * mult
+            return max(0.0, secs * ITERATION_BUDGET_FRAC)
+        except (TypeError, ValueError, IndexError):
+            return 0.0
 
     def _log_daily_snapshot_if_new_day(self):
         """Once-per-UTC-day portfolio snapshot to the Stock Macro tab. Uses
