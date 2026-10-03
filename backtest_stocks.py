@@ -378,6 +378,48 @@ def report(trades, start, end, symbols):
     else:
         print("\n  (no stops recorded — R symmetry unavailable)")
 
+    # ── PER-TRADE DUMP ────────────────────────────────────────────────────────────────
+    # Added 2026-10-03 to find what closes trades before either level. Averages said
+    # +0.69R / -0.77R — both short of a full R — and the averages alone cannot say whether
+    # that is "everything exits early" or "some hit +-1R and others exit tiny". HOLD
+    # DURATION separates them: STALE_TRADE_HOURS is the only early-exit path left (EOD was
+    # 0 of 14, and this bot has no breakeven move), so a cluster at ~6h IS the timer.
+    try:
+        from datetime import datetime as _dt
+        print(f"\n  per trade ({'R':>6} {'hold':>7} {'exit vs':>9}):")
+        print(f"  {'sym':<6} {'side':<5} {'R':>6} {'hold h':>7} {'ended':>9}")
+        for t in sorted(trades, key=lambda x: str(x.get("entry_iso"))):
+            try:
+                stop = float(t.get("stop")); R = abs(float(t["entry"]) - stop)
+                d = float(t["exit"]) - float(t["entry"])
+                rm = (d / R) if t["side"] == "LONG" else (-d / R)
+            except (TypeError, ValueError, ZeroDivisionError):
+                rm = float("nan")
+            try:
+                a, b = t["entry_iso"], t["exit_iso"]
+                a = a if hasattr(a, "timestamp") else _dt.fromisoformat(str(a))
+                b = b if hasattr(b, "timestamp") else _dt.fromisoformat(str(b))
+                hrs = (b - a).total_seconds() / 3600
+            except Exception:
+                hrs = float("nan")
+            # label by how close the exit landed to a full R
+            if rm == rm:
+                tag = "TARGET" if rm >= 0.95 else ("STOP" if rm <= -0.95 else "early")
+            else:
+                tag = "?"
+            print(f"  {t['symbol']:<6} {t['side']:<5} {rm:>+6.2f} {hrs:>7.1f} {tag:>9}")
+        # how much of the book never reached either level
+        early = [t for t in trades
+                 if t.get("stop") and abs(float(t["entry"]) - float(t["stop"])) > 0
+                 and abs(((float(t["exit"]) - float(t["entry"])) /
+                          abs(float(t["entry"]) - float(t["stop"]))) *
+                         (1 if t["side"] == "LONG" else -1)) < 0.95]
+        if trades:
+            print(f"\n  -> {len(early)}/{len(trades)} ({len(early)/len(trades)*100:.0f}%) ended "
+                  f"at NEITHER the target nor the stop.")
+    except Exception as _e:
+        print(f"\n  (per-trade dump unavailable: {type(_e).__name__}: {_e})")
+
     # ── EXIT TIMING ───────────────────────────────────────────────────────────────────
     # Added 2026-10-03. The 45d run came back 50% win with the average LOSS 32% bigger
     # than the average WIN — impossible if the bot were taking clean +1R wins against

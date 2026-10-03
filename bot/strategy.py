@@ -2625,15 +2625,56 @@ class DebbieLaSMC(Strategy):
             # Cancel OCO FIRST so the TP/SL legs don't race the closing market order
             # and cause a wash-trade or an orphan fill on the wrong side.
             self._cancel_oco(symbol)
+            # Alpaca releases `held_for_orders` ASYNCHRONOUSLY. Submitting the close in
+            # the same breath as the cancel gets rejected with
+            #   "insufficient qty available for order (requested: 8, available: 0)"
+            # because the OCO still reserves the shares. Wait for the release.
+            for _ in range(10):
+                if not self._has_open_orders(symbol):
+                    break
+                time.sleep(0.5)
             close_qty  = abs(position.quantity)
             close_side = (Order.OrderSide.BUY if position.quantity < 0
                           else Order.OrderSide.SELL)
             order = self.create_order(asset, close_qty, close_side)
-            self.submit_order(order)
+            submitted = self.submit_order(order)
+            # DO NOT reset on a failed close. GOOGL 2026-08-20: this logged success and
+            # reset unconditionally, so the bot forgot it held 8 shares; _ensure_protection
+            # then found a "naked" position and re-posted the GTC OCO, which re-reserved
+            # the shares and blocked the next flatten. The two guards livelocked for six
+            # hours (08:59, 09:25, 10:13, 10:52 — each failing, each reporting success)
+            # until the EOD flatten happened to win the race. Keeping the state is what
+            # lets the next iteration retry honestly.
+            if submitted is None:
+                self.log_message(
+                    f"[{symbol}] ⚠️ {reason} close REJECTED by the broker — position is "
+                    f"STILL OPEN ({close_qty} shares). Keeping state so the next "
+                    f"iteration retries; NOT resetting.", color="red")
+                return
             self.log_message(
                 f"[{symbol}] {reason} close: cancelled OCO + submitted market close "
                 f"({close_qty} shares).", color="cyan")
             self._reset(symbol)
+
+    def _has_open_orders(self, symbol):
+        """True while Alpaca still shows an open order for `symbol`.
+
+        Used to wait out the asynchronous release of `held_for_orders` after cancelling
+        protection. Returns False (proceed) on any read failure — a flatten that cannot
+        verify must still be attempted, since not closing is the worse outcome.
+        """
+        try:
+            import requests as _req
+            resp = _req.get(
+                f"{ALPACA_BASE_URL}/v2/orders",
+                params={"status": "open", "symbols": symbol, "limit": 50},
+                headers={"APCA-API-KEY-ID": ALPACA_API_KEY,
+                         "APCA-API-SECRET-KEY": ALPACA_API_SECRET},
+                timeout=10)
+            resp.raise_for_status()
+            return bool(resp.json())
+        except Exception:
+            return False
 
     def _flatten_all(self, reason="EOD"):
         """Cancel protection and market-close every open position. Shared by the
