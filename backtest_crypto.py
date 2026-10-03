@@ -73,7 +73,8 @@ from binance_bot import (
     SL_ATR_MULT, MIN_STOP_ATR_MULT_HTF, SWING_LOOKBACK, STALE_TRADE_HOURS,
     DEFAULT_SYMBOLS,
     DISPLACEMENT_BODY_FRAC, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT,
-    TAP_DISPLACEMENT_ATR_MULT,
+    TAP_DISPLACEMENT_ATR_MULT, atr_gate_for,
+    ENABLE_TREND_FOLLOW,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -81,6 +82,7 @@ from binance_bot import (
 # same defect backtest_stocks.py had until 6b2da44. A zero here is a finding, but it is
 # only useful if it names the gate that produced it.
 FUNNEL = Counter()
+ARMED_BY = Counter()        # which arming route produced each armed zone
 
 # Every stage, pre-seeded to zero. Without this the stages that NEVER fire are simply
 # absent from the Counter, so the table stops at the last stage that happened and the
@@ -93,6 +95,7 @@ FUNNEL_STAGES = [
     "4 6h displacement BOS",
     "5 FVG agrees with BOS",
     "5b trend-follow zone",
+    "5c AMD sweep zone",
     "6 armed, waiting",
     "7 zone not expired",
     "8 price TAPS the zone",
@@ -275,10 +278,13 @@ def backtest_symbol(ex, symbol, days, verbose=False):
                 if found and d == direction:
                     FUNNEL["5 FVG agrees with BOS"] += 1
                     armed_by = "fvg"
-            # Route B — TREND-FOLLOW demand/supply (binance_bot.py:2302). No sweep
-            # required: a daily trend plus a zone on the correct side of price. The
-            # loosest of the demand/supply sites, so the one most likely to carry volume.
-            if armed_by is None:
+            # Route B — TREND-FOLLOW demand/supply (binance_bot.py:2302).
+            # GATED ON THE LIVE FLAG. ENABLE_TREND_FOLLOW is False in production, and the
+            # first run with Route B unconditional armed 19,059 zones through it against
+            # 402 for the AMD priority engine — so the measured population was almost
+            # entirely a path nobody runs, and Route C only ever saw leftovers. Mirroring
+            # the live flag is the only way this file measures the live bot.
+            if armed_by is None and ENABLE_TREND_FOLLOW:
                 dly = day[day["ts"] <= bar["ts"]]
                 dtrend = indicators.get_daily_trend(dly) if len(dly) >= 52 else None
                 if dtrend == "bullish":
@@ -293,8 +299,40 @@ def backtest_symbol(ex, symbol, days, verbose=False):
                         direction, armed_by = "bearish", "trend"
                 if armed_by == "trend":
                     FUNNEL["5b trend-follow zone"] += 1
+            # ── Route C: AMD sweep-gated demand/supply (binance_bot.py:2208 / :2231) ──
+            # THE PRIORITY ENGINE and the live bot's main path — pure-sniper mode leaves
+            # only this and Route A enabled. Mirrors the live gates exactly:
+            #   HTF high-sweep + daily BULLISH + depth >= 0.3% -> demand zone below
+            #   HTF low-sweep  + daily BEARISH + depth >= 0.3% -> supply zone above
+            # Also applies the live per-symbol ATR floor (atr_gate_for), which Routes A
+            # and B in this file never did.
+            if armed_by is None:
+                dly2 = day[day["ts"] <= bar["ts"]]
+                dt2 = indicators.get_daily_trend(dly2) if len(dly2) >= 52 else None
+                _rng6 = htf_closed["high"] - htf_closed["low"]
+                _atr6 = float(_rng6.rolling(14).mean().iloc[-1])
+                _px6 = float(htf_closed["close"].iloc[-1])
+                _atrp = (_atr6 / _px6) if (_atr6 == _atr6 and _px6) else 0.0
+                if _atrp >= atr_gate_for(symbol):
+                    hi_sw, res_lvl, hi_wick = indicators.check_liquidity_sweep_high(
+                        htf_closed, sweep_window=5)
+                    lo_sw, sup_lvl, lo_wick = indicators.check_liquidity_sweep(
+                        htf_closed, sweep_window=5)
+                    if hi_sw and dt2 == "bullish" and res_lvl and res_lvl > 0 and hi_wick:
+                        if (hi_wick - res_lvl) / res_lvl >= 0.003:
+                            f3, z_lo, z_hi, _k = indicators.find_demand_zone(htf_closed, price)
+                            if f3:
+                                direction, armed_by = "bullish", "amd"
+                    elif lo_sw and dt2 == "bearish" and sup_lvl and sup_lvl > 0 and lo_wick:
+                        if (sup_lvl - lo_wick) / sup_lvl >= 0.003:
+                            f3, z_lo, z_hi, _k = indicators.find_supply_zone(htf_closed, price)
+                            if f3:
+                                direction, armed_by = "bearish", "amd"
+                if armed_by == "amd":
+                    FUNNEL["5c AMD sweep zone"] += 1
             if armed_by is None:
                 continue
+            ARMED_BY[armed_by] += 1
             bias = "BULLISH" if direction == "bullish" else "BEARISH"
             bars_wait = indicators.carried_zone_age(z_lo, z_hi, *last_zone)
             zone = (z_lo, z_hi, bias)
@@ -483,6 +521,13 @@ def report(all_trades, days):
             e = sum(r for r, _ in v) / len(v)
             print(f"    {str(k):<10} {len(v):>4} {w/len(v)*100:>5.0f}% {e:>+8.2f} "
                   f"{e*len(v):>+8.1f} {sum(x for _, x in v):>+9.2f}")
+
+    if ARMED_BY:
+        print("\n  ARMED BY ROUTE (zones armed, not trades):")
+        for k, n in ARMED_BY.most_common():
+            label = {"fvg": "A  displacement BOS + FVG", "trend": "B  trend-follow (OFF live)",
+                     "amd": "C  AMD sweep (PRIORITY, live)"}.get(k, k)
+            print(f"    {label:<34} {n:>7,}")
 
     _bucket("PER SYMBOL — is the edge broad?", lambda t: t.symbol,
             order=lambda b: sorted(b, key=lambda k: -sum(r for r, _ in b[k])))
