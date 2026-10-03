@@ -456,6 +456,24 @@ MAX_RISK_DOLLARS = 20.0  # fixed-risk sizing: every stop-out loses ~$20. Positio
 #
 # Note also that the tools model fees but NOT slippage or spread, which act like extra
 # fee and are what usually consumes an edge this thin.
+# REAL COINBASE SCHEDULE, pulled 2026-10-03 — THE 0.25% DEFAULT BELOW IS OPTIMISTIC.
+# 0.25% taker is the $50k-30d-volume tier. A NEW ACCOUNT PAYS 0.60% TAKER / 0.40% MAKER:
+#     30d volume        maker     taker
+#              0       0.4000%   0.6000%   <- a new account starts here
+#         10,000       0.2500%   0.4000%
+#         50,000       0.1500%   0.2500%   <- what this constant assumes
+#        100,000       0.1000%   0.2000%
+#      1,000,000       0.0800%   0.1800%
+#     75,000,000       0.0300%   0.1200%
+# Against the measured +0.11R gross edge and a 1.65% median stop, fee drag per trade is:
+#     tier 0      0.73R all-taker / 0.55R maker-in+TP  ->  net -0.44R
+#     $100k       0.24R / 0.15R                        ->  net -0.04R
+#     $1M         0.22R / 0.13R                        ->  net -0.02R
+#     $75M        0.15R / 0.06R                        ->  net +0.05R   <- first positive
+# So on Coinbase at retail volume this strategy cannot clear its own costs, and the gap is
+# ~5x of gross edge rather than a tuning problem. Any replacement strategy needs gross
+# edge ABOVE ~0.55R/trade at tier 0 to break even. Confirm a live account's actual tier
+# with GET /api/v3/brokerage/transaction_summary before trusting this table.
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0025"))   # 0.25%/side default
 # Maker rate, for orders that REST on the book instead of crossing it. Defaults to the
 # TAKER rate on purpose: assuming a discount the account has not been verified to get is
