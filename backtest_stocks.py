@@ -373,10 +373,67 @@ def report(trades, start, end, symbols):
         print(f"    expectancy{sum(rs)/len(rs):>+6.2f}R")
         if w and l:
             sym = abs(sum(w)/len(w)) / abs(sum(l)/len(l))
-            print(f"    win/loss size ratio {sym:.2f}  "
-                  f"({'symmetric — the dollar gap was SIZING' if 0.85 <= sym <= 1.15 else 'ASYMMETRIC — wins really are smaller'})")
+            # The first version printed "wins really are smaller" for BOTH tails, so a
+            # ratio of 1.17 — wins LARGER than losses — was reported as wins being
+            # smaller. Say which direction.
+            if 0.85 <= sym <= 1.15:
+                note = "symmetric"
+            elif sym > 1.15:
+                note = "wins are LARGER than losses"
+            else:
+                note = "wins are SMALLER than losses"
+            print(f"    win/loss size ratio {sym:.2f}  ({note})")
     else:
         print("\n  (no stops recorded — R symmetry unavailable)")
+
+    # ── PER-SYMBOL AND PER-MONTH ─────────────────────────────────────────────────────
+    # Added 2026-10-03. The 120d run showed +$406 net at a 64% win rate, but a P&L split
+    # revealed NFLX (+232) and PLTR (+171) carried 99% of it while the other five symbols
+    # netted +$3 between them — and the most recent 45 days of the same window ran -$37.
+    # A headline win rate hides both. These two cuts answer "is the edge broad?" and
+    # "is it still working?", which have opposite responses if the answer is no.
+    def _rmult(t):
+        try:
+            stop = float(t.get("stop")); R = abs(float(t["entry"]) - stop)
+            if R <= 0:
+                return None
+            d = float(t["exit"]) - float(t["entry"])
+            return d / R if t["side"] == "LONG" else -d / R
+        except (TypeError, ValueError):
+            return None
+
+    def _bucketed(title, keyfn, order=None):
+        buckets = {}
+        for t in trades:
+            r = _rmult(t)
+            if r is None:
+                continue
+            buckets.setdefault(keyfn(t), []).append((r, t["pnl"]))
+        if not buckets:
+            return
+        keys = order(buckets) if order else sorted(buckets)
+        print(f"\n  {title}")
+        print(f"    {'key':<9} {'n':>4} {'win%':>6} {'exp R':>8} {'tot R':>8} {'net $':>9}")
+        for k in keys:
+            v = buckets[k]
+            w = sum(1 for r, _ in v if r > 0)
+            e = sum(r for r, _ in v) / len(v)
+            print(f"    {str(k):<9} {len(v):>4} {w/len(v)*100:>5.0f}% {e:>+8.2f} "
+                  f"{e*len(v):>+8.1f} {sum(p for _, p in v):>+9.0f}")
+
+    _bucketed("PER SYMBOL — is the edge broad, or two lucky names?",
+              lambda t: t["symbol"],
+              order=lambda b: sorted(b, key=lambda k: -sum(r for r, _ in b[k])))
+
+    def _month(t):
+        try:
+            x = t["entry_iso"]
+            x = x if hasattr(x, "strftime") else _dtmod.fromisoformat(str(x))
+            return x.strftime("%Y-%m")
+        except Exception:
+            return "?"
+    from datetime import datetime as _dtmod
+    _bucketed("PER MONTH — is it decaying, or was one stretch just good?", _month)
 
     # ── PER-TRADE DUMP ────────────────────────────────────────────────────────────────
     # Added 2026-10-03 to find what closes trades before either level. Averages said
