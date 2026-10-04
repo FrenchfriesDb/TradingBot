@@ -3022,6 +3022,13 @@ def run():
             if _gap_hit:
                 _kind, fill, _ts = _gap_hit
                 sl_hit, tp_hit = _kind == "STOP", _kind == "TARGET"
+                # THIRD stop-fill site. first_protective_breach reports the LEVEL that was
+                # breached, which is right for a resting TP limit and wrong for a stop: a
+                # stop triggers on touch and then crosses the book. Same fiction as the
+                # other two sites, and it would have survived fixing both of them.
+                if sl_hit:
+                    fill = indicators.stop_fill_price(
+                        st.entry_price, st.stop_loss, is_long, STOP_SLIPPAGE_R)
                 label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
                           else "🔴 SL") if sl_hit else "🟢 TP")
                 print(f"  ⏮ {base}: {_kind} was breached at "
@@ -3031,7 +3038,9 @@ def run():
             else:
                 sl_hit = (is_long and _cur <= st.stop_loss) or (not is_long and _cur >= st.stop_loss)
                 tp_hit = (is_long and _cur >= st.take_profit) or (not is_long and _cur <= st.take_profit)
-                fill  = st.stop_loss if sl_hit else st.take_profit
+                fill  = (indicators.stop_fill_price(st.entry_price, st.stop_loss,
+                                                    is_long, STOP_SLIPPAGE_R)
+                         if sl_hit else st.take_profit)
                 label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
                           else "🔴 SL") if sl_hit else "🟢 TP")
             if sl_hit or tp_hit:
@@ -3042,7 +3051,10 @@ def run():
                 else:
                     paper.buy(sym, close_qty, fill)
                     pnl = (st.entry_price - fill) * close_qty
-                _fees = indicators.round_trip_fee(st.entry_price, fill, close_qty, TAKER_FEE_RATE)
+                _fees = indicators.round_trip_fee(
+                    st.entry_price, fill, close_qty,
+                    MAKER_FEE_RATE if MAKER_ENTRIES else TAKER_FEE_RATE,
+                    MAKER_FEE_RATE if tp_hit else TAKER_FEE_RATE)
                 pnl -= _fees          # net — see close_position()
                 _exit_reason = indicators.normalize_exit_reason(label, st.breakeven_moved)
                 trade_print(base, f"{label} HIT (startup catch-up — bot was offline)", fill,
@@ -3489,8 +3501,8 @@ def run():
                     # target genuinely does fill at its price, while a stop sweeps the
                     # book. See STOP_SLIPPAGE_R.
                     if sl_hit:
-                        _slip = STOP_SLIPPAGE_R * abs(st.entry_price - st.stop_loss)
-                        fill = (st.stop_loss - _slip) if is_long else (st.stop_loss + _slip)
+                        fill = indicators.stop_fill_price(
+                            st.entry_price, st.stop_loss, is_long, STOP_SLIPPAGE_R)
                     else:
                         fill = st.take_profit
                     # A trailed stop is a BREAK-EVEN exit, not a stop-out. Labelling
@@ -3505,7 +3517,14 @@ def run():
                     else:
                         paper.buy(sym, close_qty, fill)
                         pnl = (st.entry_price - fill) * close_qty
-                    _fees = indicators.round_trip_fee(st.entry_price, fill, close_qty, TAKER_FEE_RATE)
+                    # A resting TP limit earns the MAKER rate; a stop crosses the book
+                    # and pays TAKER. Charging one blended rate across both understates
+                    # losers and overstates winners — the helper has taken an
+                    # exit_fee_rate since it was written, and this site ignored it.
+                    _fees = indicators.round_trip_fee(
+                        st.entry_price, fill, close_qty,
+                        MAKER_FEE_RATE if MAKER_ENTRIES else TAKER_FEE_RATE,
+                        MAKER_FEE_RATE if tp_hit else TAKER_FEE_RATE)
                     pnl -= _fees      # net — see close_position()
                     _exit_reason = indicators.normalize_exit_reason(label, st.breakeven_moved)
                     lev_tag = f"[{PAPER_LEVERAGE}x]" if PAPER_LEVERAGE > 1 else ""

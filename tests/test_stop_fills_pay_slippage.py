@@ -1,78 +1,127 @@
-"""A stop-out must fill WORSE than its trigger; a take-profit must fill AT its price.
+"""A stop fills WORSE than its trigger, and each leg pays its own fee rate.
 
-binance_bot.py's exit watcher detected a stop-out by seeing the candle trade THROUGH the
-stop (`candle_low <= st.stop_loss`) and then filled at `st.stop_loss` exactly — booking the
-best available price on direct evidence that a worse one existed. Every stop-out in the
-paper ledger was flattered, in the one direction that matters when you are deciding whether
-to put real money behind it.
+TWO defects, same shape, found 2026-10-03 — and the first attempt at guarding them had a
+hole, which is why this file now enumerates by AST instead of matching strings.
 
-Calibrated from a 60d/13-symbol replay: the bar overshoots the stop by 0.15 R on average per
-stop-out (median 0.03, p90 0.39, max 0.65), worth 0.044 R per trade against a measured gross
-edge of +0.086 R — about half the edge. Real, but NOT decisive, which is the opposite of
-what I predicted before measuring it.
+1. STOP FILLS. Three separate live sites closed a position at the stop PRICE while
+   detecting the hit by observing price trade THROUGH it — booking the best available
+   price on direct evidence a worse one existed. The first fix caught one site. The
+   startup catch-up path (a ternary with different spacing) and the downtime-replay path
+   both survived it, AND survived a test that string-matched `fill = st.stop_loss\\n`.
+   Everything now goes through indicators.stop_fill_price, the single producer.
 
-The asymmetry is the point: a resting limit order at the target genuinely does fill at its
-price, so TP takes no slippage. A stop sweeps the book, so it does.
+2. FEE LEGS. round_trip_fee has taken an exit_fee_rate since it was written, and
+   binance_bot documents the model at :483 — a resting entry and a resting TP earn MAKER,
+   a stop crosses the book and pays TAKER. One of four call sites actually passed it.
+
+Calibration: 0.15 R mean overshoot per stop-out (median 0.03, p90 0.39, max 0.65) from a
+60d/13-symbol replay; 0.044 R per trade against a measured gross edge of +0.086 R — about
+half the edge. Real, but NOT decisive, which is the opposite of what I predicted.
 """
 import ast
 import pathlib
 
 import pytest
 
+from bot import indicators
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+FILES = ["binance_bot.py", "backtest_crypto.py"]
 
 
-def test_slippage_constant_is_positive_and_calibrated():
-    import binance_bot
-    assert binance_bot.STOP_SLIPPAGE_R > 0, "a stop that fills at its trigger is a fiction"
-    assert abs(binance_bot.STOP_SLIPPAGE_R - 0.15) < 1e-9, (
-        "0.15 R is the measured mean overshoot per stop-out — changing it should be a "
-        "deliberate re-calibration, not a drift")
+def _tree(rel):
+    return ast.parse((ROOT / rel).read_text())
 
 
-@pytest.mark.parametrize("side,expected_worse", [("LONG", -1), ("SHORT", +1)])
-def test_stop_fill_is_worse_than_the_trigger(side, expected_worse):
-    """Long stops fill BELOW the stop, short stops ABOVE it."""
-    import binance_bot as bb
-    entry, stop = (100.0, 99.0) if side == "LONG" else (100.0, 101.0)
-    risk = abs(entry - stop)
-    slip = bb.STOP_SLIPPAGE_R * risk
-    fill = (stop - slip) if side == "LONG" else (stop + slip)
-    assert (fill - stop) * expected_worse > 0, "fill must be on the losing side of the stop"
-    # and it must still be a loss strictly larger than 1R
-    realised_r = ((fill - entry) if side == "LONG" else (entry - fill)) / risk
-    assert realised_r < -1.0, f"a stop-out must cost MORE than 1R, got {realised_r:.3f}R"
-    # plain arithmetic, not pytest.approx: approx reaches into numpy, which can be
-    # mid-import here and raises a circular-import AttributeError.
-    assert abs(realised_r - (-1.15)) < 1e-9, "1R plus the calibrated 0.15R slip"
+class TestStopFillPrice:
+    def test_long_stop_fills_below_the_trigger(self):
+        fill = indicators.stop_fill_price(100.0, 99.0, True, 0.15)
+        assert fill < 99.0
+        assert abs(fill - 98.85) < 1e-9
+
+    def test_short_stop_fills_above_the_trigger(self):
+        fill = indicators.stop_fill_price(100.0, 101.0, False, 0.15)
+        assert fill > 101.0
+        assert abs(fill - 101.15) < 1e-9
+
+    @pytest.mark.parametrize("entry,stop,is_long", [(100.0, 99.0, True), (100.0, 101.0, False)])
+    def test_a_stop_out_costs_strictly_more_than_1r(self, entry, stop, is_long):
+        fill = indicators.stop_fill_price(entry, stop, is_long, 0.15)
+        r = abs(entry - stop)
+        realised = ((fill - entry) if is_long else (entry - fill)) / r
+        assert realised < -1.0, f"a stop-out must cost MORE than 1R, got {realised:.3f}R"
+        assert abs(realised - (-1.15)) < 1e-9
+
+    def test_zero_slippage_reproduces_the_old_behaviour(self):
+        assert indicators.stop_fill_price(100.0, 99.0, True, 0.0) == 99.0
+
+    def test_bad_input_returns_the_stop_rather_than_raising(self):
+        """Runs on a close path, after the position is already gone. Must not throw."""
+        assert indicators.stop_fill_price(None, 99.0, True, 0.15) == 99.0
+
+    def test_negative_slippage_cannot_flatter_a_fill(self):
+        assert indicators.stop_fill_price(100.0, 99.0, True, -5.0) == 99.0
 
 
-def test_take_profit_takes_no_slippage():
-    """A resting limit at the target fills at its price — charging it slippage would be
-    inventing a cost, which is as dishonest as hiding one."""
-    src = (ROOT / "binance_bot.py").read_text()
-    i = src.index("if sl_hit:\n                        _slip")
-    block = src[i:i + 420]
-    assert "fill = st.take_profit" in block, "TP must still fill at its own price"
-    tp_line = [l for l in block.splitlines() if "fill = st.take_profit" in l][0]
-    assert "_slip" not in tp_line, "TP must not be charged stop slippage"
+class TestEveryStopFillUsesTheProducer:
+    @pytest.mark.parametrize("rel", FILES)
+    def test_no_fill_variable_is_assigned_a_raw_stop_level(self, rel):
+        """AST, not string matching — the previous version of this test passed while two
+        live sites were still filling at the bare trigger."""
+        offenders = []
+        for node in ast.walk(_tree(rel)):
+            if not isinstance(node, ast.Assign):
+                continue
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if not any(n == "fill" or n.endswith("_fill") for n in names):
+                continue
+            src = ast.unparse(node.value)
+            if "stop" in src and "stop_fill_price" not in src:
+                offenders.append(f"{rel}:{node.lineno} — {src[:90]}")
+        assert not offenders, (
+            "a stop fill must come from indicators.stop_fill_price:\n  " + "\n  ".join(offenders))
+
+    def test_the_producer_is_actually_reached_from_both_files(self):
+        for rel in FILES:
+            assert "stop_fill_price" in (ROOT / rel).read_text(), (
+                f"{rel} closes positions at stops but never calls the producer")
 
 
-@pytest.mark.parametrize("rel", ["binance_bot.py", "backtest_crypto.py"])
-def test_no_call_site_fills_a_stop_at_the_bare_stop_price(rel):
-    """Guard against the fiction coming back. Both files must apply the slip."""
-    src = (ROOT / rel).read_text()
-    assert "STOP_SLIPPAGE_R" in src, f"{rel} fills stops without charging slippage"
-    bad = ["fill = st.stop_loss\n", "close(open_trade.stop, ts, \"SL\")"]
-    for pat in bad:
-        assert pat not in src, f"{rel} still fills a stop at its bare trigger: {pat!r}"
+class TestFeeLegsAreChargedSeparately:
+    @pytest.mark.parametrize("rel", FILES)
+    def test_round_trip_fee_is_given_an_exit_rate(self, rel):
+        """A resting TP earns MAKER; a stop pays TAKER. One blended rate understates
+        losers and overstates winners.
 
+        Allowlisted: a MANUAL dashboard close genuinely crosses the book on both legs, so
+        taker-only is correct there — but it must say so at the call site.
+        """
+        src = (ROOT / rel).read_text()
+        lines = src.splitlines()
+        offenders = []
+        for node in ast.walk(_tree(rel)):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "attr", getattr(node.func, "id", None)) != "round_trip_fee":
+                continue
+            if len(node.args) + len(node.keywords) >= 5:
+                continue
+            context = "\n".join(lines[max(0, node.lineno - 4):node.lineno + 4])
+            if "MANUAL CLOSE" in context:          # genuine taker/taker
+                continue
+            offenders.append(f"{rel}:{node.lineno} — only {len(node.args)} args, no exit rate")
+        assert not offenders, (
+            "round_trip_fee must be given a per-leg exit rate:\n  " + "\n  ".join(offenders))
 
-def test_replay_and_live_agree_on_the_constant():
-    """The replay must import the live constant, not define its own."""
-    tree = ast.parse((ROOT / "backtest_crypto.py").read_text())
-    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
-                and n.module == "binance_bot" for a in n.names}
-    assert "STOP_SLIPPAGE_R" in imported, (
-        "backtest_crypto must IMPORT STOP_SLIPPAGE_R from binance_bot — a local copy is "
-        "exactly how this file drifted from live three times already")
+    def test_maker_rate_assumes_no_discount_until_one_is_configured(self):
+        """MAKER_FEE_RATE must default to the taker rate. Assuming a discount nobody has
+        verified is how the crypto numbers got optimistic in the first place."""
+        import binance_bot
+        assert binance_bot.MAKER_FEE_RATE == binance_bot.TAKER_FEE_RATE, (
+            "MAKER_FEE_RATE must default to TAKER_FEE_RATE — set it from a real fee tier")
+
+    def test_maker_entries_default_off(self):
+        """A resting entry trades fill quality for the maker rate and some taps stop
+        filling entirely. It is not a free win and must be opted into."""
+        import binance_bot
+        assert binance_bot.MAKER_ENTRIES is False

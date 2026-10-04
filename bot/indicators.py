@@ -996,6 +996,32 @@ def maker_limit_fill(limit_price, bar_low, bar_high, is_long, require_through=Tr
     return limit_price if reached else None
 
 
+def stop_fill_price(entry, stop, is_long, slip_r):
+    """The price a STOP actually fills at: its trigger, plus slippage, always worse.
+
+    THE SINGLE PRODUCER. This exists because the fix was applied to one of the two live
+    stop-fill sites and missed the other — binance_bot.py's exit watcher got it while the
+    startup catch-up path kept filling at the bare trigger, and a string-matching test
+    gave a false pass because the second site writes it as a ternary with different
+    spacing. Every path that closes a position at a stop must come through here.
+
+    A stop is a market exit: it triggers and crosses the book. Filling it at the trigger
+    books the best possible price, and both sites detected the hit by observing price
+    trade THROUGH the stop — i.e. on direct evidence a worse price was available.
+
+    slip_r is a fraction of R (the entry-to-stop distance). Calibrated at 0.15 from a
+    60d/13-symbol replay: mean overshoot per stop-out, median 0.03, p90 0.39, max 0.65.
+    Not inferred from the candle extreme, which at those call sites is the low of the
+    WHOLE hold rather than of the fill moment and would overstate the slip badly.
+    """
+    try:
+        entry, stop, slip_r = float(entry), float(stop), float(slip_r)
+    except (TypeError, ValueError):
+        return stop
+    slip = abs(entry - stop) * max(0.0, slip_r)
+    return (stop - slip) if is_long else (stop + slip)
+
+
 def round_trip_fee(entry_price, exit_price, qty, fee_rate, exit_fee_rate=None):
     """What the exchange bills for opening AND closing `qty` — charged on NOTIONAL.
 

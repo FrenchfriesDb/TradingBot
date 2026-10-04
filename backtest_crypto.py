@@ -316,9 +316,9 @@ def backtest_symbol(ex, symbol, days, verbose=False):
                              else (hi - open_trade.stop))
                     open_trade.sl_overshoot_r = max(0.0, _past / _r)
                 # Same honest stop fill the live watcher now uses.
-                _slip = STOP_SLIPPAGE_R * _r
-                _sl_fill = ((open_trade.stop - _slip) if open_trade.side == "LONG"
-                            else (open_trade.stop + _slip))
+                _sl_fill = indicators.stop_fill_price(
+                    open_trade.entry, open_trade.stop,
+                    open_trade.side == "LONG", STOP_SLIPPAGE_R)
                 trades.append(open_trade.close(_sl_fill, ts, "SL")); open_trade = None
             elif hit_tgt:
                 trades.append(open_trade.close(open_trade.target, ts, "TP")); open_trade = None
