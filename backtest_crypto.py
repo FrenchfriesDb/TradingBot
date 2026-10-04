@@ -76,6 +76,7 @@ from binance_bot import (
     DISPLACEMENT_BODY_FRAC, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT,
     TAP_DISPLACEMENT_ATR_MULT, atr_gate_for,
     ENABLE_TREND_FOLLOW, MAX_TARGET_ATR_MULT,
+    TARGET_NEAREST_POOL, POOL_MIN_RR, MIN_TRADE_RR,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -448,17 +449,20 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         if risk <= 0:
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
         FUNNEL["C risk > 0"] += 1
+        # Aim AT the nearest pool, not past it — mirrors binance_bot.py:1652 and :2627.
+        _tp_floor = POOL_MIN_RR if TARGET_NEAREST_POOL else MIN_AI_RR
         pool = indicators.find_next_liquidity_target(
-            htf_closed, price + MIN_AI_RR * risk if is_long else price - MIN_AI_RR * risk,
+            htf_closed, price + _tp_floor * risk if is_long else price - _tp_floor * risk,
             "bullish" if is_long else "bearish")
-        target = indicators.structural_take_profit(price, risk, pool, is_long, MIN_AI_RR, MAX_AI_RR)
+        target = indicators.structural_take_profit(
+            price, risk, pool, is_long, MIN_AI_RR, MAX_AI_RR, pool_min_rr=_tp_floor)
         # binance_bot.py:1688 CLAMPS the target to what the hold window can deliver and
         # SKIPS the trade when the honest target no longer pays MIN_AI_RR. This replay
         # had no such gate, so it opened trades live refuses and then scored them dying
         # on the timer — which is exactly the "setups never resolve" symptom.
         target, _rr_reach, _reach_ok = indicators.reachable_target(
             price, price - risk if is_long else price + risk, target,
-            indicators.range_atr(htf_closed), MAX_TARGET_ATR_MULT, MIN_AI_RR)
+            indicators.range_atr(htf_closed), MAX_TARGET_ATR_MULT, MIN_TRADE_RR)
         if not _reach_ok:
             FUNNEL["D reachability veto (live skips)"] += 1
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
@@ -565,6 +569,21 @@ def report_resolution(all_trades):
     print("\n" + "=" * 62)
     print("  WHY SETUPS DON'T RESOLVE — travel vs. target")
     print("=" * 62)
+    # SIGNIFICANCE, printed next to the expectancy it qualifies. This project has
+    # repeatedly read a thin positive sample as an edge: a +0.19R figure from a 4,406-tap
+    # proxy got quoted back as the stock bot's measured edge, and a 64% win rate over 45
+    # trades turned out to be two symbols. An expectancy without its standard error is
+    # not a result, so the tool now refuses to print one.
+    _rs = [t.pnl / (t.risk_per_unit * t.qty) for t in ts if t.qty and t.risk_per_unit]
+    if len(_rs) > 2:
+        _mean = st.mean(_rs)
+        _se = st.stdev(_rs) / (len(_rs) ** 0.5)
+        _t = _mean / _se if _se else 0.0
+        # n needed for |t| >= 2 at the observed mean and spread
+        _need = int((2 * st.stdev(_rs) / abs(_mean)) ** 2) + 1 if _mean else 0
+        print(f"  expectancy   {_mean:+.3f} R  +/- {_se:.3f} (1 s.e.)   t = {_t:+.2f}")
+        print(f"  verdict      {'DISTINGUISHABLE from zero' if abs(_t) >= 2 else 'INDISTINGUISHABLE from zero'}"
+              + (f" — would need n ~ {_need:,} at this mean/spread" if abs(_t) < 2 and _need else ""))
     print(f"  trades measured            {len(ts)}")
     print(f"  target asked (median)      {st.median(tgt):.2f} R"
           f"   [p10 {pct(tgt,.1):.2f}  p90 {pct(tgt,.9):.2f}]")
@@ -703,7 +722,9 @@ def main():
 
     print("=" * 62)
     print(f"  BINANCE_BOT SMC BACKTEST — {args.days}d — {len(symbols)} symbols")
-    print(f"  risk/trade ${MAX_RISK_DOLLARS:.0f} | R:R {MIN_AI_RR}-{MAX_AI_RR} | "
+    print(f"  risk/trade ${MAX_RISK_DOLLARS:.0f} | "
+          f"target {'nearest pool' if TARGET_NEAREST_POOL else 'floored'} "
+          f"{MIN_TRADE_RR}-{MAX_AI_RR}R | "
           f"stale zone {STALE_ZONE_BARS}b | stale trade {STALE_TRADE_HOURS}h")
     print("=" * 62)
 

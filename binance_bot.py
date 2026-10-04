@@ -1308,6 +1308,32 @@ MIN_AI_RR = 2.0   # hard floor — 1:2 minimum. Was 3.0, but ledger data showed 
                   # 2R is actually hittable on 5m setups inside the 6h window.
 MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
 
+# AIM AT THE NEAREST POOL, NOT PAST IT (2026-10-03).
+# The TP search used to be seeded at `entry + MIN_AI_RR*risk`, so find_next_liquidity_target
+# could only ever return a pool BEYOND 2R and any pool nearer than that was invisible.
+# structural_take_profit then floored the target at 2R regardless. Net effect: whenever the
+# first draw on liquidity sat inside 2R — which on 6H crypto is nearly always, 93% of live
+# trades landed on exactly 1:2 — the bot aimed past the very level its entry thesis said
+# price was going to go take.
+#
+# Measured consequence of the old behaviour (60d, 13 symbols, routes A+C): median target
+# 2.23R against a median best travel of 0.59R, and only 15% of setups ever reached 2R.
+#
+# HONEST CAVEAT: the same measurement says this will NOT make the bot profitable. Capture
+# is flat (~0.30R) at every target from 0.5R to 2R, so pulling the target in trades
+# win-rate for reward at roughly par, and under 0.6%/side taker fees the nearer target is
+# slightly WORSE net because a fixed per-trade fee eats a bigger share of a smaller win.
+# It becomes the right trade only once execution cost is near zero. This is shipped
+# because aiming past your own thesis is wrong, not because it is a fix.
+TARGET_NEAREST_POOL = os.getenv("TARGET_NEAREST_POOL", "1") == "1"
+# Noise floor for a pool target: never risk more than the target can pay back. Matches the
+# stock bot's MIN_TP_RR of 1.0.
+POOL_MIN_RR = float(os.getenv("POOL_MIN_RR", "1.0"))
+# The R:R a trade must clear to be TAKEN. Decoupled from MIN_AI_RR, which now only sets the
+# fallback target used when no pool exists at all. Without this split, every nearest-pool
+# target inside 2R would be vetoed by the reachability gate and the change would be a no-op.
+MIN_TRADE_RR = POOL_MIN_RR if TARGET_NEAREST_POOL else MIN_AI_RR
+
 def get_ai_confirmation(symbol, price, daily_trend, bos_dir,
                         fvg_low, fvg_high, sweep_level,
                         sl, risk_amt, pool_tp, df_ltf, df_htf=None,
@@ -1623,7 +1649,9 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
     #    2.0R floor (confirmed live: 93% of trades landed on exactly 1:2 R:R). Searching
     #    from the floor forward finds the nearest REAL pool beyond it instead of giving
     #    up (verified: drops the floor-collapse rate to ~20%).
-    _min_tp_lvl = price + MIN_AI_RR * risk_amt if is_long else price - MIN_AI_RR * risk_amt
+    _tp_floor_rr = POOL_MIN_RR if TARGET_NEAREST_POOL else MIN_AI_RR
+    _min_tp_lvl = (price + _tp_floor_rr * risk_amt if is_long
+                   else price - _tp_floor_rr * risk_amt)
     pool_tp = indicators.find_next_liquidity_target(df_htf, _min_tp_lvl, bias_str)
 
     # 3. Ask NVIDIA AI — pass the TRADE direction (state.bias), not the current BOS
@@ -1674,7 +1702,8 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
         state.reset()
         return
     tp_planned = indicators.structural_take_profit(
-        price, risk_amt, pool_tp, is_long, MIN_AI_RR, MAX_AI_RR)
+        price, risk_amt, pool_tp, is_long, MIN_AI_RR, MAX_AI_RR,
+        pool_min_rr=_tp_floor_rr)
     # ── Target reachability (added 2026-09-04) ───────────────────────────────────
     # structural_take_profit pins TP to a REAL 4H pool, which is right — but says nothing
     # about whether that pool can be reached before STALE_TRADE_HOURS force-closes the
@@ -1686,21 +1715,21 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
     _htf_atr = indicators.range_atr(df_htf)
     _stop_ref = price - risk_amt if is_long else price + risk_amt
     tp_planned, _rr_reach, _reach_ok = indicators.reachable_target(
-        price, _stop_ref, tp_planned, _htf_atr, MAX_TARGET_ATR_MULT, MIN_AI_RR)
+        price, _stop_ref, tp_planned, _htf_atr, MAX_TARGET_ATR_MULT, MIN_TRADE_RR)
     if not _reach_ok:
         print(f"[{base}] 🚫 Reachability gate — nearest structure is "
               f"{abs(tp_planned - price)/price*100:.2f}% away; only "
               f"{MAX_TARGET_ATR_MULT:g}× the HTF ATR ({_htf_atr/price*100:.2f}%) is "
               f"reachable inside {STALE_TRADE_HOURS}h, which pays 1:{_rr_reach:.1f} "
-              f"< 1:{MIN_AI_RR:g}. Skipping.")
+              f"< 1:{MIN_TRADE_RR:g}. Skipping.")
         state.reset()
         return
     reward    = abs(tp_planned - price)
     rr_actual = reward / risk_amt if risk_amt else 0.0
     # Target OFFSET — pull the TP a fraction of ATR inward so we fill BEFORE the
     # herd's orders pile up at the round number / structural ceiling.
-    # Hard cap: offset can never reduce effective R:R below MIN_AI_RR floor.
-    min_reward  = risk_amt * MIN_AI_RR
+    # Hard cap: offset can never reduce effective R:R below the MIN_TRADE_RR floor.
+    min_reward  = risk_amt * MIN_TRADE_RR
     max_offset  = max(0.0, reward - min_reward)
     tp_offset   = min(0.05 * entry_atr, 0.25 * reward, max_offset)
     state.take_profit = (tp_planned - tp_offset if is_long else tp_planned + tp_offset)
@@ -2595,17 +2624,20 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             _risk_s = abs(_fill_s - _sl_s)
             # TP pinned to the nearest 4H liquidity pool (≥MIN_AI_RR, ≤MAX_AI_RR) instead
             # of a flat MIN_AI_RR multiple — targets real structure, not just risk×2.
+            _tp_floor_s = POOL_MIN_RR if TARGET_NEAREST_POOL else MIN_AI_RR
             _pool_s = indicators.find_next_liquidity_target(
-                df_htf, _fill_s + MIN_AI_RR * _risk_s if _is_long_s else _fill_s - MIN_AI_RR * _risk_s,
+                df_htf, (_fill_s + _tp_floor_s * _risk_s if _is_long_s
+                         else _fill_s - _tp_floor_s * _risk_s),
                 "bullish" if _is_long_s else "bearish")
             _tp_s = indicators.structural_take_profit(
-                _fill_s, _risk_s, _pool_s, _is_long_s, MIN_AI_RR, MAX_AI_RR)
+                _fill_s, _risk_s, _pool_s, _is_long_s, MIN_AI_RR, MAX_AI_RR,
+                pool_min_rr=_tp_floor_s)
             # Same reachability clamp as the main path — the sniper arms its TP here and
             # never revisits it, so an unreachable target booked at arm time is locked in
             # for the whole 6h hold. (POL/USD 2026-09-04 was a sniper arm.)
             _tp_s, _rr_s_reach, _reach_ok_s = indicators.reachable_target(
                 _fill_s, _sl_s, _tp_s, indicators.range_atr(df_htf),
-                MAX_TARGET_ATR_MULT, MIN_AI_RR)
+                MAX_TARGET_ATR_MULT, MIN_TRADE_RR)
             if not _reach_ok_s:
                 print(f"[{base}] 🚫 Sniper not armed — target unreachable inside "
                       f"{STALE_TRADE_HOURS}h (best reachable R:R 1:{_rr_s_reach:.1f}).")
@@ -3306,7 +3338,7 @@ def run():
                             # which is exactly why this slipped through unnoticed.
                             _rr_at_fill = (abs(st.sniper_tp - _fill) / _risk_at_fill
                                            if _risk_at_fill > 0 else 0.0)
-                            if _rr_at_fill < MIN_AI_RR:
+                            if _rr_at_fill < MIN_TRADE_RR:
                                 # RESET, don't merely disarm. R:R is a property of the
                                 # SETUP (zone, stop, target) — not of which engine is
                                 # looking at it. Clearing only `sniper_armed` left the zone
@@ -3317,7 +3349,7 @@ def run():
                                 # than brand-new, which is what makes this safe.
                                 print(f"[{_base}] 🚫 Setup rejected — R:R decayed to "
                                       f"1:{_rr_at_fill:.2f} at the fill (${_fill:,.4f} vs armed "
-                                      f"zone), under the 1:{MIN_AI_RR:g} floor. Zone dropped so "
+                                      f"zone), under the 1:{MIN_TRADE_RR:g} floor. Zone dropped so "
                                       f"the 5m cycle cannot re-take it.", flush=True)
                                 st.reset()
                                 continue

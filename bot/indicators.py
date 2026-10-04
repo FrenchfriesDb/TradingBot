@@ -264,16 +264,27 @@ def structural_stop_price(entry, swing, atr_ref, is_long, min_atr_mult, liq_cap_
     return entry - dist if is_long else entry + dist
 
 
-def structural_take_profit(entry, stop_dist, pool, is_long, min_rr, max_rr):
+def structural_take_profit(entry, stop_dist, pool, is_long, min_rr, max_rr,
+                           pool_min_rr=None):
     """Take-profit PRICE pinned to the nearest higher-timeframe liquidity pool / breaker.
 
-    - Pool within [min_rr, max_rr] of risk  → TP sits ON the pool (target real structure).
-    - Pool farther than max_rr              → capped at max_rr (kept reachable intraday).
-    - Pool closer than min_rr (in the noise) or absent → default min_rr target.
-    stop_dist is the positive entry→stop distance."""
+    - Pool within [pool_min_rr, max_rr] of risk → TP sits ON the pool (real structure).
+    - Pool farther than max_rr                  → capped at max_rr (reachable intraday).
+    - Pool nearer than pool_min_rr (noise) or absent → default min_rr target.
+    stop_dist is the positive entry→stop distance.
+
+    `pool_min_rr` is the nearest distance, in R, at which a pool is ACCEPTED as the
+    target. It defaults to min_rr, which is the legacy behaviour and was a real defect:
+    a pool inside min_rr got discarded and the target pushed out to min_rr, so the bot
+    aimed PAST the nearest draw on liquidity — the exact level its entry thesis said
+    price was going to go take. On crypto 6H structure the nearest pool is nearly always
+    inside 2R (93% of live trades landed on exactly 1:2), so the floor was not an edge
+    case, it was the normal path. Pass a smaller pool_min_rr to aim AT the pool.
+    """
+    floor = min_rr if pool_min_rr is None else pool_min_rr
     if pool:
         rr = (pool - entry) / stop_dist if is_long else (entry - pool) / stop_dist
-        if rr >= min_rr:
+        if rr >= floor:
             capped = min(rr, max_rr)
             return entry + capped * stop_dist if is_long else entry - capped * stop_dist
     return entry + min_rr * stop_dist if is_long else entry - min_rr * stop_dist
