@@ -1325,6 +1325,17 @@ MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
 # slightly WORSE net because a fixed per-trade fee eats a bigger share of a smaller win.
 # It becomes the right trade only once execution cost is near zero. This is shipped
 # because aiming past your own thesis is wrong, not because it is a fix.
+# A stop is a MARKET exit: it fills at-or-worse, never at its trigger. The watcher below
+# filled stop-outs at st.stop_loss EXACTLY while detecting the hit by seeing the candle
+# trade THROUGH the stop — booking the best possible price on direct evidence that a worse
+# one was available. Every stop-out in the paper ledger was flattered.
+# Calibrated 2026-10-03, 60d / 13 symbols: the bar overshoots the stop by 0.15 R on average
+# per stop-out (median 0.03, p90 0.39, max 0.65). Charged as a fraction of R rather than
+# inferred from the candle extreme, because candle_low there is the low of the WHOLE hold,
+# not of the fill moment — using it would overstate the slip badly.
+# Worth 0.044 R per trade overall, against a measured gross edge of +0.086 R.
+STOP_SLIPPAGE_R = float(os.getenv("STOP_SLIPPAGE_R", "0.15"))
+
 TARGET_NEAREST_POOL = os.getenv("TARGET_NEAREST_POOL", "1") == "1"
 # Noise floor for a pool target: never risk more than the target can pay back. Matches the
 # stock bot's MIN_TP_RR of 1.0.
@@ -3473,9 +3484,13 @@ def run():
                     if not sl_hit and not tp_hit:
                         continue
 
-                    # Fill at the level that was crossed (not the current last price)
+                    # Fill at the level that was crossed (not the current last price),
+                    # but a STOP pays slippage and a TP does not: a resting limit at the
+                    # target genuinely does fill at its price, while a stop sweeps the
+                    # book. See STOP_SLIPPAGE_R.
                     if sl_hit:
-                        fill = st.stop_loss
+                        _slip = STOP_SLIPPAGE_R * abs(st.entry_price - st.stop_loss)
+                        fill = (st.stop_loss - _slip) if is_long else (st.stop_loss + _slip)
                     else:
                         fill = st.take_profit
                     # A trailed stop is a BREAK-EVEN exit, not a stop-out. Labelling

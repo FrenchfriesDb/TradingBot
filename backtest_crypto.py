@@ -76,7 +76,7 @@ from binance_bot import (
     DISPLACEMENT_BODY_FRAC, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT,
     TAP_DISPLACEMENT_ATR_MULT, atr_gate_for,
     ENABLE_TREND_FOLLOW, MAX_TARGET_ATR_MULT,
-    TARGET_NEAREST_POOL, POOL_MIN_RR, MIN_TRADE_RR,
+    TARGET_NEAREST_POOL, POOL_MIN_RR, MIN_TRADE_RR, STOP_SLIPPAGE_R,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -173,7 +173,8 @@ def fetch_paginated(ex, symbol, timeframe, tf_secs, since_ms, total):
 class Trade:
     __slots__ = ("symbol", "side", "entry", "stop", "target", "qty",
                  "entry_ts", "exit_ts", "exit", "reason", "pnl", "fees",
-                 "partial_qty", "banked", "tp1", "mfe_r", "mae_r", "hrs_to_mfe")
+                 "partial_qty", "banked", "tp1", "mfe_r", "mae_r", "hrs_to_mfe",
+                 "sl_overshoot_r")
 
     def __init__(self, symbol, side, entry, stop, target, qty, entry_ts):
         self.symbol, self.side = symbol, side
@@ -187,6 +188,11 @@ class Trade:
         # wrong direction". Updated only on bars that did NOT hit the stop, so a
         # favourable wick on the stop bar can never inflate it.
         self.mfe_r, self.mae_r, self.hrs_to_mfe = 0.0, 0.0, 0.0
+        # How far PAST the stop the bar actually traded, in R. Both this replay and the
+        # live paper trader (binance_bot.py:3477) fill a stop-out AT the stop price even
+        # though they detect the hit by seeing the candle trade THROUGH it. A stop is a
+        # market exit: it fills at-or-worse. This measures the size of that fiction.
+        self.sl_overshoot_r = 0.0
 
     @property
     def risk_per_unit(self):
@@ -304,7 +310,16 @@ def backtest_symbol(ex, symbol, days, verbose=False):
             if not hit_stop:      # pessimistic: a stop bar contributes no favourable R
                 open_trade.track_excursion(hi, lo, ts)
             if hit_stop:          # pessimistic: stop wins a same-bar tie
-                trades.append(open_trade.close(open_trade.stop, ts, "SL")); open_trade = None
+                _r = open_trade.risk_per_unit
+                if _r:
+                    _past = ((open_trade.stop - lo) if open_trade.side == "LONG"
+                             else (hi - open_trade.stop))
+                    open_trade.sl_overshoot_r = max(0.0, _past / _r)
+                # Same honest stop fill the live watcher now uses.
+                _slip = STOP_SLIPPAGE_R * _r
+                _sl_fill = ((open_trade.stop - _slip) if open_trade.side == "LONG"
+                            else (open_trade.stop + _slip))
+                trades.append(open_trade.close(_sl_fill, ts, "SL")); open_trade = None
             elif hit_tgt:
                 trades.append(open_trade.close(open_trade.target, ts, "TP")); open_trade = None
             elif (ts - open_trade.entry_ts).total_seconds() / 3600 >= STALE_TRADE_HOURS:
@@ -592,6 +607,15 @@ def report_resolution(all_trades):
     print(f"  median hours to that peak  {st.median([t.hrs_to_mfe for t in ts]):.1f}h"
           f"   (timer fires at {STALE_TRADE_HOURS}h)")
     print(f"  median adverse excursion   {st.median([t.mae_r for t in ts]):.2f} R")
+    _sl = [t for t in ts if t.reason == "SL"]
+    if _sl:
+        _ov = sorted(t.sl_overshoot_r for t in _sl)
+        _mean_ov = sum(_ov) / len(_ov)
+        print(f"  stop-outs                  {len(_sl)}")
+        print(f"  traded PAST the stop by    {st.median(_ov):.2f} R median "
+              f"[p90 {_ov[min(len(_ov)-1, int(.9*len(_ov)))]:.2f}  max {_ov[-1]:.2f}]")
+        print(f"  cost of the AT-STOP fill   {_mean_ov * len(_sl) / len(ts):.3f} R per trade "
+              f"if a stop filled at the bar's extreme instead")
     _veto = FUNNEL.get("D reachability veto (live skips)", 0)
     if _veto:
         print(f"  setups live REFUSES        {_veto:,} (target unreachable inside "
