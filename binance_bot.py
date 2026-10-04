@@ -243,8 +243,32 @@ def trade_print(symbol: str, event: str, price: float,
 # NOTE the HTF path: Bybit (the 4H source) returns 403 from this machine — a US geo-block —
 # so connect_htf_exchange() falls back to 6H on Coinbase for ALL symbols. That fallback is
 # what these were validated against; nothing here depends on Bybit coming back.
-DEFAULT_SYMBOLS  = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "XRP/USD", "AVAX/USD", "POL/USD", "ADA/USD",
-                    "HYPE/USD", "INJ/USD", "SEI/USD", "DRIFT/USD", "ASTER/USD"]
+DEFAULT_SYMBOLS  = [
+    # 40 Coinbase USD spot pairs, ranked by real 24h quote volume (floor ~$2.8M/day),
+    # stablecoin pairs excluded, each verified to carry >=60 6H and >=100 5m bars — below
+    # that the replay skips the symbol outright and it would silently contribute nothing.
+    #
+    # WHY 40. At 13 symbols the bot takes 0.63 trades/day, and proving its measured
+    # +0.043R gross edge from zero would need ~2,000 trades = 8.7 YEARS. Trade rate sets
+    # the minimum detectable effect; tripling it is the only lever that shortens that
+    # without changing the hypothesis being tested. It does NOT rescue +0.043R (still
+    # years) — it makes the NEXT hypothesis answerable in months instead of never.
+    #
+    # The original 13 are kept verbatim and first: swapping the population wholesale would
+    # make every crypto measurement taken before 2026-10-04 incomparable to everything after.
+    "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD",
+    "XRP/USD", "AVAX/USD", "POL/USD", "ADA/USD",
+    "HYPE/USD", "INJ/USD", "SEI/USD", "DRIFT/USD",
+    "ASTER/USD",
+    # added 2026-10-04
+    "ZEC/USD", "QNT/USD", "NEAR/USD", "SUI/USD",
+    "PUMP/USD", "ZRO/USD", "TAO/USD", "LINK/USD",
+    "LTC/USD", "AERO/USD", "MON/USD", "FET/USD",
+    "STRK/USD", "HBAR/USD", "ICP/USD", "XLM/USD",
+    "SAND/USD", "ONDO/USD", "WLD/USD", "UNI/USD",
+    "HONEY/USD", "DIMO/USD", "AAVE/USD", "ENA/USD",
+    "BNB/USD", "LIGHTER/USD", "USELESS/USD",
+]
 CRYPTO_STATE_FILE = "crypto_state.json"
 
 # Per-asset minimum 4H ATR to treat a market as "live" enough to trade.
@@ -1359,6 +1383,32 @@ MAX_AI_RR = 15.0  # sanity ceiling — guards against a hallucinated target
 # not of the fill moment — using it would overstate the slip badly.
 # Worth 0.044 R per trade overall, against a measured gross edge of +0.086 R.
 STOP_SLIPPAGE_R = float(os.getenv("STOP_SLIPPAGE_R", "0.15"))
+
+# The SL/TP watcher only starts AFTER the analysis pass, so open positions go unwatched
+# for exactly as long as that pass takes. At 13 symbols that was ~8s. At 40 it is ~25s of
+# fetching alone, and a single AI call can add up to its 25s timeout on top. Without a
+# bound, widening the symbol list silently converts a 5m cadence into a longer one and
+# stretches the blind spot in front of every stop.
+# The stock bot got this when it moved to a 5M loop (ITERATION_BUDGET_FRAC); the crypto
+# bot never had it. Symbols are rotated each cycle so a deferral cannot starve the tail
+# of the list forever, and any symbol HOLDING A POSITION is processed first and is never
+# deferred — management must not be what gets dropped.
+CRYPTO_ITERATION_BUDGET_SEC = float(os.getenv("CRYPTO_ITERATION_BUDGET_SEC", "120"))
+
+
+def iteration_order(symbols, held, cycle):
+    """The order to walk symbols this cycle: open positions first, then a rotating rest.
+
+    Positions lead so that a budget cut can never drop position MANAGEMENT — the thing
+    that must happen is the thing most worth protecting. The remainder rotates by cycle
+    so a budget that always cuts at the same count cannot starve the tail of the list
+    forever; every symbol reaches the front eventually.
+    """
+    held_set = set(held)
+    lead = [s for s in symbols if s in held_set]
+    rest = [s for s in symbols if s not in held_set]
+    shift = (cycle % len(rest)) if rest else 0
+    return lead + rest[shift:] + rest[:shift]
 
 TARGET_NEAREST_POOL = os.getenv("TARGET_NEAREST_POOL", "1") == "1"
 # Noise floor for a pool target: never risk more than the target can pay back. Matches the
@@ -3101,7 +3151,9 @@ def run():
         "Crypto Macro": MACRO_HEADER, "Crypto Ledger": LEDGER_HEADER,
     })
     prices = {}
+    _cycle = 0
     while True:
+        _cycle += 1
         print(f"\n{'─'*60}")
         print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
         print(f"{'─'*60}")
@@ -3116,7 +3168,19 @@ def run():
               f"({RISK_PCT*100:.2f}% of ${_eq_now:,.2f} equity)"
               + (f"  [{PAPER_LEVERAGE}x leverage — affects margin, not risk]"
                  if PAPER_LEVERAGE > 1 else ""))
-        for symbol in symbols:
+        _held = [s for s in symbols if paper.get_position(s)]
+        _order = iteration_order(symbols, _held, _cycle)
+        _t0, _n = time.monotonic(), len(_order)
+        for _i, symbol in enumerate(_order):
+            if (CRYPTO_ITERATION_BUDGET_SEC
+                    and symbol not in set(_held)
+                    and (time.monotonic() - _t0) > CRYPTO_ITERATION_BUDGET_SEC):
+                _left = _order[_i:]
+                print(f"  ⏱️ Iteration budget {CRYPTO_ITERATION_BUDGET_SEC:.0f}s spent "
+                      f"after {_i}/{_n} symbols — deferring {len(_left)} "
+                      f"({', '.join(x.split('/')[0] for x in _left[:6])}"
+                      f"{'…' if len(_left) > 6 else ''}); they lead the next pass.")
+                break
             try:
                 result = process_symbol(exchange, paper, symbol, states[symbol],
                                         BINANCE_CASH_AT_RISK, htf_exchange=htf_exchange)
