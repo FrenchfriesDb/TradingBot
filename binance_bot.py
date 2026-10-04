@@ -342,8 +342,32 @@ def _tf_hours(tf, default=6):
 
 
 _HTF_HOURS             = _tf_hours(HTF_TIMEFRAME)
-MAX_TARGET_ATR_MULT    = float(os.getenv(
-    "MAX_TARGET_ATR_MULT", f"{1.5 * max(1.0, STALE_TRADE_HOURS / _HTF_HOURS):g}"))
+_MAX_TARGET_ATR_MULT_ENV = os.getenv("MAX_TARGET_ATR_MULT")
+MAX_TARGET_ATR_MULT    = float(_MAX_TARGET_ATR_MULT_ENV
+                               or f"{1.5 * max(1.0, STALE_TRADE_HOURS / _HTF_HOURS):g}")
+
+
+def max_target_atr_mult_for(htf_name=None):
+    """The reachability clamp, scaled to the frame the ATR was ACTUALLY measured on.
+
+    MAX_TARGET_ATR_MULT is derived from HTF_TIMEFRAME (6h) at import. But df_htf holds
+    BYBIT_HTF_TIMEFRAME (4h) candles whenever Bybit answers and HTF_TIMEFRAME (6h) when it
+    does not — chosen per symbol, at runtime, by which exchange replied. reachable_target
+    is handed range_atr(df_htf), so the ATR comes from the LIVE frame while the multiple
+    describing it came from a constant that may not. Measuring a 4H ATR and clamping it
+    with a 6H-derived multiple is a silent mis-calibration of the only guard that decides
+    whether a target is reachable at all.
+
+    Dormant on a US connection, where Bybit answers 403 and the fallback keeps everything
+    on 6H — which is also why it would have gone unnoticed until the day it did not.
+
+    An explicit MAX_TARGET_ATR_MULT in the environment still wins: an operator who pins the
+    number means it, whatever frame the data arrived on.
+    """
+    if _MAX_TARGET_ATR_MULT_ENV:
+        return MAX_TARGET_ATR_MULT
+    hours = _tf_hours(htf_name) if htf_name else 0
+    return 1.5 * max(1.0, STALE_TRADE_HOURS / (hours or _HTF_HOURS))
 # How far a swept level may sit from price and still be treated as THIS move's
 # inducement. Volatility-relative, with the percentage as a floor so a dead ATR read
 # tightens the gate rather than opening it. 2.5x/2% refuses the 2026-09-17 entries
@@ -1726,7 +1750,8 @@ def execute_confirmed_entry(symbol, base, state, paper, is_long, price, risk_amt
     _htf_atr = indicators.range_atr(df_htf)
     _stop_ref = price - risk_amt if is_long else price + risk_amt
     tp_planned, _rr_reach, _reach_ok = indicators.reachable_target(
-        price, _stop_ref, tp_planned, _htf_atr, MAX_TARGET_ATR_MULT, MIN_TRADE_RR)
+        price, _stop_ref, tp_planned, _htf_atr,
+        max_target_atr_mult_for(htf_name), MIN_TRADE_RR)
     if not _reach_ok:
         print(f"[{base}] 🚫 Reachability gate — nearest structure is "
               f"{abs(tp_planned - price)/price*100:.2f}% away; only "
@@ -1974,7 +1999,10 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
 
     daily_trend = indicators.get_daily_trend(df_daily)
 
-    # Dual HTF BOS: 4H = full conviction, 1H = faster signal at half size
+    # Dual HTF BOS: the HTF frame = full conviction, 1H = faster signal at half size.
+    # The HTF frame is 4h from Bybit or 6h from the main exchange — htf_name says which,
+    # and bos_tf below reports it. This comment used to claim "4H" unconditionally, which
+    # sent the operator to a 4H chart to check a BOS the bot had measured on 6H.
     is_bos_htf, direction_htf, _ = indicators.detect_displacement_bos(df_htf,    lookback=15)
     is_bos_1h, direction_1h, _ = indicators.detect_displacement_bos(df_htf_1h, lookback=15)
     is_bos    = is_bos_htf or is_bos_1h
@@ -2019,12 +2047,12 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
     # 5m chart has no visible 3-candle structure and reads as invented — see
     # tests/test_zone_source_timeframe.py.
     fvg_bull_tf    = indicators.zone_source_tf(is_fvg_bull_htf, is_fvg_bull_ltf,
-                                               HTF_TIMEFRAME, LTF_TIMEFRAME)
+                                               htf_name, LTF_TIMEFRAME)
     is_fvg_bear    = is_fvg_bear_htf or is_fvg_bear_ltf
     fvg_bear_bot   = fvg_bear_bot_htf if is_fvg_bear_htf else fvg_bear_bot_ltf
     fvg_bear_top   = fvg_bear_top_htf if is_fvg_bear_htf else fvg_bear_top_ltf
     fvg_bear_tf    = indicators.zone_source_tf(is_fvg_bear_htf, is_fvg_bear_ltf,
-                                               HTF_TIMEFRAME, LTF_TIMEFRAME)
+                                               htf_name, LTF_TIMEFRAME)
 
     # Equal-lows / equal-highs liquidity pools — the wick shelves where stops cluster.
     # LTF (5m, ~10h back to match the live chart); HTF = macro pools the sweep logic hunts.
@@ -2648,7 +2676,7 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             # for the whole 6h hold. (POL/USD 2026-09-04 was a sniper arm.)
             _tp_s, _rr_s_reach, _reach_ok_s = indicators.reachable_target(
                 _fill_s, _sl_s, _tp_s, indicators.range_atr(df_htf),
-                MAX_TARGET_ATR_MULT, MIN_TRADE_RR)
+                max_target_atr_mult_for(htf_name), MIN_TRADE_RR)
             if not _reach_ok_s:
                 print(f"[{base}] 🚫 Sniper not armed — target unreachable inside "
                       f"{STALE_TRADE_HOURS}h (best reachable R:R 1:{_rr_s_reach:.1f}).")

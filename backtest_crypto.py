@@ -77,6 +77,7 @@ from binance_bot import (
     TAP_DISPLACEMENT_ATR_MULT, atr_gate_for,
     ENABLE_TREND_FOLLOW, MAX_TARGET_ATR_MULT,
     TARGET_NEAREST_POOL, POOL_MIN_RR, MIN_TRADE_RR, STOP_SLIPPAGE_R,
+    max_target_atr_mult_for,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -477,7 +478,8 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         # on the timer — which is exactly the "setups never resolve" symptom.
         target, _rr_reach, _reach_ok = indicators.reachable_target(
             price, price - risk if is_long else price + risk, target,
-            indicators.range_atr(htf_closed), MAX_TARGET_ATR_MULT, MIN_TRADE_RR)
+            indicators.range_atr(htf_closed), max_target_atr_mult_for(HTF_TF),
+            MIN_TRADE_RR)
         if not _reach_ok:
             FUNNEL["D reachability veto (live skips)"] += 1
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue

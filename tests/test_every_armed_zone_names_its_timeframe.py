@@ -108,15 +108,26 @@ def test_no_arming_branch_hardcodes_a_timeframe_string():
             f"line {ln} is not a plain name: {rhs!r}"
 
 
+#: Acceptable sources for the HTF half of a zone label. `htf_name` is the frame that
+#: ACTUALLY arrived — Bybit's 4h or the main exchange's 6h, decided per cycle by which
+#: one answered — and is strictly better than the HTF_TIMEFRAME constant, which names 6h
+#: even when the candles are 4h. The constant stays allowed because paths without a live
+#: htf_name in scope may legitimately fall back to it. (Widened 2026-10-04; the invariant
+#: this test protects is "the label names both frames and is never blank", not "the label
+#: is built from one specific identifier".)
+_HTF_LABEL_SOURCES = ("htf_name", "HTF_TIMEFRAME")
+
+
 def test_the_derived_timeframe_variables_come_from_the_constants():
     """fvg_bull_tf / fvg_bear_tf are computed, so follow them one hop to their source."""
     derived = {SRC.splitlines()[ln - 1].split("=", 1)[1].split("#")[0].strip()
                for ln in _fvg_tf_lines()}
-    for name in derived - {"HTF_TIMEFRAME", "LTF_TIMEFRAME"}:
+    for name in derived - {"HTF_TIMEFRAME", "LTF_TIMEFRAME", "htf_name"}:
         m = re.search(rf"{name}\s*=\s*indicators\.zone_source_tf\((.*?)\)", SRC, re.S)
         assert m, f"{name} is assigned to fvg_tf but is not derived from zone_source_tf"
-        assert "HTF_TIMEFRAME" in m.group(1) and "LTF_TIMEFRAME" in m.group(1), \
-            f"{name} does not name both frames: {m.group(1)!r}"
+        args = m.group(1)
+        assert any(src in args for src in _HTF_LABEL_SOURCES) and "LTF_TIMEFRAME" in args, \
+            f"{name} does not name both frames: {args!r}"
 
 
 def test_reset_clears_the_timeframe():
