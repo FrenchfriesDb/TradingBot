@@ -225,21 +225,22 @@ def run_backtest():
     print("🤖 DEBBIE-LA INSTITUTIONAL SMC STRATEGY - BACKTEST")
     print("=" * 80)
     print(f"📊 Backtest Period: {start_date.date()} to {end_date.date()}")
-    print(f"📈 Symbol: SPY")
-    print(f"⏱️  HTF: 4H | LTF: 15m")
-    print(f"💰 Risk per trade: 3%")
+    _bt_params = {
+        "symbols": ["SPY"],
+        "cash_at_risk": 0.03,
+        "timeframe_htf": "4 hours",
+        "timeframe_ltf": "15 minutes",
+    }
+    print(f"📈 Symbol: {', '.join(_bt_params['symbols'])}")
+    for _line in _config_banner(_bt_params, show_interval=False):
+        print(_line)
     print("=" * 80)
     
     DebbieLaSMC.backtest(
         YahooDataBacktesting,
         start_date,
         end_date,
-        parameters={
-            "symbols": ["SPY"],
-            "cash_at_risk": 0.03,
-            "timeframe_htf": "4 hours",
-            "timeframe_ltf": "15 minutes"
-        }
+        parameters=_bt_params
     )
 
 def run_live_trading():
@@ -263,9 +264,21 @@ def run_live_trading():
     # equity; say so if something else was meant.
     watchlist = ["AAPL", "QQQ", "SPY", "NVDA", "TSLA", "GOOGL", "META", "MSFT",
                  "AMZN", "AMD", "PLTR", "NFLX", "BE", "AMG"]
+    # DERIVED, never hand-written. This banner was three hardcoded literals and all three
+    # were wrong: it said "Execution Interval: 15 minutes" after the loop moved to 5M
+    # (f838799), "3% total" while the live strategy is constructed with 0.02, and "~0.5%
+    # per symbol" against 0.02/14 = 0.14%. A banner that states the config is the first
+    # thing anyone reads when asking "is the change live?" — and this one would have
+    # answered no on the very session it was built to verify.
+    _params = {
+        "symbols": watchlist,
+        "cash_at_risk": 0.02,
+        "timeframe_htf": "4 hours",
+        "timeframe_ltf": "15 minutes",
+    }
     print(f"📈 Watchlist: {', '.join(watchlist)}")
-    print(f"⏱️  HTF: 4H | LTF: 15m | Execution Interval: 15 minutes")
-    print(f"💰 Risk per trade: 3% total (~0.5% per symbol)")
+    for _line in _config_banner(_params):
+        print(_line)
     print("=" * 80)
 
     ALPACA_CREDS = {
@@ -275,15 +288,8 @@ def run_live_trading():
     }
     broker = Alpaca(ALPACA_CREDS)
 
-    strategy = DebbieLaSMC(
-        broker=broker,
-        parameters={
-            "symbols": watchlist,
-            "cash_at_risk": 0.02,
-            "timeframe_htf": "4 hours",
-            "timeframe_ltf": "15 minutes"
-        }
-    )
+    # Built from the SAME dict the banner printed, so the two cannot drift apart again.
+    strategy = DebbieLaSMC(broker=broker, parameters=_params)
     
     # Create trader
     trader = Trader()
@@ -293,6 +299,30 @@ def run_live_trading():
     quiet_logging()   # re-apply now that Lumibot has configured its log handlers
     trader.run_all()
 
+def _config_banner(params, *, show_interval=True):
+    """The config lines for a startup banner, DERIVED from the params actually used.
+
+    THE SINGLE PRODUCER. Three separate banners hand-wrote these numbers and the live-stock
+    one was wrong on all three counts: "Execution Interval: 15 minutes" after the loop moved
+    to 5M (f838799), "3% total" against a constructed 0.02, and "~0.5% per symbol" against
+    0.02/14 = 0.14%. A banner is the first thing read when asking "did the change go live?",
+    and a Monday review had already been scheduled to confirm the 5M cadence FROM THIS LOG.
+    It would have answered "15 minutes" on the very session built to verify it.
+
+    The other two banners were each internally consistent, which is exactly why hand-written
+    ones are dangerous: they are right until the day someone changes the config and not the
+    string, and nothing fails when that happens.
+    """
+    from bot.strategy import LOOP_INTERVAL, MAX_STOCK_RISK_DOLLARS
+    n = max(1, len(params.get("symbols") or []))
+    risk = params.get("cash_at_risk", 0.0)
+    lines = [f"⏱️  HTF: {params.get('timeframe_htf')} | LTF: {params.get('timeframe_ltf')}"
+             + (f" | Execution Interval: {LOOP_INTERVAL}" if show_interval else "")]
+    lines.append(f"💰 Risk: {risk*100:.3g}% total across {n} symbol{'s' if n != 1 else ''} "
+                 f"(~{risk/n*100:.2f}% each), hard cap ${MAX_STOCK_RISK_DOLLARS:,.0f}/trade")
+    return lines
+
+
 def run_crypto_live():
     """Run the Debbie-La strategy on Alpaca crypto (BTC, ETH, SOL, etc.) 24/7."""
     crypto_watchlist = ["BTC", "ETH", "SOL", "LINK", "LTC", "BCH"]
@@ -300,8 +330,15 @@ def run_crypto_live():
     print("🟡 DEBBIE-LA CRYPTO — ALPACA PAPER TRADING (24/7)")
     print("=" * 80)
     print(f"🔗 Connected to: {BASE_URL}")
+    _cx_params = {
+        "symbols": crypto_watchlist,
+        "cash_at_risk": 0.02,
+        "timeframe_htf": "4 hours",
+        "timeframe_ltf": "15 minutes",
+    }
     print(f"₿  Watchlist: {', '.join(crypto_watchlist)}")
-    print(f"⏱️  HTF: 4H | LTF: 15m | Risk: 2% total (~0.33% per symbol)")
+    for _line in _config_banner(_cx_params):
+        print(_line)
     print("=" * 80)
 
     ALPACA_CREDS = {
@@ -311,15 +348,7 @@ def run_crypto_live():
     }
     broker = Alpaca(ALPACA_CREDS)
 
-    strategy = DebbieLaCrypto(
-        broker=broker,
-        parameters={
-            "symbols": crypto_watchlist,
-            "cash_at_risk": 0.02,
-            "timeframe_htf": "4 hours",
-            "timeframe_ltf": "15 minutes"
-        }
-    )
+    strategy = DebbieLaCrypto(broker=broker, parameters=_cx_params)
 
     trader = Trader()
     trader.add_strategy(strategy)
