@@ -255,6 +255,34 @@ def instrument_funnel(S):
             return _w
         setattr(_I, _name, _mk(_name, _f))
 
+    # DATA COVERAGE. Two runs of an IDENTICAL config (same window, same symbols, same
+    # threshold) produced 39 trades and 28 trades. AMD, NVDA and TSLA reproduced exactly;
+    # GOOGL went from 8 trades to 1. The simulation is deterministic — the DATA is not.
+    # IEX is a single venue carrying ~2-3% of consolidated volume, and when a symbol's
+    # bars arrive short nothing says so: the run just reports a different answer with the
+    # same confident formatting. That is how a threshold sweep turns into noise.
+    # Same failure as backtest_crypto's short-page pagination bug: silent partial history.
+    COVERAGE = defaultdict(lambda: {"calls": 0, "bars": 0, "empty": 0, "short": 0})
+    _orig_hist = S.DebbieLaSMC.get_historical_prices
+
+    def _counted_hist(self, asset, length, timestep="minute", **kw):
+        out = _orig_hist(self, asset, length, timestep, **kw)
+        try:
+            key = f"{getattr(asset, 'symbol', asset)}:{timestep}"
+            c = COVERAGE[key]
+            c["calls"] += 1
+            n = 0 if out is None or getattr(out, "df", None) is None else len(out.df)
+            c["bars"] += n
+            if n == 0:
+                c["empty"] += 1
+            elif n < length:
+                c["short"] += 1
+        except Exception:
+            pass          # instrumentation must never break the run it measures
+        return out
+
+    S.DebbieLaSMC.get_historical_prices = _counted_hist
+
     orig = S.DebbieLaSMC._process_symbol
 
     def wrapped(self, symbol):
@@ -333,7 +361,19 @@ def report(trades, start, end, symbols):
         peak = max(peak, equity)
         max_dd = min(max_dd, equity - peak)
 
-    print(f"  RESULTS — {len(trades)} trades   {start:%Y-%m-%d} → {end:%Y-%m-%d}")
+    _cov = [(k, v) for k, v in sorted(COVERAGE.items()) if v["calls"]]
+    if _cov:
+        _bad = [(k, v) for k, v in _cov if v["empty"] or v["short"]]
+        print("\n  DATA COVERAGE — a run whose bars arrived short is not comparable")
+        print(f"    {'symbol:tf':<18} {'calls':>7} {'avg bars':>9} {'empty':>6} {'short':>6}")
+        for k, v in _cov:
+            flag = "  <-- INCOMPLETE" if (v["empty"] or v["short"]) else ""
+            print(f"    {k:<18} {v['calls']:>7,} {v['bars']/v['calls']:>9.0f} "
+                  f"{v['empty']:>6,} {v['short']:>6,}{flag}")
+        if _bad:
+            print(f"    {len(_bad)} of {len(_cov)} series arrived incomplete — treat any "
+                  f"comparison against another run as UNSAFE until this is clean.")
+    print(f"\n  RESULTS — {len(trades)} trades   {start:%Y-%m-%d} → {end:%Y-%m-%d}")
     print("=" * 66)
     print(f"  net P&L         {sum(pnls):+,.2f}")
     print(f"  expectancy      {sum(pnls)/len(pnls):+,.2f} per trade   <-- the number that matters")
@@ -371,6 +411,21 @@ def report(trades, start, end, symbols):
         print(f"    avg win   {sum(w)/len(w):>+6.2f}R" if w else "    avg win   n/a")
         print(f"    avg loss  {sum(l)/len(l):>+6.2f}R" if l else "    avg loss  n/a")
         print(f"    expectancy{sum(rs)/len(rs):>+6.2f}R")
+        # SIGNIFICANCE. An expectancy without its standard error is not a result, and this
+        # project has repeatedly read thin samples as edges: a +0.19R figure from a proxy
+        # population came back quoted as this bot's measured edge, and a 64% win rate over
+        # 45 trades turned out to be two symbols. Added to backtest_crypto first; a
+        # displacement-threshold sweep then compared +0.31R (n=39) against +0.08R (n=30)
+        # with no way to say whether the gap was real.
+        if len(rs) > 2:
+            import statistics as _st
+            _m = sum(rs) / len(rs)
+            _se = _st.stdev(rs) / (len(rs) ** 0.5)
+            _t = _m / _se if _se else 0.0
+            _need = int((2 * _st.stdev(rs) / abs(_m)) ** 2) + 1 if _m else 0
+            print(f"    s.e.      {_se:>6.3f}R  (sd {_st.stdev(rs):.2f})   t = {_t:+.2f}")
+            print(f"    verdict   {'DISTINGUISHABLE from zero' if abs(_t) >= 2 else 'INDISTINGUISHABLE from zero'}"
+                  + (f" — needs n ~ {_need:,}" if abs(_t) < 2 and _need else ""))
         if w and l:
             sym = abs(sum(w)/len(w)) / abs(sum(l)/len(l))
             # The first version printed "wins really are smaller" for BOTH tails, so a
