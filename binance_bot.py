@@ -413,6 +413,21 @@ OVERHEAD_MIN_ROOM_ATR  = 2.0   # need ≥2× 5m ATR of clear air to the opposing
 #   2. BOS displacement retest  (a real momentum break of structure, then retest)
 # The two low(er)-conviction engines below are GATED OFF — they were the source of the
 # "dip-buy in consolidation that bleeds to the 6h timer" trades:
+# AMD's third leg. A sweep is MANIPULATION; it is not a setup on its own. The model is
+# accumulation -> manipulation -> DISTRIBUTION, and the distribution leg — a real displacement
+# out of the sweep — is what says the stop-run resolved into a move instead of just being a
+# wick. Both AMD branches armed on manipulation alone: sweep + daily trend + ATR + depth +
+# "a zone exists", then straight to waiting for a pullback. The BOS route has always required
+# detect_displacement_bos; the AMD route required nothing equivalent.
+#
+# Operator, on an AERO long armed from a 6H high-sweep: "if it was an AMD, it needs a strong
+# breakout". Correct, and the code did not ask for one.
+#
+# Checked on the HTF frame the sweep was found in, at the FORMATION multiple (1.8x), not the
+# tap multiple — this is about whether the move happened at all, which is a different and
+# stronger question than whether the retest candle is decisive.
+AMD_REQUIRE_DISPLACEMENT = os.getenv("AMD_REQUIRE_DISPLACEMENT", "1") == "1"
+
 ENABLE_TREND_FOLLOW   = False  # "buy the discount in a clear daily trend" fallback (no sweep/BOS)
 ENABLE_WEDGE_BREAKOUT = False  # falling-wedge breakout — a generic pattern, not a sweep or BOS
 # Breakout chase: enter at MARKET when price ran away from a zone without tapping it.
@@ -1352,6 +1367,36 @@ def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, 
 # AI model resolution lives in bot/ai_model.py so BOTH bots share one definition —
 # the hardcoded `meta/llama-3.3-70b-instruct` was duplicated here and in bot/strategy.py,
 # and NVIDIA decommissioned it under both. See that module for why probing beats listing.
+def amd_distribution_confirmed(df_htf_closed, is_long, base=""):
+    """Did the sweep actually resolve into a move? AMD's distribution leg.
+
+    ONE producer for both AMD branches — the low-sweep/SHORT and high-sweep/LONG paths are
+    mirror images and have already drifted from each other once in this file's history.
+
+    Fails CLOSED on unreadable data: an unverifiable breakout must not become a free pass,
+    which is the same rule the tap-momentum check follows.
+    """
+    if not AMD_REQUIRE_DISPLACEMENT:
+        return True, "displacement gate off"
+    try:
+        rng = df_htf_closed["high"] - df_htf_closed["low"]
+        atr = float(rng.rolling(14).mean().iloc[-1])
+        px  = float(df_htf_closed["close"].iloc[-1])
+        if not atr or atr != atr:
+            return False, "ATR unreadable"
+        ok = indicators.has_displacement(
+            df_htf_closed.tail(3)[["open", "high", "low", "close"]].values.tolist(),
+            is_long,
+            min_body_frac=DISPLACEMENT_BODY_FRAC,
+            min_body_abs=indicators.displacement_min_body(
+                atr, px, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT))
+        return (ok, "" if ok else
+                f"no distribution leg — needs a body >={DISPLACEMENT_BODY_FRAC:.0%} of range "
+                f"AND >={DISPLACEMENT_ATR_MULT}x {HTF_TIMEFRAME.upper()}-ATR in the last 3 bars")
+    except Exception as e:
+        return False, f"distribution check failed ({type(e).__name__})"
+
+
 def resolve_ai_model(timeout=20):
     from bot import ai_model as _ai
     return _ai.resolve(NVIDIA_API_KEY, timeout=timeout)
@@ -2344,7 +2389,13 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             if sweep_depth < 0.003:
                 print(f"[{base}] AMD low-sweep too shallow ({sweep_depth:.2%} < 0.3%) — trying generic setups")
             else:
-                found, sup_lo, sup_hi, sup_type = indicators.find_supply_zone(df_htf_closed, price)
+                _amd_ok, _amd_why = amd_distribution_confirmed(df_htf_closed, False, base)
+                if not _amd_ok:
+                    print(f"[{base}] 🚫 AMD low-sweep REFUSED — {_amd_why}. A sweep is "
+                          f"manipulation, not a setup.")
+                    found = False
+                else:
+                    found, sup_lo, sup_hi, sup_type = indicators.find_supply_zone(df_htf_closed, price)
                 if found:
                     pool_note = ""
                     if eql_h_found and eql_h_level and abs(sweep_wick_htf - eql_h_level) / eql_h_level <= 0.005:
@@ -2367,7 +2418,13 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
             if sweep_depth < 0.003:
                 print(f"[{base}] AMD high-sweep too shallow ({sweep_depth:.2%} < 0.3%) — trying generic setups")
             else:
-                found, dem_lo, dem_hi, dem_type = indicators.find_demand_zone(df_htf_closed, price)
+                _amd_ok, _amd_why = amd_distribution_confirmed(df_htf_closed, True, base)
+                if not _amd_ok:
+                    print(f"[{base}] 🚫 AMD high-sweep REFUSED — {_amd_why}. A sweep is "
+                          f"manipulation, not a setup.")
+                    found = False
+                else:
+                    found, dem_lo, dem_hi, dem_type = indicators.find_demand_zone(df_htf_closed, price)
                 if found:
                     pool_note = ""
                     if eqh_h_found and eqh_h_level and abs(sweep_high_wick_htf - eqh_h_level) / eqh_h_level <= 0.005:
