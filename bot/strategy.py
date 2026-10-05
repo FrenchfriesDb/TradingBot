@@ -2091,9 +2091,30 @@ class DebbieLaSMC(Strategy):
                 #
                 # Body >= DISPLACEMENT_BODY_FRAC of range AND >= TAP_DISPLACEMENT_ATR_MULT
                 # x ATR of this timeframe, in the trade direction, within the last 3 bars.
-                # The ATR multiple is the TAP one (1.0x), not the formation one (1.8x) --
-                # measured, see the constant. This gate is what makes the setup profitable
-                # at all: without it the same taps run -0.12R.
+                # The ATR multiple is the TAP one (1.0x), not the formation one (1.8x).
+                #
+                # CORRECTION 2026-10-05. This used to claim "without it the same taps run
+                # -0.12R", and that number is wrong — it predates the 1R-target change and
+                # was measured on a different window. A 3x-repeated sweep over
+                # 2026-08-05..10-04, 8 symbols, with data-coverage checks clean on all 15
+                # runs, measures the opposite:
+                #
+                #     mult   trades   expectancy      t
+                #     0.00     50       +0.273     +2.28
+                #     0.50     50       +0.270     +2.31
+                #     0.75     43       +0.260     +1.88
+                #     1.00     32       +0.073     +0.40   <-- this setting
+                #     1.25     23       +0.093     +0.45
+                #
+                # 1.0x costs ~18 trades AND ~0.2R of expectancy against 0.5x. The cliff
+                # sits between 0.75 and 1.0. Run-to-run spread on an identical config is
+                # 4-10% of trade count, far smaller than that gap.
+                #
+                # NOT CHANGED YET, deliberately: this is one 60-day window on IEX data, and
+                # the three repeats are repeated measurements of the SAME period, not
+                # independent samples — so t~2.3 describes ~50 trades of one window, not a
+                # general edge. Changing it on the day the 5M cadence gets its first clean
+                # live session would confound both. Revisit after.
                 try:
                     _ltf_atr  = indicators.range_atr(ltf["df"])
                     _ltf_px   = float(ltf["df"]["close"].iloc[-1])
