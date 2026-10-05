@@ -212,6 +212,23 @@ def _equity_series(account, window_secs=86400):
     }
 
 
+def _render_page():
+    """HTML with the symbol lists filled in FROM THE BOT, so they cannot drift again.
+
+    A plain .replace, not .format: the page is full of JS braces and format() would choke
+    on every one of them.
+    """
+    import json as _json
+    try:
+        from binance_bot import DEFAULT_SYMBOLS as _SYMS
+    except Exception:
+        _SYMS = ["BTC/USD", "ETH/USD", "SOL/USD"]      # degrade, never 500
+    pairs = {s: s.replace("/", "-") for s in _SYMS}    # Coinbase product id
+    return (HTML
+            .replace("__PAIRS__", _json.dumps(pairs))
+            .replace("__SMC_SYMBOLS__", _json.dumps(list(_SYMS))))
+
+
 # ── HTML page ─────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -285,21 +302,17 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 // Maps internal symbol name → Coinbase product id
-const PAIRS = {
-  'BTC/USD':'BTC-USD','ETH/USD':'ETH-USD','SOL/USD':'SOL-USD',
-  'DOGE/USD':'DOGE-USD','XRP/USD':'XRP-USD','AVAX/USD':'AVAX-USD',
-  'POL/USD':'POL-USD','ADA/USD':'ADA-USD',
-  'LINK/USD':'LINK-USD','LTC/USD':'LTC-USD',
-  'HYPE/USD':'HYPE-USD','INJ/USD':'INJ-USD','SEI/USD':'SEI-USD',
-  'DRIFT/USD':'DRIFT-USD','ASTER/USD':'ASTER-USD',
-};
+const PAIRS = __PAIRS__;
 const STOCK_SYMS = ['SPY','QQQ','AAPL','NVDA','TSLA','GOOGL','META','MSFT'];
 const ALL_SYMS = {
   test:  ['BTC/USD','ETH/USD','SOL/USD','DOGE/USD','XRP/USD','AVAX/USD','POL/USD','ADA/USD'],
-  // smc mirrors binance_bot.py DEFAULT_SYMBOLS (13 as of 2026-08-20). test_bot still
-  // trades only the 8 above — do not add the new coins there until test_bot.py:75 does.
-  smc:   ['BTC/USD','ETH/USD','SOL/USD','DOGE/USD','XRP/USD','AVAX/USD','POL/USD','ADA/USD',
-          'HYPE/USD','INJ/USD','SEI/USD','DRIFT/USD','ASTER/USD'],
+  // smc and PAIRS are SUBSTITUTED from binance_bot.DEFAULT_SYMBOLS at serve time — see
+  // _render_page. They used to be hardcoded here, and when the bot widened 13 -> 40 the
+  // chart kept the old 13: positions in AERO and TAO existed, traded and moved the
+  // balance, and simply could not be selected or drawn. A dashboard that cannot show a
+  // live position is worse than no dashboard, because it reads as "no position".
+  // test_bot genuinely trades only the 8 above, so that list stays literal.
+  smc:   __SMC_SYMBOLS__,
   strat: STOCK_SYMS,
 };
 
@@ -1024,7 +1037,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(404); self.end_headers()
             return
         if path == "/":
-            body = HTML.encode()
+            body = _render_page().encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", len(body))
