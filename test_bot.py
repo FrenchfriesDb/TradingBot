@@ -414,6 +414,76 @@ def _restore_daily_budget(paper):
         print(f"[STATE] daily-budget restore skipped: {e}")
 
 
+def restore_open_positions(paper, sl_levels, tp_levels, entry_times, stats):
+    """Rehydrate OPEN POSITIONS, balance and stats from test_state.json.
+
+    THE BUG THIS FIXES. save_test_state has always written a complete position record —
+    qty, side, entry_price, stop_loss, take_profit, entry_time — and NOTHING ever read it
+    back. _restore_daily_budget restored exactly two fields, daily_risked and daily_date.
+    So every restart silently abandoned any open trade:
+
+        [ETH] SWEEP SHORT @ $2,688.54  SL=$2,697.06  TP=$2,650.00  qty=1.859745
+        [CRYPTO] Cash: $0.00  |  Equity: $5,009.39  |  ETH=S1.8597
+        ===== 1H/1M SWEEP-REVERSAL TEST BOT =====        <- restart
+        [STATE] Resumed today's risk budget used: $15.84
+
+    After that line the ETH short did not exist. No stop, no target, no exit, no row in
+    the ledger — the trade simply evaporated, and the balance reset to the $5,000 start
+    while the dashboard went on rendering the position from the last state it had read.
+    Worst case is not a lost paper trade: it is a REAL position left with no stop while
+    the operator believes it is protected.
+
+    Fail-soft, and deliberately conservative: a position is only restored when it carries
+    both a qty and an entry price. A half-written record is skipped loudly rather than
+    resumed with a missing stop.
+    """
+    import json
+    try:
+        with open(TEST_STATE_FILE) as f:
+            saved = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print(f"[STATE] position restore skipped: {e}")
+        return
+
+    try:
+        bal = saved.get("balance")
+        if isinstance(bal, (int, float)) and bal > 0:
+            paper.balance = float(bal)
+        st = saved.get("stats") or {}
+        for k in ("trades", "wins", "losses", "gross_win", "gross_loss"):
+            if k in st and k in stats:
+                stats[k] = st[k]
+
+        restored = 0
+        for sym, pos in (saved.get("positions") or {}).items():
+            qty   = pos.get("qty")
+            entry = pos.get("entry_price")
+            if not qty or not entry:
+                print(f"[STATE] ⚠️ {sym}: incomplete saved position, NOT resumed — "
+                      f"check for an untracked position on the exchange.")
+                continue
+            paper.positions[sym]    = float(qty)
+            paper.entry_prices[sym] = float(entry)
+            if pos.get("stop_loss") is not None:
+                sl_levels[sym] = float(pos["stop_loss"])
+            if pos.get("take_profit") is not None:
+                tp_levels[sym] = float(pos["take_profit"])
+            if pos.get("entry_time"):
+                try:
+                    entry_times[sym] = datetime.fromisoformat(pos["entry_time"])
+                except Exception:
+                    pass
+            restored += 1
+            print(f"[STATE] ↩️ Resumed {sym} {pos.get('side')} qty={qty} @ ${float(entry):,.4f} "
+                  f"SL=${sl_levels.get(sym) or 0:,.4f} TP=${tp_levels.get(sym) or 0:,.4f}")
+        if restored:
+            print(f"[STATE] {restored} open position(s) resumed — SL/TP watching continues.")
+    except Exception as e:
+        print(f"[STATE] position restore failed: {e}")
+
+
 def save_test_state(paper, sl_levels, tp_levels, prices, pools, trade_states, stats=None, entry_times=None):
     import json
     entry_times = entry_times or {}
@@ -714,6 +784,14 @@ def run_crypto_sweep():
     entry_times  = {s: None for s in CRYPTO_SYMBOLS}   # so the chart can anchor the entry zone box precisely
     last_watch_ms = {s: None for s in CRYPTO_SYMBOLS}  # epoch ms of the last 1m candle already SL/TP-checked
     stats        = new_stats()   # combined across all symbols
+    # AFTER the dicts exist, because the restore writes into them. Without this an open
+    # trade is abandoned on every restart — see restore_open_positions.
+    restore_open_positions(paper, sl_levels, tp_levels, entry_times, stats)
+    # A resumed position must be marked IN_TRADE or the pool recalc treats the symbol as
+    # idle and can arm a second entry on top of the one already held.
+    for _s, _q in paper.positions.items():
+        if abs(_q) > 1e-9:
+            trade_states[_s] = "IN_TRADE"
     last_stats_print = 0.0
 
     def try_close_position(symbol, base, live_price, hi, lo):
