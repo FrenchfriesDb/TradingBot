@@ -155,6 +155,13 @@ MIN_STOP_ATR_MULT = float(os.getenv("MIN_STOP_ATR_MULT", "1.5"))
 # before the next was drawn, while price fell 9 points. The operator called it from the
 # journal before any measurement did.
 AMD_REQUIRE_DISPLACEMENT = os.getenv("AMD_REQUIRE_DISPLACEMENT", "1") == "1"
+# WHERE in the zone the fill sits. price_in_entry_zone answers "has price reached the
+# zone" and returns True anywhere between lo and hi; nothing asked whether the fill was on
+# the favourable side. A demand zone is bought at its LOW. PLTR 2026-10-05 filled 189.50 in
+# a 187.62-190.50 demand zone — 65% up it, paying a premium for a discount setup — and the
+# inflated distance from the structural invalidation then inflated the stop and, through the
+# R multiple, the target too. 0.5 = the better half. Env-overridable so it can be swept.
+ZONE_ENTRY_MAX_FRAC = float(os.getenv("ZONE_ENTRY_MAX_FRAC", "0.5"))
 # TARGET BAND — moved 2:1 -> 1:1 on 2026-10-01, on measurement.
 #
 # These were 2.0/4.0 on the stated reasoning that "1:2 keeps TP reachable intraday on 15m
@@ -2073,6 +2080,13 @@ class DebbieLaSMC(Strategy):
                     indicators.range_atr(ltf["df"]),
                     is_long=(self.bias[symbol] == "BULLISH"),
                     max_atr_mult=TAP_MAX_CHASE_ATR)
+                if _ok and not indicators.zone_entry_edge_ok(
+                        current_price, _zlo, _zhi,
+                        self.bias[symbol] == "BULLISH", ZONE_ENTRY_MAX_FRAC):
+                    _ok = False
+                    _why = (f"price {current_price:.2f} is past the better "
+                            f"{ZONE_ENTRY_MAX_FRAC:.0%} of {_zlo:.2f}-{_zhi:.2f} — "
+                            f"that is a premium, not the discount the zone offers")
                 if _ok:
                     in_fvg = True
                     if not _live_tap:

@@ -468,6 +468,13 @@ OVERHEAD_MIN_ROOM_ATR  = 2.0   # need ≥2× 5m ATR of clear air to the opposing
 # without displacement was never a setup — but it means AMD contributes almost nothing now,
 # and the bot leans on Route A.
 AMD_REQUIRE_DISPLACEMENT = os.getenv("AMD_REQUIRE_DISPLACEMENT", "1") == "1"
+# WHERE in the zone the fill sits. price_in_entry_zone answers "has price reached the
+# zone" and returns True anywhere between lo and hi; nothing asked whether the fill was on
+# the favourable side. A demand zone is bought at its LOW. PLTR 2026-10-05 filled 189.50 in
+# a 187.62-190.50 demand zone — 65% up it, paying a premium for a discount setup — and the
+# inflated distance from the structural invalidation then inflated the stop and, through the
+# R multiple, the target too. 0.5 = the better half. Env-overridable so it can be swept.
+ZONE_ENTRY_MAX_FRAC = float(os.getenv("ZONE_ENTRY_MAX_FRAC", "0.5"))
 
 ENABLE_TREND_FOLLOW   = False  # "buy the discount in a clear daily trend" fallback (no sweep/BOS)
 ENABLE_WEDGE_BREAKOUT = False  # falling-wedge breakout — a generic pattern, not a sweep or BOS
@@ -2873,6 +2880,13 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
         # applies only on the far side, where overshooting improves the fill.
         in_fvg = indicators.price_in_entry_zone(
             price, state.fvg_low, state.fvg_high, state.bias == "BULLISH")
+        if in_fvg and not indicators.zone_entry_edge_ok(
+                price, state.fvg_low, state.fvg_high,
+                state.bias == "BULLISH", ZONE_ENTRY_MAX_FRAC):
+            print(f"[{base}] ⏭ In the zone but on the WRONG SIDE of it — "
+                  f"${price:,.4f} is past the better {ZONE_ENTRY_MAX_FRAC:.0%} of "
+                  f"${state.fvg_low:,.4f}-${state.fvg_high:,.4f}. Waiting for the discount.")
+            in_fvg = False
 
         # Same release rule as the stock bot: a zone price has broken THROUGH is dead and
         # must not occupy the symbol until the staleness timer expires.
@@ -3424,6 +3438,13 @@ def run():
                         # where overshooting improves the fill.
                         _in     = indicators.price_in_entry_zone(
                             _cur, st.fvg_low, st.fvg_high, _is_long)
+                        # The 10s watcher wins nearly every race against the 5m cycle, so a
+                        # gate living only there is dead code — the exact way the candle
+                        # veto ended up unenforced.
+                        if _in and not indicators.zone_entry_edge_ok(
+                                _cur, st.fvg_low, st.fvg_high, _is_long,
+                                ZONE_ENTRY_MAX_FRAC):
+                            _in = False
                         # Same retest rule as the 5m cycle. This watcher polls every 10s
                         # and "wins nearly every race" against it, so a gate that lives
                         # only in the 5m path is effectively dead code — exactly how the

@@ -249,6 +249,39 @@ def find_next_liquidity_target(df, price, bias, swing_bars=2):
     return best
 
 
+def zone_entry_edge_ok(price, zone_lo, zone_hi, is_long, max_frac=0.5):
+    """Is the fill on the FAVOURABLE side of the zone, or halfway up it?
+
+    price_in_entry_zone answers "has price reached the zone" and returns True ANYWHERE
+    between lo and hi. Nothing then asked WHERE in the zone the fill sat. A demand zone is
+    bought at its LOW — that is the discount the zone exists to offer — and the bot was
+    filling wherever price happened to be when the poll ran.
+
+    Real case, PLTR 2026-10-05: zone 187.62-190.50, filled 189.50 — 65% up a demand zone,
+    which is paying a premium for a discount setup. The operator's words were "it always
+    buys literally in the middle of a weak consolidating zone", and that is exactly what
+    the arithmetic says.
+
+    This compounds with everything downstream: risk is measured from the fill, so a fill
+    at the top of a demand zone is further from the structural invalidation, which inflates
+    the stop, which inflates the target by the same R multiple.
+
+    max_frac is the share of the zone, measured from the favourable edge, in which a fill
+    is allowed. 0.5 = the better half. Overshooting the far edge (a long BELOW the zone low)
+    is deeper discount and always allowed — that is the fill improving, not degrading.
+    """
+    try:
+        lo, hi, px = float(zone_lo), float(zone_hi), float(price)
+    except (TypeError, ValueError):
+        return False
+    if hi <= lo:
+        return False
+    span = hi - lo
+    if is_long:
+        return px <= lo + max_frac * span          # buy the LOW of demand
+    return px >= hi - max_frac * span              # sell the HIGH of supply
+
+
 def structural_stop_price(entry, swing, atr_ref, is_long, min_atr_mult, liq_cap_dist=None):
     """Stop PRICE anchored to real structure but kept OUTSIDE the noise.
 

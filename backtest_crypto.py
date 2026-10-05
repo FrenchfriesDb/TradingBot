@@ -78,6 +78,7 @@ from binance_bot import (
     ENABLE_TREND_FOLLOW, MAX_TARGET_ATR_MULT,
     TARGET_NEAREST_POOL, POOL_MIN_RR, MIN_TRADE_RR, STOP_SLIPPAGE_R,
     max_target_atr_mult_for, amd_distribution_confirmed, AMD_REQUIRE_DISPLACEMENT,
+    ZONE_ENTRY_MAX_FRAC,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -443,6 +444,9 @@ def backtest_symbol(ex, symbol, days, verbose=False):
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
         FUNNEL["7 zone not expired"] += 1
         if not indicators.price_in_entry_zone(price, z_lo, z_hi, is_long):
+            continue
+        if not indicators.zone_entry_edge_ok(price, z_lo, z_hi, is_long, ZONE_ENTRY_MAX_FRAC):
+            FUNNEL["8b wrong side of the zone"] += 1
             continue
         FUNNEL["8 price TAPS the zone"] += 1
 
