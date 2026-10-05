@@ -77,7 +77,7 @@ from binance_bot import (
     TAP_DISPLACEMENT_ATR_MULT, atr_gate_for,
     ENABLE_TREND_FOLLOW, MAX_TARGET_ATR_MULT,
     TARGET_NEAREST_POOL, POOL_MIN_RR, MIN_TRADE_RR, STOP_SLIPPAGE_R,
-    max_target_atr_mult_for,
+    max_target_atr_mult_for, amd_distribution_confirmed, AMD_REQUIRE_DISPLACEMENT,
 )
 
 # Sequential drop-off tally. Added 2026-09-30 after "No trades generated" turned out to
@@ -396,12 +396,24 @@ def backtest_symbol(ex, symbol, days, verbose=False):
                         htf_closed, sweep_window=5)
                     if hi_sw and dt2 == "bullish" and res_lvl and res_lvl > 0 and hi_wick:
                         if (hi_wick - res_lvl) / res_lvl >= 0.003:
-                            f3, z_lo, z_hi, _k = indicators.find_demand_zone(htf_closed, price)
-                            if f3:
-                                direction, armed_by = "bullish", "amd"
+                            # AMD's DISTRIBUTION leg (binance_bot.py). A sweep is
+                            # manipulation; without a displacement out of it there is no
+                            # setup. Added live 2026-10-05 and mirrored here the same day —
+                            # a gate that runs in production and not in the replay is how
+                            # this file has drifted from live three times already.
+                            if amd_distribution_confirmed(htf_closed, True)[0]:
+                                f3, z_lo, z_hi, _k = indicators.find_demand_zone(htf_closed, price)
+                                if f3:
+                                    direction, armed_by = "bullish", "amd"
+                            else:
+                                FUNNEL["5d AMD refused — no distribution"] += 1
                     elif lo_sw and dt2 == "bearish" and sup_lvl and sup_lvl > 0 and lo_wick:
                         if (sup_lvl - lo_wick) / sup_lvl >= 0.003:
-                            f3, z_lo, z_hi, _k = indicators.find_supply_zone(htf_closed, price)
+                            if not amd_distribution_confirmed(htf_closed, False)[0]:
+                                FUNNEL["5d AMD refused — no distribution"] += 1
+                                f3 = False
+                            else:
+                                f3, z_lo, z_hi, _k = indicators.find_supply_zone(htf_closed, price)
                             if f3:
                                 direction, armed_by = "bearish", "amd"
                 if armed_by == "amd":
