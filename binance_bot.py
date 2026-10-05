@@ -426,6 +426,25 @@ OVERHEAD_MIN_ROOM_ATR  = 2.0   # need ≥2× 5m ATR of clear air to the opposing
 # Checked on the HTF frame the sweep was found in, at the FORMATION multiple (1.8x), not the
 # tap multiple — this is about whether the move happened at all, which is a different and
 # stronger question than whether the retest candle is decisive.
+# MEASURED 2026-10-05, A/B over 60d / 13 symbols at real tier-0 fees:
+#                        OFF (old)                    ON (this)
+#   trades                   37                            5
+#   net                 -311.54                        +2.76
+#   gross                +38.57                       +73.00
+#   expectancy   -0.421R +/-0.161  t=-2.62     +0.028R +/-0.494  t=+0.06
+#   verdict      DISTINGUISHABLE negative      indistinguishable from zero
+#
+# Read it carefully, because it is easy to over-claim. The gate removed a population that
+# was SIGNIFICANTLY losing, and gross went UP while trade count fell 86% — the discarded
+# trades were net-negative as a group. That part is solid.
+#
+# What it does NOT show is an edge. n=5, t=+0.06, and ~6,380 trades would be needed to
+# tell that +0.028R from zero. "Stopped the bleeding" is the claim; "found an edge" is not.
+#
+# The cost is volume: 5 trades per 60 days on 13 symbols is 0.08/day, roughly 0.25/day at
+# the live 40. This path is close to switched off. That is the correct outcome if a sweep
+# without displacement was never a setup — but it means AMD contributes almost nothing now,
+# and the bot leans on Route A.
 AMD_REQUIRE_DISPLACEMENT = os.getenv("AMD_REQUIRE_DISPLACEMENT", "1") == "1"
 
 ENABLE_TREND_FOLLOW   = False  # "buy the discount in a clear daily trend" fallback (no sweep/BOS)
