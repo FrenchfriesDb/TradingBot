@@ -144,6 +144,59 @@ _RR       = re.compile(r"\bRR\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 _REASON   = re.compile(r"REASON\s*[:\-]?\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
+def reply_text(resp):
+    """The model's text from a chat completion, or "" — never raises.
+
+    THE BUG. Both bots did `resp.choices[0].message.content.strip()`, which dies with
+
+        AI unavailable ('NoneType' object has no attribute 'strip')
+
+    the moment `content` is None. That is not an outage and not a rate limit: the model
+    answered. Reasoning models (nvidia/nemotron-3-super-*, deepseek-r1 and friends) put
+    their chain of thought in a SEPARATE field and can return content=None entirely —
+    typically when the whole max_tokens budget was spent reasoning and the reply was cut
+    off before any final text. The caller then reported "AI unavailable", which sent the
+    operator looking for an API problem that did not exist.
+
+    Falls back to the reasoning field, because parse_ai_decision already strips <think>
+    blocks and can find a DECISION line inside reasoning text. If the reasoning really was
+    cut off before the verdict, parse_ai_decision returns no decision and the caller stands
+    aside — which is the correct, safe outcome, reached honestly instead of via a crash.
+    """
+    try:
+        choice = (getattr(resp, "choices", None) or [None])[0]
+        if choice is None:
+            return ""
+        msg = getattr(choice, "message", None)
+        if msg is None:
+            return ""
+        for field in ("content", "reasoning_content", "reasoning"):
+            val = getattr(msg, field, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+    except Exception:
+        return ""
+
+
+def finish_hint(resp):
+    """Why the reply ended, when that explains an empty one. "" when unremarkable.
+
+    finish_reason == "length" means the token budget ran out mid-thought, which is the
+    usual cause of an empty content field on a reasoning model — and the actionable fix is
+    raising max_tokens, not debugging the network. Surfacing it turns a 20-minute hunt into
+    a sentence in the log.
+    """
+    try:
+        choice = (getattr(resp, "choices", None) or [None])[0]
+        fr = getattr(choice, "finish_reason", None) if choice else None
+        if fr == "length":
+            return " (reply hit the max_tokens ceiling mid-reasoning — raise max_tokens)"
+        return f" (finish_reason={fr})" if fr and fr != "stop" else ""
+    except Exception:
+        return ""
+
+
 def parse_ai_decision(text):
     """(decision, rr, reason) from a model reply. decision is "YES", "NO" or None.
 

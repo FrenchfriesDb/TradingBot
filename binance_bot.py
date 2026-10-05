@@ -1648,8 +1648,12 @@ REASON: one concise sentence"""
             max_tokens=1000,   # a reasoning model needs room to reach its own DECISION line
             timeout=15,
         )
-        text = resp.choices[0].message.content.strip()
         from bot import ai_model as _ai
+        # content can be None on a reasoning model — see ai_model.reply_text.
+        text = _ai.reply_text(resp)
+        if not text:
+            return (False, MIN_AI_RR,
+                    f"AI returned an EMPTY reply{_ai.finish_hint(resp)} — standing aside")
         decision, _rr, reason = _ai.parse_ai_decision(text)
         rr = max(MIN_AI_RR, min(_rr if _rr is not None else MIN_AI_RR, MAX_AI_RR))
         if decision is None:
