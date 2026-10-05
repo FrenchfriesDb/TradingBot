@@ -302,6 +302,25 @@ SL_ATR_MULT          = 1.5   # SL placed 1.5× 5m-ATR outside the FVG edge (dyna
 # Env-overridable so it can be SWEPT. It was a hardcoded literal, which meant a sweep of it
 # silently produced five identical runs — the same trap that wasted a stock sweep earlier
 # today. A constant nobody can vary is a constant nobody has tested.
+# SWEPT 2026-10-05, 60d / 13 symbols, real tier-0 fees:
+#   mult   floor won   median stop %      net    expectancy
+#   0.50       0%          2.90%       -384.71   -0.520R  t=-3.19
+#   1.00       5%          2.90%       -391.93   -0.530R  t=-3.31
+#   1.50      22%          3.16%       -311.54   -0.421R  t=-2.62   <- live
+#   2.00      33%          3.86%       -284.85   -0.396R  t=-2.66
+#
+# CORRECTS A CLAIM I MADE FROM n=2. Looking at two live positions (AERO 3x, TAO 9x over
+# their zone-edge stops) I said the ATR floor dominates. Across 37 trades it wins 22% at
+# the live setting — STRUCTURE sets the stop 78% of the time. Those two trades are real,
+# they are just not typical.
+#
+# Stops are wide because the 6H ZONES are wide: median stop is 2.90% of price even at
+# mult=0.5, where the floor never binds at all. The floor is not what inflates them.
+#
+# And tightening makes NET WORSE (-284 at 2.0 -> -384 at 0.5). A tighter stop buys a BIGGER
+# position for the same fixed dollar risk, so notional and fees rise with it — the same
+# effect that took fees 192 -> 357 when the stop anchor was corrected. Expectancy is
+# significantly negative at EVERY multiple, so this is a volume/cost dial, not an edge dial.
 MIN_STOP_ATR_MULT_HTF = float(os.getenv("MIN_STOP_ATR_MULT_HTF", "1.5"))  # floor vs 1H ATR
 SWING_LOOKBACK  = 12    # candles to scan for structural swing high/low (wick-sweep guard)
 
