@@ -42,7 +42,10 @@ def audit(path, label):
     # wolf is a lint that gets ignored, which is how the real gap survived three months.
     def _is_call(line):
         code = line.split("#", 1)[0]
-        return "arm_zone(" in code and "def arm_zone" not in code
+        if "arm_zone(" in code and "def arm_zone" not in code:
+            return True
+        # the stock bot has no arm_zone(); it arms by setting the zone directly
+        return bool(re.search(r"self\.fvg_low\[\w+\]\s*=\s*(?!None)", code))
     sites = [i for i, l in enumerate(src) if _is_call(l)]
     print(f"\n{'='*86}\n  {label} — {len(sites)} arming sites\n{'='*86}")
     print(f"  {'line':>6}  {'what arms it':<30} " + " ".join(f"{g[:12]:>13}" for g in GATES))
@@ -71,6 +74,10 @@ def audit(path, label):
 def main():
     gaps = []
     gaps += audit(ROOT / "binance_bot.py", "binance_bot.py (crypto)")
+    # The stock bot has arming paths too. Auditing only the crypto file is how the AMD
+    # distribution gate got fixed on one bot and not the other — a tool built to find
+    # "a rule on one path and not the others" that itself only looked at one file.
+    gaps += audit(ROOT / "bot" / "strategy.py", "bot/strategy.py (stocks)")
     print("\n  ✓ = a marker for that gate appears in the arming path's guard context")
     print("  · = NO marker found. Not proof of a bug — a question to answer.")
     if gaps:

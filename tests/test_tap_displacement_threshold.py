@@ -78,17 +78,46 @@ def test_both_constants_are_env_overridable():
         assert f'os.getenv("{name}"' in SRC, name
 
 
+def _displacement_calls():
+    return [n for n in ast.walk(TREE)
+            if isinstance(n, ast.Call) and (
+                (isinstance(n.func, ast.Attribute) and n.func.attr == "has_displacement")
+                or (isinstance(n.func, ast.Name) and n.func.id == "has_displacement"))]
+
+
 def _tap_call():
-    """The single has_displacement call in strategy.py — the tap-time recheck."""
-    calls = [n for n in ast.walk(TREE)
-             if isinstance(n, ast.Call) and (
-                 (isinstance(n.func, ast.Attribute) and n.func.attr == "has_displacement")
-                 or (isinstance(n.func, ast.Name) and n.func.id == "has_displacement"))]
-    assert len(calls) == 1, (
-        f"expected exactly 1 has_displacement call in bot/strategy.py, found {len(calls)}. "
-        "A second tap-time momentum check must ALSO use TAP_DISPLACEMENT_ATR_MULT — "
-        "update this test to enumerate them rather than deleting the assertion.")
-    return calls[0]
+    """The TAP-time recheck, told apart from the FORMATION checks by its multiple.
+
+    This used to assert there was exactly one has_displacement call in the file, with a
+    message instructing whoever hit it to ENUMERATE rather than delete the assertion. A
+    second call arrived on 2026-10-05 — AMD's distribution leg, which is a FORMATION check
+    on the HTF and correctly uses DISPLACEMENT_ATR_MULT. Enumerating, as instructed.
+
+    The invariant that matters is unchanged and is now stated directly: exactly one call
+    uses the TAP multiple, and every other call uses the FORMATION multiple. Neither may
+    borrow the other's threshold — 1.0x vs 1.8x is a 3x difference in the body a bar must
+    print, and swapping them silently cuts qualifying taps to a third or lets formation
+    arm on noise.
+    """
+    calls = _displacement_calls()
+    tap = [c for c in calls
+           if "TAP_DISPLACEMENT_ATR_MULT" in {n.id for n in ast.walk(c)
+                                              if isinstance(n, ast.Name)}]
+    assert len(tap) == 1, (
+        f"expected exactly 1 TAP-multiple has_displacement call in bot/strategy.py, "
+        f"found {len(tap)} of {len(calls)} total.")
+    return tap[0]
+
+
+def test_every_displacement_call_declares_which_multiple_it_is():
+    """No call may be left on a bare default — that is how one silently becomes the other."""
+    orphans = []
+    for c in _displacement_calls():
+        names = {n.id for n in ast.walk(c) if isinstance(n, ast.Name)}
+        if not ({"TAP_DISPLACEMENT_ATR_MULT", "DISPLACEMENT_ATR_MULT"} & names):
+            orphans.append(c.lineno)
+    assert not orphans, (
+        f"has_displacement calls with neither multiple named, at lines {orphans}")
 
 
 def test_the_tap_uses_the_tap_multiple():

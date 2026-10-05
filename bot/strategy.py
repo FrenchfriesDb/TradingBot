@@ -148,6 +148,13 @@ LOOP_INTERVAL          = os.getenv("LOOP_INTERVAL", "5M")
 ITERATION_BUDGET_FRAC  = float(os.getenv("ITERATION_BUDGET_FRAC", "0.8"))
 
 MIN_STOP_ATR_MULT = float(os.getenv("MIN_STOP_ATR_MULT", "1.5"))
+# AMD's third leg, the same rule binance_bot got on 2026-10-05. A sweep is MANIPULATION;
+# accumulation -> manipulation -> DISTRIBUTION, and with no displacement out of the sweep
+# there is no setup. Fixed on the crypto bot that morning and NOT here — which is how PLTR
+# armed LONG three times into a collapse the same afternoon, each demand zone breaking
+# before the next was drawn, while price fell 9 points. The operator called it from the
+# journal before any measurement did.
+AMD_REQUIRE_DISPLACEMENT = os.getenv("AMD_REQUIRE_DISPLACEMENT", "1") == "1"
 # TARGET BAND — moved 2:1 -> 1:1 on 2026-10-01, on measurement.
 #
 # These were 2.0/4.0 on the stated reasoning that "1:2 keeps TP reachable intraday on 15m
@@ -1015,6 +1022,31 @@ class DebbieLaSMC(Strategy):
                              f"(retried on the next close).", color="yellow")
         return
 
+    def _amd_distribution_confirmed(self, df_closed, is_long):
+        """Did the sweep resolve into a move? Mirrors binance_bot.amd_distribution_confirmed.
+
+        Fails CLOSED on unreadable data — an unverifiable breakout must not become a free
+        pass, the same rule the tap-momentum check already follows.
+        """
+        if not AMD_REQUIRE_DISPLACEMENT:
+            return True, "displacement gate off"
+        try:
+            _atr = indicators.range_atr(df_closed)
+            _px = float(df_closed["close"].iloc[-1])
+            if not _atr or _atr != _atr:
+                return False, "ATR unreadable"
+            ok = indicators.has_displacement(
+                df_closed.tail(3)[["open", "high", "low", "close"]].values.tolist(),
+                is_long,
+                min_body_frac=DISPLACEMENT_BODY_FRAC,
+                min_body_abs=indicators.displacement_min_body(
+                    _atr, _px, DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT))
+            return (ok, "" if ok else
+                    f"no distribution leg — needs a body >={DISPLACEMENT_BODY_FRAC:.0%} of "
+                    f"range AND >={DISPLACEMENT_ATR_MULT}x HTF-ATR in the last 3 bars")
+        except Exception as e:
+            return False, f"distribution check failed ({type(e).__name__})"
+
     def _send_ledger_row(self, row):
         """Hand one stored row to Sheets. True only on success, so a failure keeps it
         queued. A None client means no credentials — a failure to record, not a
@@ -1695,9 +1727,16 @@ class DebbieLaSMC(Strategy):
                     # manipulation_up = stop hunt of lows completed, price bleeding up
                     # → real move will be DOWN — SHORT from supply zone above
                     if amd_phase == "manipulation_up" and daily_trend == "bearish":
-                        found, sup_lo, sup_hi, sup_type = indicators.find_supply_zone(
-                            htf.get("df_closed", htf["df"]), current_price
-                        )
+                        _df_closed = htf.get("df_closed", htf["df"])
+                        _dok, _dwhy = self._amd_distribution_confirmed(_df_closed, False)
+                        if not _dok:
+                            self.log_message(
+                                f"[{symbol}] 🚫 AMD manipulation_up REFUSED — {_dwhy}. "
+                                f"A sweep is manipulation, not a setup.", color="yellow")
+                            found = False
+                        else:
+                            found, sup_lo, sup_hi, sup_type = indicators.find_supply_zone(
+                                _df_closed, current_price)
                         if found:
                             self.bias[symbol]          = "BEARISH"
                             self.sweep_low[symbol]     = amd_info.get("sweep_wick", htf.get("sweep_wick_htf"))
@@ -1718,9 +1757,16 @@ class DebbieLaSMC(Strategy):
                     # manipulation_down = stop hunt of highs completed, price pushed down
                     # → real move will be UP — LONG from demand zone below
                     elif amd_phase == "manipulation_down" and daily_trend == "bullish":
-                        found, dem_lo, dem_hi, dem_type = indicators.find_demand_zone(
-                            htf.get("df_closed", htf["df"]), current_price
-                        )
+                        _df_closed = htf.get("df_closed", htf["df"])
+                        _dok, _dwhy = self._amd_distribution_confirmed(_df_closed, True)
+                        if not _dok:
+                            self.log_message(
+                                f"[{symbol}] 🚫 AMD manipulation_down REFUSED — {_dwhy}. "
+                                f"A sweep is manipulation, not a setup.", color="yellow")
+                            found = False
+                        else:
+                            found, dem_lo, dem_hi, dem_type = indicators.find_demand_zone(
+                                _df_closed, current_price)
                         if found:
                             self.bias[symbol]          = "BULLISH"
                             self.sweep_low[symbol]     = amd_info.get("sweep_wick", htf.get("sweep_wick_htf"))
