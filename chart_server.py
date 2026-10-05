@@ -403,10 +403,20 @@ function drawAnalysis(sm){
   clearAnalysis();
   if(!sm) return;
   const st = sm.state;
-  if((st==='ENTRY_WAIT'||st==='SWEEP_HUNT') && sm.fvg_low && sm.fvg_high){
+  // POSITION_OPEN included deliberately. The zone used to disappear the moment the trade
+  // filled — i.e. exactly when the operator most wants to know what they are in. Looking at
+  // an open AERO long on a 5m chart with no zone drawn, the honest reaction is "there is no
+  // FVG here", and there wasn't: it was a 6H bullish ORDER BLOCK from an AMD high-sweep.
+  // The data (amd_zone_type, fvg_tf) was in the state file the whole time, unrendered.
+  if((st==='ENTRY_WAIT'||st==='SWEEP_HUNT'||st==='POSITION_OPEN') && sm.fvg_low && sm.fvg_high){
     const bearish = sm.bias==='BEARISH';
     const col  = bearish ? '#ff7043' : '#66bb6a';      // supply=orange, demand=green
-    const kind = sm.amd_phase ? 'AMD' : 'FVG';
+    // NAME THE STRUCTURE, not just the route. "AMD" says which engine armed it; it does not
+    // say whether the level is an order block, a breaker, an inverted FVG or a real gap —
+    // and those fail in different ways. bullish_ob rendered as "AMD" is why a chart with no
+    // gap on it looked like the bot had invented one.
+    const ztype = sm.amd_zone_type ? String(sm.amd_zone_type).replace(/_/g,' ') : null;
+    const kind = ztype ? ztype : (sm.amd_phase ? 'AMD' : 'FVG');
     const side = bearish ? 'SHORT' : 'LONG';
     // NAME THE CHART THE LEVEL CAME FROM. These candles are 5m, but the bot prefers an
     // HTF gap when it finds one — BTC's armed 82087-84753 was a real SIX-HOUR FVG
