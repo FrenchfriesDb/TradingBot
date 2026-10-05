@@ -48,7 +48,7 @@ import argparse
 import os
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
 # Lumibot reads credentials at import time, so load .env before anything else.
@@ -225,6 +225,60 @@ def pair_round_trips(fills):
 
 FUNNEL = Counter()
 GATES = Counter()   # state-transition tallies, filled when --funnel is on
+# Per-series data coverage, module-level BECAUSE report() reads it and is a separate
+# function. It was first written as a local inside the instrumentation setup, which made
+# every run die with NameError at the report stage — after the full simulation had run.
+COVERAGE = defaultdict(lambda: {"calls": 0, "bars": 0, "empty": 0, "short": 0,
+                                "worst": 1.0})
+# Below this fraction of the bars requested, a series is treated as genuinely incomplete
+# rather than trimmed at a window edge.
+SHORT_SERIES_FRAC = 0.80
+
+
+def instrument_coverage(S):
+    """Tally bars delivered per series. ALWAYS ON, unlike the funnel.
+
+    The funnel is a diagnostic you ask for. Coverage decides whether the run's numbers can
+    be COMPARED to another run at all, so making it opt-in means the one thing that tells
+    you the answer is unreliable is off by default. It was first written inside
+    instrument_funnel and therefore only ran with --funnel — i.e. never, for the sweep it
+    existed to protect.
+    """
+    # DATA COVERAGE. Two runs of an IDENTICAL config (same window, same symbols, same
+    # threshold) produced 39 trades and 28 trades. AMD, NVDA and TSLA reproduced exactly;
+    # GOOGL went from 8 trades to 1. The simulation is deterministic — the DATA is not.
+    # IEX is a single venue carrying ~2-3% of consolidated volume, and when a symbol's
+    # bars arrive short nothing says so: the run just reports a different answer with the
+    # same confident formatting. That is how a threshold sweep turns into noise.
+    # Same failure as backtest_crypto's short-page pagination bug: silent partial history.
+    COVERAGE.clear()
+    _orig_hist = S.DebbieLaSMC.get_historical_prices
+
+    def _counted_hist(self, asset, length, timestep="minute", **kw):
+        out = _orig_hist(self, asset, length, timestep, **kw)
+        try:
+            key = f"{getattr(asset, 'symbol', asset)}:{timestep}"
+            c = COVERAGE[key]
+            c["calls"] += 1
+            n = 0 if out is None or getattr(out, "df", None) is None else len(out.df)
+            c["bars"] += n
+            if n == 0:
+                c["empty"] += 1
+            elif n < length:
+                c["short"] += 1
+                # WORST ratio, not a count. The first version flagged any n < length, which
+                # fires on every run: a 100-bar daily request legitimately returns 96 near
+                # the start of a window. That made the warning constant, and a warning that
+                # is always on is one nobody reads. What matters is HOW short, at worst.
+                c["worst"] = min(c.get("worst", 1.0), n / length)
+        except Exception:
+            pass          # instrumentation must never break the run it measures
+        return out
+
+    S.DebbieLaSMC.get_historical_prices = _counted_hist
+
+
+    S.DebbieLaSMC.get_historical_prices = _counted_hist
 
 
 def instrument_funnel(S):
@@ -254,34 +308,6 @@ def instrument_funnel(S):
                 return r
             return _w
         setattr(_I, _name, _mk(_name, _f))
-
-    # DATA COVERAGE. Two runs of an IDENTICAL config (same window, same symbols, same
-    # threshold) produced 39 trades and 28 trades. AMD, NVDA and TSLA reproduced exactly;
-    # GOOGL went from 8 trades to 1. The simulation is deterministic — the DATA is not.
-    # IEX is a single venue carrying ~2-3% of consolidated volume, and when a symbol's
-    # bars arrive short nothing says so: the run just reports a different answer with the
-    # same confident formatting. That is how a threshold sweep turns into noise.
-    # Same failure as backtest_crypto's short-page pagination bug: silent partial history.
-    COVERAGE = defaultdict(lambda: {"calls": 0, "bars": 0, "empty": 0, "short": 0})
-    _orig_hist = S.DebbieLaSMC.get_historical_prices
-
-    def _counted_hist(self, asset, length, timestep="minute", **kw):
-        out = _orig_hist(self, asset, length, timestep, **kw)
-        try:
-            key = f"{getattr(asset, 'symbol', asset)}:{timestep}"
-            c = COVERAGE[key]
-            c["calls"] += 1
-            n = 0 if out is None or getattr(out, "df", None) is None else len(out.df)
-            c["bars"] += n
-            if n == 0:
-                c["empty"] += 1
-            elif n < length:
-                c["short"] += 1
-        except Exception:
-            pass          # instrumentation must never break the run it measures
-        return out
-
-    S.DebbieLaSMC.get_historical_prices = _counted_hist
 
     orig = S.DebbieLaSMC._process_symbol
 
@@ -363,13 +389,19 @@ def report(trades, start, end, symbols):
 
     _cov = [(k, v) for k, v in sorted(COVERAGE.items()) if v["calls"]]
     if _cov:
-        _bad = [(k, v) for k, v in _cov if v["empty"] or v["short"]]
+        # A series is suspect when a response came back EMPTY, or when the worst response
+        # fell below SHORT_SERIES_FRAC of what was asked for. Mild end-of-window trimming
+        # is normal and is reported without condemning the run.
+        _bad = [(k, v) for k, v in _cov
+                if v["empty"] or v.get("worst", 1.0) < SHORT_SERIES_FRAC]
         print("\n  DATA COVERAGE — a run whose bars arrived short is not comparable")
-        print(f"    {'symbol:tf':<18} {'calls':>7} {'avg bars':>9} {'empty':>6} {'short':>6}")
+        print(f"    {'symbol:tf':<18} {'calls':>7} {'avg bars':>9} {'empty':>6} {'short':>6} {'worst':>7}")
         for k, v in _cov:
-            flag = "  <-- INCOMPLETE" if (v["empty"] or v["short"]) else ""
+            worst = v.get("worst", 1.0)
+            flag = ("  <-- INCOMPLETE" if (v["empty"] or worst < SHORT_SERIES_FRAC)
+                    else ("  (trimmed)" if v["short"] else ""))
             print(f"    {k:<18} {v['calls']:>7,} {v['bars']/v['calls']:>9.0f} "
-                  f"{v['empty']:>6,} {v['short']:>6,}{flag}")
+                  f"{v['empty']:>6,} {v['short']:>6,} {worst:>7.0%}{flag}")
         if _bad:
             print(f"    {len(_bad)} of {len(_cov)} series arrived incomplete — treat any "
                   f"comparison against another run as UNSAFE until this is clean.")
@@ -632,6 +664,7 @@ def main():
               f"get_daily_trend needs; expect zero trades.", file=sys.stderr)
 
     S = sandbox_strategy(args.ai)
+    instrument_coverage(S)      # always — a run you cannot trust is worse than no run
     if args.funnel:
         instrument_funnel(S)
     from lumibot.backtesting import AlpacaBacktesting
