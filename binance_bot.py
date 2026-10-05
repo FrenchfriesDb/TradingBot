@@ -1249,7 +1249,8 @@ def _send_ledger_row(row):
               row.get("take_profit"), row.get("exit_price"), row.get("size"),
               row.get("margin"), row.get("notional"), row.get("leverage"),
               row.get("pnl"), row.get("reason"), row.get("chart_url"),
-              fees=row.get("fees", 0.0), exit_reason=row.get("exit_reason", ""))
+              fees=row.get("fees", 0.0), exit_reason=row.get("exit_reason", ""),
+              zone_type=row.get("zone_type", ""))
     return True
 
 
@@ -1264,8 +1265,11 @@ def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, 
     caught it. sheets_logger's own functions are already fail-soft; the chart
     render/upload is separately wrapped so a bad candle fetch, GitHub hiccup, or
     disk error can never block the ledger row itself from being written."""
-    reason = (f"{'CHASE ' if state.is_chase else ''}{state.amd_phase or 'BOS'} "
-              f"{'LONG' if is_long else 'SHORT'}")
+    # Was "{amd_phase or BOS} {LONG|SHORT}" — which never recorded WHICH structure the
+    # entry was taken on, so a bullish FVG, an order block and a breaker all logged
+    # identically. indicators.entry_reason is now the one producer for both bots.
+    reason = indicators.entry_reason(state.amd_phase, state.amd_zone_type, is_long,
+                                     is_chase=state.is_chase)
     now = datetime.now(timezone.utc)
 
     chart_ref = None
@@ -1319,7 +1323,10 @@ def _log_trade_close_to_sheet(base, is_long, entry_price, exit_price, qty, pnl, 
         side="LONG" if is_long else "SHORT", entry_price=entry_price, stop_loss=ledger_sl,
         take_profit=state.take_profit, exit_price=exit_price, size=qty, margin=margin,
         notional=notional, leverage=PAPER_LEVERAGE, pnl=pnl_total, reason=reason,
-        chart_url=chart_ref, fees=fees, exit_reason=exit_reason)
+        chart_url=chart_ref, fees=fees, exit_reason=exit_reason,
+        # Single token, so the sheet and the journal can GROUP by structure. The "reason"
+        # string above carries it too, but as prose — this is the machine-readable cut.
+        zone_type=state.amd_zone_type or "")
     _lpath = _ledger.ledger_path("crypto")
     if not _lpath or not _ledger.append_row(_lpath, _row):
         print(f"[LEDGER] ⚠️ could not write {base} to the local ledger — "

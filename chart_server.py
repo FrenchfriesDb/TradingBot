@@ -947,6 +947,11 @@ def _fetch_journal_data(account):
                 # recorded why they closed. Don't render a missing value as 0 or "STOP".
                 "fees": _num(r[15]) if len(r) > 15 else None,
                 "exitReason": (r[16] or None) if len(r) > 16 else None,
+                # Appended 2026-10-04, same rule: past the end, so every index above is
+                # untouched. None on older rows, which is honest — they recorded the AMD
+                # phase but never which structure the entry was taken on, so a bullish FVG
+                # and a breaker are indistinguishable in that history. Don't invent one.
+                "zoneType": (r[17] or None) if len(r) > 17 else None,
             })
         return out
 

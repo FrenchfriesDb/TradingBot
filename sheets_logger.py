@@ -36,6 +36,14 @@ LEDGER_HEADER = [
     # (TARGET / STOP / BREAKEVEN / STALE / OTHER) so the column can be grouped — the
     # BREAKEVEN vs STOP split is the one that shows where the money actually goes.
     "Exit Reason",
+    # APPENDED for the same reason Fees and Exit Reason were: ~177 rows already carry
+    # their chart in column O, and inserting ahead of it would shift every new row's
+    # chart one column right of every old one. missing_header_cells backfills the label
+    # on the live tab.
+    # Duplicates the middle field of "Reason" on purpose: that column is a human-readable
+    # sentence, this one is a single token so the sheet can GROUP by structure and answer
+    # "do breakers actually work?" without parsing strings.
+    "Zone Type",
 ]
 
 _client_cache = None
@@ -180,7 +188,7 @@ def missing_snapshot_dates(last_snapshot_date, today, max_backfill=30):
 
 def build_ledger_row(entry_time_str, exit_time_str, ticker, side, entry_price, stop_loss,
                       take_profit, exit_price, size, margin, notional, leverage, pnl, reason,
-                      chart_url=None, fees=0.0, exit_reason=""):
+                      chart_url=None, fees=0.0, exit_reason="", zone_type=""):
     """Pure row-building for the Ledger tabs — no network call, unit-testable in isolation.
     An http(s) chart_url becomes a clickable Sheets image — =HYPERLINK(url, IMAGE(url))
     renders the thumbnail in-cell AND opens the full-resolution PNG on click, since the
@@ -197,7 +205,7 @@ def build_ledger_row(entry_time_str, exit_time_str, ticker, side, entry_price, s
             round(stop_loss, 6), round(take_profit, 6), round(exit_price, 6),
             round(size, 6), round(margin, 2), round(notional, 2), leverage,
             round(pnl, 2), reason, chart_cell, round(fees or 0.0, 2),
-            exit_reason or ""]
+            exit_reason or "", zone_type or ""]
 
 
 def log_daily_snapshot(client, spreadsheet_url, tab_name, date_str,
@@ -219,7 +227,8 @@ def log_daily_snapshot(client, spreadsheet_url, tab_name, date_str,
 
 def log_trade(client, spreadsheet_url, tab_name, entry_time_str, exit_time_str, ticker, side,
               entry_price, stop_loss, take_profit, exit_price, size, margin, notional,
-              leverage, pnl, reason, chart_url=None, fees=0.0, exit_reason=""):
+              leverage, pnl, reason, chart_url=None, fees=0.0, exit_reason="",
+              zone_type=""):
     """Appends one row to a Ledger tab. Never raises — logs a warning and returns on
     any failure (client is None, sheet unreachable, tab missing, network error)."""
     if client is None:
@@ -243,7 +252,7 @@ def log_trade(client, spreadsheet_url, tab_name, entry_time_str, exit_time_str, 
         row = build_ledger_row(entry_time_str, exit_time_str, ticker, side, entry_price,
                                 stop_loss, take_profit, exit_price, size, margin, notional,
                                 leverage, pnl, reason, chart_url, fees=fees,
-                                exit_reason=exit_reason)
+                                exit_reason=exit_reason, zone_type=zone_type)
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         print(f"[SHEETS] log_trade to '{tab_name}' failed: {e}")

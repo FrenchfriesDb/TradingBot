@@ -996,6 +996,31 @@ def maker_limit_fill(limit_price, bar_low, bar_high, is_long, require_through=Tr
     return limit_price if reached else None
 
 
+def entry_reason(amd_phase, zone_type, is_long, is_chase=False):
+    """One line saying WHY a trade was opened: phase, the structure it was taken on, side.
+
+    THE SINGLE PRODUCER. binance_bot and bot/strategy each built this string themselves,
+    identically and incompletely: "{amd_phase or BOS} {LONG|SHORT}". That records the AMD
+    phase but NOT the structure the entry was actually taken on — so a ledger row said
+    "manipulation_down LONG" whether the setup was a bullish FVG, an order block, a
+    breaker or an inverted FVG. Those are different trades with different failure modes,
+    and the journal could not tell them apart after the fact.
+
+    zone_type comes from state.amd_zone_type (crypto) / self.amd_zone_type (stock) — the
+    same value the status line already prints as `zone=bullish_fvg`.
+
+    Shape: "PHASE | ZONE | SIDE", stable and splittable, so the column groups cleanly in
+    Sheets and a later scorer can cut by any of the three.
+    """
+    parts = []
+    if is_chase:
+        parts.append("CHASE")
+    parts.append(str(amd_phase) if amd_phase else "BOS")
+    parts.append(str(zone_type) if zone_type else "—")
+    parts.append("LONG" if is_long else "SHORT")
+    return " | ".join(parts)
+
+
 def stop_fill_price(entry, stop, is_long, slip_r):
     """The price a STOP actually fills at: its trigger, plus slippage, always worse.
 

@@ -937,7 +937,10 @@ class DebbieLaSMC(Strategy):
         sheets_logger's own functions are already fail-soft; the chart
         render/upload is separately wrapped so a bad bars fetch, GitHub hiccup, or
         disk error can never block the ledger row itself from being written."""
-        reason = f"{self.amd_phase[symbol] or 'BOS'} {'LONG' if is_long else 'SHORT'}"
+        # Same producer as the crypto bot — see indicators.entry_reason. .get() because a
+        # trade can close for a symbol whose zone state was already reset.
+        reason = indicators.entry_reason(self.amd_phase.get(symbol),
+                                         self.amd_zone_type.get(symbol), is_long)
         now = datetime.now(timezone.utc)
         entry_time = self.entry_time[symbol] or now
         sl = self.stop_loss[symbol]
@@ -996,7 +999,8 @@ class DebbieLaSMC(Strategy):
                     stop_loss=sl, take_profit=tp, exit_price=exit_price, size=qty,
                     margin=margin, notional=notional, leverage=PAPER_LEVERAGE, pnl=pnl,
                     reason=reason, chart_url=chart_ref, fees=0.0,
-                    exit_reason=_exit_reason_final)
+                    exit_reason=_exit_reason_final,
+                    zone_type=self.amd_zone_type.get(symbol) or "")
         _lpath = _ledger.ledger_path("stock")
         if not _ledger.append_row(_lpath, _row):
             self.log_message(f"[{symbol}] ⚠️ could not write to the local ledger — "
@@ -1020,7 +1024,8 @@ class DebbieLaSMC(Strategy):
                   row.get("take_profit"), row.get("exit_price"), row.get("size"),
                   row.get("margin"), row.get("notional"), row.get("leverage"),
                   row.get("pnl"), row.get("reason"), row.get("chart_url"),
-                  exit_reason=row.get("exit_reason", ""))
+                  exit_reason=row.get("exit_reason", ""),
+                  zone_type=row.get("zone_type", ""))
         return True
 
     # NOTE on exit_reason, preserved from the direct-write this replaced: exits here fire

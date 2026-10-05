@@ -301,6 +301,7 @@
                             <th class="py-2 pr-4">Ticker</th>
                             <th class="py-2 pr-4">Side</th>
                             <th class="py-2 pr-4">Strategy</th>
+                            <th class="py-2 pr-4">Exit</th>
                             <th class="py-2 pr-4 text-right">Risk</th>
                             <th class="py-2 pr-4 text-right">R:R</th>
                             <th class="py-2 pr-4 text-right">P&L</th>
@@ -389,6 +390,20 @@
             const w = chartContainer.clientWidth || 900;
             // applyOptions ALONE fixes the render. Do NOT call fitContent() after it —
             // fitContent re-applies the squashed spacing and undoes this, which is the
+            // Colour the exit token. BREAKEVEN is deliberately NOT green: it is a trade
+            // that gave its edge back, and painting it like a win hides the single most
+            // useful split in the ledger (STOP vs BREAKEVEN). Older rows have no exit
+            // reason at all and render dim rather than being guessed at.
+            function exitReasonClass(r) {
+                if (!r) return 'text-[var(--ink-dim)]';
+                const k = String(r).toUpperCase();
+                if (k === 'TARGET') return 'text-[var(--win)]';
+                if (k === 'STOP') return 'text-[var(--loss)]';
+                if (k === 'BREAKEVEN') return 'text-[var(--ink-dim)]';
+                if (k === 'STALE') return 'text-amber-400';
+                return 'text-[var(--ink-dim)]';
+            }
+
             // whole reason the curve looked like a straight line.
             // No upper cap: sparse ranges (1W = 7 daily points) need wide spacing to fill the
             // pane. Capping at 24px left them occupying 18% of the width — the same
@@ -701,6 +716,8 @@
                             ${detailStat('Margin', t.margin != null ? '$' + t.margin.toFixed(2) : '—')}
                             ${detailStat('Notional', t.notional != null ? '$' + t.notional.toFixed(2) : '—')}
                             ${detailStat('Strategy', t.reason || '—')}
+                            ${detailStat('Structure', t.zoneType || '—')}
+                            ${detailStat('Closed by', t.exitReason || '—')}
                         </div>
                         ${t.chartUrl ? `
                         <div class="w-2/5 aspect-video bg-zinc-900 rounded-lg overflow-hidden border border-white/10 relative group flex-shrink-0">
@@ -738,6 +755,7 @@
                         <td class="py-2 pr-4 font-bold">${t.ticker}</td>
                         <td class="py-2 pr-4"><span class="px-2 py-0.5 rounded text-xs font-bold ${t.side === 'LONG' ? 'bg-cyan-500/20 text-cyan-400' : 'bg-purple-500/20 text-purple-400'}">${t.side}</span></td>
                         <td class="py-2 pr-4 font-mono text-xs text-[var(--ink-dim)]">${t.reason || '—'}</td>
+                        <td class="py-2 pr-4 font-mono text-xs ${exitReasonClass(t.exitReason)}">${t.exitReason || '—'}</td>
                         <td class="py-2 pr-4 text-right font-mono">${risk != null ? '$' + risk.toFixed(2) : '—'}</td>
                         <td class="py-2 pr-4 text-right font-mono ${realizedR != null && realizedR >= 0 ? 'text-[var(--win)]' : 'text-[var(--loss)]'}">${realizedR != null ? (realizedR >= 0 ? '+' : '') + realizedR.toFixed(2) + 'R' : '—'}</td>
                         <td class="py-2 pr-4 text-right font-mono font-bold" style="color:${t.pnl >= 0 ? 'var(--win)' : 'var(--loss)'}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</td>

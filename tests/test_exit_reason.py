@@ -88,10 +88,19 @@ def test_tokens_are_a_closed_set():
 # ── the ledger row ──
 def test_exit_reason_column_exists_and_is_appended_last():
     """Appended for the same reason as Fees: ~177 historical rows have their chart in
-    column O, and inserting ahead of Chart would shift every new row's chart."""
-    assert LEDGER_HEADER[-1] == "Exit Reason"
+    column O, and inserting ahead of Chart would shift every new row's chart.
+
+    The invariant is that EXISTING columns keep their index and new ones go on the end —
+    not that any particular column is last forever. This originally asserted
+    LEDGER_HEADER[-1] == "Exit Reason", which was just "the newest column at the time";
+    adding Zone Type in 2026-10-04 failed it without anything actually being wrong.
+    Pinning the indices is the check that has teeth.
+    """
     assert LEDGER_HEADER.index("Chart") == 14
     assert LEDGER_HEADER.index("Fees ($)") == 15
+    assert LEDGER_HEADER.index("Exit Reason") == 16
+    assert LEDGER_HEADER.index("Zone Type") == 17
+    assert LEDGER_HEADER[-1] == "Zone Type", "newest column goes last"
 
 
 def test_row_carries_the_exit_reason():
@@ -161,8 +170,8 @@ def test_live_15_column_ledger_gets_both_new_headings():
     """The real case: a tab created before Fees and Exit Reason existed."""
     live = LEDGER_HEADER[:15]
     rng, values = missing_header_cells(live, LEDGER_HEADER)
-    assert rng == "P1:Q1"
-    assert values == [["Fees ($)", "Exit Reason"]]
+    assert rng == "P1:R1"
+    assert values == [["Fees ($)", "Exit Reason", "Zone Type"]]
 
 
 def test_nothing_to_do_when_already_current():
@@ -173,7 +182,7 @@ def test_never_rewrites_an_existing_label():
     """Someone may have renamed a heading by hand. Only cells PAST the end are filled."""
     renamed = ["MY OWN NAME"] + LEDGER_HEADER[1:15]
     rng, values = missing_header_cells(renamed, LEDGER_HEADER)
-    assert rng == "P1:Q1"
+    assert rng == "P1:R1"
     assert "MY OWN NAME" not in values[0]
 
 
