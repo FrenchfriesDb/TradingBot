@@ -147,7 +147,7 @@ LOOP_INTERVAL          = os.getenv("LOOP_INTERVAL", "5M")
 # is a PRECONDITION of the cadence change, not a nicety.
 ITERATION_BUDGET_FRAC  = float(os.getenv("ITERATION_BUDGET_FRAC", "0.8"))
 
-MIN_STOP_ATR_MULT = 1.5
+MIN_STOP_ATR_MULT = float(os.getenv("MIN_STOP_ATR_MULT", "1.5"))
 # TARGET BAND — moved 2:1 -> 1:1 on 2026-10-01, on measurement.
 #
 # These were 2.0/4.0 on the stated reasoning that "1:2 keeps TP reachable intraday on 15m

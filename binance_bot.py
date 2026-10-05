@@ -299,7 +299,10 @@ REVERSAL_WINDOW      = 54      # ~4.5h on 5m — wide enough to hold a multi-hou
 # pairs (AVAX $0.06 stop, ADA $0.0002 stop) — right into single-candle noise. A floor
 # fixes that without slowing down entries.
 SL_ATR_MULT          = 1.5   # SL placed 1.5× 5m-ATR outside the FVG edge (dynamic breathing room)
-MIN_STOP_ATR_MULT_HTF = 1.5  # stop distance floored at 1.5× the 1H ATR — outside 1H-candle noise
+# Env-overridable so it can be SWEPT. It was a hardcoded literal, which meant a sweep of it
+# silently produced five identical runs — the same trap that wasted a stock sweep earlier
+# today. A constant nobody can vary is a constant nobody has tested.
+MIN_STOP_ATR_MULT_HTF = float(os.getenv("MIN_STOP_ATR_MULT_HTF", "1.5"))  # floor vs 1H ATR
 SWING_LOOKBACK  = 12    # candles to scan for structural swing high/low (wick-sweep guard)
 
 # ── Entry-quality filters (make the AMD manipulation setup the primary trigger) ──

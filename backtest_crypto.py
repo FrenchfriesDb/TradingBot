@@ -175,7 +175,7 @@ class Trade:
     __slots__ = ("symbol", "side", "entry", "stop", "target", "qty",
                  "entry_ts", "exit_ts", "exit", "reason", "pnl", "fees",
                  "partial_qty", "banked", "tp1", "mfe_r", "mae_r", "hrs_to_mfe",
-                 "sl_overshoot_r")
+                 "sl_overshoot_r", "struct_dist", "floor_dist")
 
     def __init__(self, symbol, side, entry, stop, target, qty, entry_ts):
         self.symbol, self.side = symbol, side
@@ -194,6 +194,13 @@ class Trade:
         # though they detect the hit by seeing the candle trade THROUGH it. A stop is a
         # market exit: it fills at-or-worse. This measures the size of that fiction.
         self.sl_overshoot_r = 0.0
+        # WHICH ANCHOR SET THE STOP. structural_stop_price takes the WIDER of the
+        # structural invalidation and the ATR noise floor. If the floor wins almost always,
+        # the stop is a volatility multiple wearing a structure label — and because the
+        # target is then placed at N x that inflated risk, BOTH legs get stretched by the
+        # same error. The operator spotted this on two live trades: AERO's zone-edge stop
+        # was 1.18% and the actual stop 3.56% (3x), TAO 0.22% vs 1.99% (9x).
+        self.struct_dist, self.floor_dist = 0.0, 0.0
 
     @property
     def risk_per_unit(self):
@@ -471,8 +478,11 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         zone_lvl = indicators.crypto_zone_stop_level(
             price, is_long, z_lo if is_long else z_hi, SL_ATR_MULT * atr5, swing)
         _atr_1h = atr_1h_at(int(bar["ts"]))
+        _atr_1h_ref = _atr_1h or atr5
+        _struct_d = abs(price - zone_lvl) if zone_lvl else 0.0
+        _floor_d  = MIN_STOP_ATR_MULT_HTF * _atr_1h_ref
         stop = indicators.structural_stop_price(
-            price, zone_lvl, _atr_1h or atr5, is_long, MIN_STOP_ATR_MULT_HTF)
+            price, zone_lvl, _atr_1h_ref, is_long, MIN_STOP_ATR_MULT_HTF)
         risk = abs(price - stop)
         if risk <= 0:
             last_zone = (z_lo, z_hi, bars_wait); zone = None; continue
@@ -504,6 +514,7 @@ def backtest_symbol(ex, symbol, days, verbose=False):
         qty = indicators.cap_qty_for_risk(MAX_RISK_DOLLARS / risk, risk, MAX_RISK_DOLLARS)
 
         open_trade = Trade(symbol, "LONG" if is_long else "SHORT", price, stop, target, qty, ts)
+        open_trade.struct_dist, open_trade.floor_dist = _struct_d, _floor_d
         open_trade.tp1 = _tp1
         if verbose:
             print(f"    {ts:%m-%d %H:%M} {symbol:9} {open_trade.side:5} @ {price:>11,.4f} "
@@ -621,6 +632,19 @@ def report_resolution(all_trades):
     print(f"  median hours to that peak  {st.median([t.hrs_to_mfe for t in ts]):.1f}h"
           f"   (timer fires at {STALE_TRADE_HOURS}h)")
     print(f"  median adverse excursion   {st.median([t.mae_r for t in ts]):.2f} R")
+    _an = [t for t in ts if t.floor_dist]
+    if _an:
+        _floor_won = [t for t in _an if t.floor_dist >= t.struct_dist]
+        _infl = [t.floor_dist / t.struct_dist for t in _an if t.struct_dist > 0]
+        print(f"\n  WHAT SET THE STOP — structure, or the ATR floor?")
+        print(f"    ATR floor won             {len(_floor_won)}/{len(_an)} "
+              f"({len(_floor_won)/len(_an):.0%})")
+        if _infl:
+            _infl.sort()
+            print(f"    inflation over structure  {st.median(_infl):.1f}x median "
+                  f"[p90 {_infl[min(len(_infl)-1, int(.9*len(_infl)))]:.1f}x  "
+                  f"max {_infl[-1]:.1f}x]")
+        print(f"    median stop as % of price {st.median([abs(t.entry-t.stop)/t.entry*100 for t in _an]):.2f}%")
     _sl = [t for t in ts if t.reason == "SL"]
     if _sl:
         _ov = sorted(t.sl_overshoot_r for t in _sl)
