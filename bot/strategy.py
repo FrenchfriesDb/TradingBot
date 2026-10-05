@@ -1994,11 +1994,19 @@ class DebbieLaSMC(Strategy):
                     f"left {_zlo:.2f}–{_zhi:.2f} since it was armed; this is the impulse, "
                     f"not a return to it.", color="yellow")
                 # SHADOW ONLY — recorded, never traded. See bot/shadow_ledger.
-                _shadow.record_refusal(
-                    symbol, "LONG" if self.bias[symbol] == "BULLISH" else "SHORT",
-                    current_price, _zlo, _zhi, None, None,
-                    ts=datetime.now().astimezone().isoformat(),
-                    extra={"zone_type": self.amd_zone_type[symbol], "bot": "stock"})
+                # record_refusal is fail-soft INTERNALLY, but its ARGUMENTS are evaluated
+                # first: self.amd_zone_type[symbol] was a bare subscript and would raise
+                # KeyError straight into the entry path for a symbol that had not armed
+                # one yet. Observation must never be able to break trading.
+                try:
+                    _shadow.record_refusal(
+                        symbol, "LONG" if self.bias.get(symbol) == "BULLISH" else "SHORT",
+                        current_price, _zlo, _zhi, None, None,
+                        ts=datetime.now().astimezone().isoformat(),
+                        reason="no_retest",
+                        extra={"zone_type": self.amd_zone_type.get(symbol), "bot": "stock"})
+                except Exception:
+                    pass
             elif _bar_tap:
                 # Detection widened, so price may have left the zone by now — and every
                 # downstream number (stop, risk, target, R:R) comes from the live price
@@ -2103,6 +2111,26 @@ class DebbieLaSMC(Strategy):
                         f"(${indicators.displacement_min_body(_ltf_atr, _ltf_px, TAP_DISPLACEMENT_ATR_MULT, DISPLACEMENT_MIN_PCT):.2f})"
                         f" in the last 3 bars. Standing aside.",
                         color="yellow")
+                    # SHADOW ONLY — appended, never traded. The retest rule has been
+                    # recording its refusals since the shadow ledger was built; this gate
+                    # never did, so the single most active filter on the stock bot (28 of
+                    # 28 taps across 2026-09-29..10-02) was throwing away setups without
+                    # leaving any evidence of what they would have done.
+                    # Without this, "is the displacement gate too tight?" can only be
+                    # answered by backtest. With it, the live tape answers it in a few
+                    # weeks, at the threshold actually running.
+                    try:
+                        _shadow.record_refusal(
+                            symbol, "LONG" if _is_long else "SHORT",
+                            float(ltf["df"]["close"].iloc[-1]), _zlo, _zhi, None, None,
+                            ts=datetime.now().astimezone().isoformat(),
+                            reason="no_tap_displacement",
+                            extra={"zone_type": self.amd_zone_type.get(symbol),
+                                   "bot": "stock",
+                                   "atr": _ltf_atr,
+                                   "mult": TAP_DISPLACEMENT_ATR_MULT})
+                    except Exception:
+                        pass      # observation must never raise into the entry path
                     return
 
                 # S/R confluence at the entry zone
