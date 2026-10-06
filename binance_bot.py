@@ -176,6 +176,11 @@ def _load_heavy_libs_inner():
 threading.Thread(target=_load_heavy_libs, daemon=True, name="lib-loader").start()
 
 SLEEP_SECONDS = 5 * 60
+# If more wall-clock time than this passes between two moments the process KNOWS it was
+# running, the machine was asleep or frozen and the open positions' stops went unwatched.
+# 10s watcher ticks and even a slow 40-symbol pass fit well inside it, and a false trigger
+# is harmless anyway: the replay only acts on a genuine breach.
+SLEEP_GAP_SECONDS = 150
 # MEASURED 2026-09-29, n=895 zone taps on 1h: at a 6h hold, 58% of trades time out
 # (the live log shows 51% STALE) and gross expectancy is +0.14R. Extending the window:
 #     6h  15% hit 2R  27% stopped  58% timed out  +0.14R
@@ -3123,6 +3128,110 @@ def process_symbol(exchange, paper: PaperTrader, symbol: str,
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def catch_up_open_positions(paper, states, symbols, exchange, from_ms=None,
+                            why="startup catch-up — bot was offline",
+                            what="the bot was DOWN"):
+    """Replay the 1m wicks of a window nobody was watching, for every open position.
+
+    EXTRACTED from the startup block so a SLEEP can use the same logic. The stop and target
+    live only in this process — crypto here is paper, so there is no resting order anywhere
+    — which means any window in which the process did not run is a window in which a stop
+    could be blown through and recovered from unseen. Comparing the CURRENT price against
+    the levels misses exactly that, so this walks the gap's 1m candles.
+
+    WHY IT IS NOT STARTUP-ONLY ANY MORE. The 10-second watcher looks at the last five 1m
+    candles. After the lid closes for an hour the process does not restart, it just resumes,
+    so the watcher never saw minutes 1-55. Operator closes the laptop whenever they move
+    around; a stop touched at minute 10 of a 60-minute sleep was simply never evaluated.
+    Checking more often cannot fix that — nothing runs while the machine is asleep.
+
+    from_ms: start of the unwatched window; None means "since the saved last_alive_ms",
+    which is the startup case. Replaying a window that was in fact watched is harmless: it
+    only acts on a genuine breach, and the position would have closed then anyway.
+    """
+    for sym in symbols:
+        st = states[sym]
+        if st.state != "POSITION_OPEN" or not st.stop_loss or not st.take_profit:
+            continue
+        try:
+            _t   = exchange.fetch_ticker(sym)
+            _cur = float(_t["last"])
+            held = paper.get_position(sym)
+            if abs(held) < 1e-9:
+                continue
+            is_long = held > 0
+            base    = sym.split("/")[0]
+            # Scan the DOWNTIME, not just this instant. The stop lives only in this
+            # process, so while the bot was off there was no resting order anywhere — and
+            # comparing the CURRENT price against the levels misses a stop that was blown
+            # through and recovered from during the gap, carrying the position on as
+            # though it never happened. Walk the gap's 1m wicks instead; a resting order
+            # fills the moment price TOUCHES a level.
+            _gap_hit = None
+            try:
+                _since = int((st.entry_time.timestamp() if st.entry_time else 0) * 1000)
+                _floor = (int(from_ms) if from_ms is not None
+                          else int(getattr(paper, 'last_alive_ms', 0) or 0))
+                _from = max(_since, _floor)
+                if _from:
+                    _gap = exchange.fetch_ohlcv(sym, "1m", since=_from, limit=1000)
+                    _gap_hit = indicators.first_protective_breach(
+                        _gap, st.stop_loss, st.take_profit, is_long, since_ms=_since)
+            except Exception as _e:
+                print(f"  ⚠️  {base}: could not replay the downtime ({type(_e).__name__}) "
+                      f"— falling back to the current price only, which can MISS a stop "
+                      f"that was hit and recovered from.", flush=True)
+
+            if _gap_hit:
+                _kind, fill, _ts = _gap_hit
+                sl_hit, tp_hit = _kind == "STOP", _kind == "TARGET"
+                # THIRD stop-fill site. first_protective_breach reports the LEVEL that was
+                # breached, which is right for a resting TP limit and wrong for a stop: a
+                # stop triggers on touch and then crosses the book. Same fiction as the
+                # other two sites, and it would have survived fixing both of them.
+                if sl_hit:
+                    fill = indicators.stop_fill_price(
+                        st.entry_price, st.stop_loss, is_long, STOP_SLIPPAGE_R)
+                label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
+                          else "🔴 SL") if sl_hit else "🟢 TP")
+                print(f"  ⏮ {base}: {_kind} was breached at "
+                      f"{datetime.fromtimestamp(_ts/1000, timezone.utc):%Y-%m-%d %H:%M UTC} "
+                      f"while {what} — honouring it at ${fill:,.6g} "
+                      f"(current price ${_cur:,.6g} would have missed it).", flush=True)
+            else:
+                sl_hit = (is_long and _cur <= st.stop_loss) or (not is_long and _cur >= st.stop_loss)
+                tp_hit = (is_long and _cur >= st.take_profit) or (not is_long and _cur <= st.take_profit)
+                fill  = (indicators.stop_fill_price(st.entry_price, st.stop_loss,
+                                                    is_long, STOP_SLIPPAGE_R)
+                         if sl_hit else st.take_profit)
+                label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
+                          else "🔴 SL") if sl_hit else "🟢 TP")
+            if sl_hit or tp_hit:
+                close_qty = abs(held)
+                if is_long:
+                    paper.sell(sym, close_qty, fill)
+                    pnl = (fill - st.entry_price) * close_qty
+                else:
+                    paper.buy(sym, close_qty, fill)
+                    pnl = (st.entry_price - fill) * close_qty
+                _fees = indicators.round_trip_fee(
+                    st.entry_price, fill, close_qty,
+                    MAKER_FEE_RATE if MAKER_ENTRIES else TAKER_FEE_RATE,
+                    MAKER_FEE_RATE if tp_hit else TAKER_FEE_RATE)
+                pnl -= _fees          # net — see close_position()
+                _exit_reason = indicators.normalize_exit_reason(label, st.breakeven_moved)
+                trade_print(base, f"{label} HIT ({why})", fill,
+                            pnl=pnl, balance=paper.balance)
+                _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st, exchange,
+                                          fees=_fees, exit_reason=_exit_reason)
+                st.reset()
+                print(f"  ⚠️  {base} {label} was missed while {what} — closed now at ${fill:,.4f}", flush=True)
+            else:
+                print(f"  ✅  {base} position intact  price=${_cur:,.4f}  SL=${st.stop_loss:,.4f}  TP=${st.take_profit:,.4f}", flush=True)
+        except Exception as e:
+            print(f"  Catch-up check failed for {sym}: {e}", flush=True)
+
+
 def run():
     symbols_env = os.getenv("BINANCE_SYMBOL", "")
     symbols = ([s.strip() for s in symbols_env.split(",")]
@@ -3189,85 +3298,7 @@ def run():
 
     # ── Startup catch-up: check if any open position already hit SL/TP while bot was offline ──
     print("Checking open positions against current prices…", flush=True)
-    for sym in symbols:
-        st = states[sym]
-        if st.state != "POSITION_OPEN" or not st.stop_loss or not st.take_profit:
-            continue
-        try:
-            _t   = exchange.fetch_ticker(sym)
-            _cur = float(_t["last"])
-            held = paper.get_position(sym)
-            if abs(held) < 1e-9:
-                continue
-            is_long = held > 0
-            base    = sym.split("/")[0]
-            # Scan the DOWNTIME, not just this instant. The stop lives only in this
-            # process, so while the bot was off there was no resting order anywhere — and
-            # comparing the CURRENT price against the levels misses a stop that was blown
-            # through and recovered from during the gap, carrying the position on as
-            # though it never happened. Walk the gap's 1m wicks instead; a resting order
-            # fills the moment price TOUCHES a level.
-            _gap_hit = None
-            try:
-                _since = int((st.entry_time.timestamp() if st.entry_time else 0) * 1000)
-                _from = max(_since, int(getattr(paper, 'last_alive_ms', 0) or _since))
-                if _from:
-                    _gap = exchange.fetch_ohlcv(sym, "1m", since=_from, limit=1000)
-                    _gap_hit = indicators.first_protective_breach(
-                        _gap, st.stop_loss, st.take_profit, is_long, since_ms=_since)
-            except Exception as _e:
-                print(f"  ⚠️  {base}: could not replay the downtime ({type(_e).__name__}) "
-                      f"— falling back to the current price only, which can MISS a stop "
-                      f"that was hit and recovered from.", flush=True)
-
-            if _gap_hit:
-                _kind, fill, _ts = _gap_hit
-                sl_hit, tp_hit = _kind == "STOP", _kind == "TARGET"
-                # THIRD stop-fill site. first_protective_breach reports the LEVEL that was
-                # breached, which is right for a resting TP limit and wrong for a stop: a
-                # stop triggers on touch and then crosses the book. Same fiction as the
-                # other two sites, and it would have survived fixing both of them.
-                if sl_hit:
-                    fill = indicators.stop_fill_price(
-                        st.entry_price, st.stop_loss, is_long, STOP_SLIPPAGE_R)
-                label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
-                          else "🔴 SL") if sl_hit else "🟢 TP")
-                print(f"  ⏮ {base}: {_kind} was breached at "
-                      f"{datetime.fromtimestamp(_ts/1000, timezone.utc):%Y-%m-%d %H:%M UTC} "
-                      f"while the bot was DOWN — honouring it at ${fill:,.6g} "
-                      f"(current price ${_cur:,.6g} would have missed it).", flush=True)
-            else:
-                sl_hit = (is_long and _cur <= st.stop_loss) or (not is_long and _cur >= st.stop_loss)
-                tp_hit = (is_long and _cur >= st.take_profit) or (not is_long and _cur <= st.take_profit)
-                fill  = (indicators.stop_fill_price(st.entry_price, st.stop_loss,
-                                                    is_long, STOP_SLIPPAGE_R)
-                         if sl_hit else st.take_profit)
-                label = (("🛡 BREAK-EVEN" if getattr(st, "breakeven_moved", False)
-                          else "🔴 SL") if sl_hit else "🟢 TP")
-            if sl_hit or tp_hit:
-                close_qty = abs(held)
-                if is_long:
-                    paper.sell(sym, close_qty, fill)
-                    pnl = (fill - st.entry_price) * close_qty
-                else:
-                    paper.buy(sym, close_qty, fill)
-                    pnl = (st.entry_price - fill) * close_qty
-                _fees = indicators.round_trip_fee(
-                    st.entry_price, fill, close_qty,
-                    MAKER_FEE_RATE if MAKER_ENTRIES else TAKER_FEE_RATE,
-                    MAKER_FEE_RATE if tp_hit else TAKER_FEE_RATE)
-                pnl -= _fees          # net — see close_position()
-                _exit_reason = indicators.normalize_exit_reason(label, st.breakeven_moved)
-                trade_print(base, f"{label} HIT (startup catch-up — bot was offline)", fill,
-                            pnl=pnl, balance=paper.balance)
-                _log_trade_close_to_sheet(base, is_long, st.entry_price, fill, close_qty, pnl, st, exchange,
-                                          fees=_fees, exit_reason=_exit_reason)
-                st.reset()
-                print(f"  ⚠️  {base} {label} was missed while bot was offline — closed now at ${fill:,.4f}", flush=True)
-            else:
-                print(f"  ✅  {base} position intact  price=${_cur:,.4f}  SL=${st.stop_loss:,.4f}  TP=${st.take_profit:,.4f}", flush=True)
-        except Exception as e:
-            print(f"  Catch-up check failed for {sym}: {e}", flush=True)
+    catch_up_open_positions(paper, states, symbols, exchange)
 
     # ── Google Sheets: create tabs once at startup, track daily snapshot baseline ──
     ensure_tabs(get_sheet_client(), GOOGLE_SHEET_URL, {
@@ -3275,7 +3306,34 @@ def run():
     })
     prices = {}
     _cycle = 0
+    _last_wall = time.time()    # last wall-clock instant this process was provably running
+
+    def _catch_up_if_machine_slept():
+        """Replay the wicks of a window the machine spent asleep.
+
+        Nothing runs while the lid is closed, so the process never sees the gap: it resumes
+        as if no time had passed. The startup catch-up covered a RESTART; this covers a
+        resume, using the same code."""
+        nonlocal _last_wall
+        _now = time.time()
+        _gap = _now - _last_wall
+        if _gap > SLEEP_GAP_SECONDS and any(abs(paper.get_position(x)) > 1e-9 for x in symbols):
+            print(f"\n  💤 {_gap/60:.0f} minutes passed with the process unwatched "
+                  f"(machine asleep or frozen) — replaying the missed 1m wicks "
+                  f"for open positions…", flush=True)
+            try:
+                catch_up_open_positions(
+                    paper, states, symbols, exchange, from_ms=int(_last_wall * 1000),
+                    why=f"machine was asleep ~{_gap/60:.0f}m",
+                    what=f"the machine was ASLEEP for ~{_gap/60:.0f}m")
+                save_state(states, paper)
+            except Exception as _e:
+                print(f"  ⚠️ sleep catch-up failed ({type(_e).__name__}: {_e}) — "
+                      f"open stops were NOT verified for that window.", flush=True)
+        _last_wall = _now
+
     while True:
+        _catch_up_if_machine_slept()
         _cycle += 1
         print(f"\n{'─'*60}")
         print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
@@ -3368,9 +3426,11 @@ def run():
         # ── Fast SL/TP watcher ─────────────────────────────────────────────────
         # Checks every 10 seconds so SL/TP fire within 10s of being hit,
         # not after the full 5-minute strategy sleep.
+        _last_wall = time.time()    # the cycle's own work is over; the gap clock restarts here
         deadline = time.time() + SLEEP_SECONDS
         while time.time() < deadline:
             time.sleep(10)
+            _catch_up_if_machine_slept()
             for sym in symbols:
                 st = states[sym]
 
