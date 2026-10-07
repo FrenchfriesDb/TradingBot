@@ -318,8 +318,8 @@ REASON: one concise sentence"""
             model=(_ai_model.resolve(NVIDIA_API_KEY) or _ai_model.configured_model()),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=1000,   # a reasoning model needs room to reach its own DECISION line
-            timeout=15,
+            max_tokens=_ai_model.AI_MAX_TOKENS,   # reasoning is billed against this — see ai_model
+            timeout=_ai_model.AI_CALL_TIMEOUT,
         )
         # content can be None on a reasoning model — see ai_model.reply_text.
         text = _ai_model.reply_text(resp)

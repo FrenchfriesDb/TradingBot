@@ -1732,6 +1732,14 @@ REASON: one concise sentence"""
 
     import concurrent.futures
 
+    # Imported in the ENCLOSING scope. It used to be imported inside _call_ai, after the
+    # create() call that now reads AI_MAX_TOKENS — which makes the name a local for the whole
+    # function and raises UnboundLocalError before the request is sent — and the outer
+    # `.result(timeout=...)` could not see it at all. Both land in `except Exception`, which
+    # returns "AI SKIPPED, technicals only", so every trade would have bypassed the gate
+    # with nothing but a log line to say so.
+    from bot import ai_model as _ai
+
     def _call_ai():
         from openai import OpenAI
         import re
@@ -1743,10 +1751,9 @@ REASON: one concise sentence"""
             model=(resolve_ai_model() or __import__("bot.ai_model", fromlist=["x"]).configured_model()),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=1000,   # a reasoning model needs room to reach its own DECISION line
-            timeout=15,
+            max_tokens=_ai.AI_MAX_TOKENS,   # reasoning is billed against this — see ai_model
+            timeout=_ai.AI_CALL_TIMEOUT,
         )
-        from bot import ai_model as _ai
         # content can be None on a reasoning model — see ai_model.reply_text.
         text = _ai.reply_text(resp)
         if not text:
@@ -1768,15 +1775,17 @@ REASON: one concise sentence"""
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     _future   = _executor.submit(_call_ai)
     try:
-        result = _future.result(timeout=25)
+        # Outer deadline sits ABOVE the HTTP timeout, or it fires first and the longer
+        # timeout never gets to matter.
+        result = _future.result(timeout=_ai.AI_CALL_TIMEOUT + 10)
         _executor.shutdown(wait=False)
         return result
     except concurrent.futures.TimeoutError:
         _executor.shutdown(wait=False)
-        print(f"  ⚠️  AI call timed out (25s) — proceeding on technicals at 1:{MIN_AI_RR:g}", flush=True)
+        print(f"  ⚠️  AI call timed out ({_ai.AI_CALL_TIMEOUT + 10}s) — proceeding on technicals at 1:{MIN_AI_RR:g}", flush=True)
         # AI is a secondary confirmation; the setup already passed every technical
         # filter. A timeout must not cost a valid trade — fall back, don't skip.
-        return True, MIN_AI_RR, "AI timeout (25s) — proceeding on technicals"
+        return True, MIN_AI_RR, f"AI timeout ({_ai.AI_CALL_TIMEOUT + 10}s) — proceeding on technicals"
     except Exception as e:
         _executor.shutdown(wait=False)
         # Fail OPEN, but do not CLAIM an approval. The NVIDIA model id is retired

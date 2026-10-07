@@ -144,6 +144,28 @@ _RR       = re.compile(r"\bRR\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 _REASON   = re.compile(r"REASON\s*[:\-]?\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
+# THE REASONING BUDGET. nvidia/nemotron-3-super-120b-a12b is a reasoning model: it thinks
+# BEFORE it answers, and the thinking is billed against max_tokens. Probed 2026-10-07 with
+# the bot's own prompt shape, 3 runs per setting:
+#
+#   max_tokens=1000   (the old value)   1 of 3 cut off (finish=length, content=None)
+#   max_tokens=4000                     0 of 3 cut off; used 830-1335 tokens, 7-13s
+#   thinking switched OFF               0 of 3 cut off, ~70 tokens, 1-2s — but it answered
+#                                       YES 3 of 3 where thinking mode said YES 1 of 6
+#
+# So 1000 sat on the knife edge (the model spends ~900-1000 tokens reasoning) and about a
+# third of replies were truncated into "no readable decision". Switching thinking off is NOT
+# an option: it is fast because it does not deliberate, and it approved what deliberation
+# mostly refused — that turns the gate into a rubber stamp.
+#
+# The HTTP timeout MUST rise with it. At 4000 tokens a reply takes up to ~13s typical, and
+# the old 15s timeout would turn a slow, careful answer into an exception — which both bots
+# treat as "AI unavailable, proceed on technicals". Raising max_tokens alone would have
+# converted the model's best answers into unfiltered approvals.
+AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "4000"))
+AI_CALL_TIMEOUT = int(os.getenv("AI_CALL_TIMEOUT", "60"))
+
+
 def reply_text(resp):
     """The model's text from a chat completion, or "" — never raises.
 
