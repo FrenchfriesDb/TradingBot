@@ -249,7 +249,7 @@ def find_next_liquidity_target(df, price, bias, swing_bars=2):
     return best
 
 
-def zone_entry_edge_ok(price, zone_lo, zone_hi, is_long, max_frac=0.5):
+def zone_entry_edge_ok(price, zone_lo, zone_hi, is_long, max_frac=0.5, inside_only=False):
     """Is the fill on the FAVOURABLE side of the zone, or halfway up it?
 
     price_in_entry_zone answers "has price reached the zone" and returns True ANYWHERE
@@ -269,6 +269,14 @@ def zone_entry_edge_ok(price, zone_lo, zone_hi, is_long, max_frac=0.5):
     max_frac is the share of the zone, measured from the favourable edge, in which a fill
     is allowed. 0.5 = the better half. Overshooting the far edge (a long BELOW the zone low)
     is deeper discount and always allowed — that is the fill improving, not degrading.
+
+    inside_only=True limits the test to fills INSIDE the zone and passes everything else.
+    The STOCK bot needs it: it fills past the zone edge on purpose, within a budget
+    (tap_chase_ok: "a long may chase a little ABOVE its demand zone — that is the rejection
+    working"). Without this flag a long above the zone fails here even at max_frac=1.0, so the
+    gate silently deleted that whole path and "gates off" was not off. A backtest exposed it:
+    the same window and code gave 21 trades before the gate and 12 with it set to 1.0.
+    Where a fill beyond the zone is acceptable is the chase budget's decision, not this one's.
     """
     try:
         lo, hi, px = float(zone_lo), float(zone_hi), float(price)
@@ -276,6 +284,8 @@ def zone_entry_edge_ok(price, zone_lo, zone_hi, is_long, max_frac=0.5):
         return False
     if hi <= lo:
         return False
+    if inside_only and not (lo <= px <= hi):
+        return True                                # not this gate's business — see docstring
     span = hi - lo
     if is_long:
         return px <= lo + max_frac * span          # buy the LOW of demand

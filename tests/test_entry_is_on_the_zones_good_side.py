@@ -79,3 +79,39 @@ class TestEveryTapSiteIsGated:
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1] / rel).read_text()
         assert "ZONE_ENTRY_MAX_FRAC" in src
+
+
+class TestTheStockGateDoesNotDeleteTheChasePath:
+    """The stock bot fills ABOVE a demand zone on purpose, inside a budget (tap_chase_ok).
+
+    zone_entry_edge_ok treated any fill above the zone as the wrong side, even at
+    max_frac=1.0, so it silently removed that path and "gates off" was not off. Found by a
+    backtest: identical window and code, 21 trades without the gate wired in and 12 with it
+    set to its neutral value. The live bot carried the same bug; nothing in the unit tests
+    could see it because they only tested fills INSIDE the zone.
+    """
+
+    def test_a_chase_fill_above_a_demand_zone_is_not_this_gates_business(self):
+        assert ok(190.71, LO, HI, True, 0.5, inside_only=True), "the chase budget decides that"
+
+    def test_a_chase_fill_below_a_supply_zone_is_not_this_gates_business(self):
+        assert ok(187.00, LO, HI, False, 0.5, inside_only=True)
+
+    def test_the_inside_zone_rule_still_bites(self):
+        assert not ok(189.50, LO, HI, True, 0.5, inside_only=True), "the PLTR fill must still be refused"
+
+    @pytest.mark.parametrize("px", [186.0, 187.62, 188.5, 190.5, 190.71, 195.0])
+    @pytest.mark.parametrize("is_long", [True, False])
+    def test_a_fraction_of_one_is_exactly_neutral(self, px, is_long):
+        """If this fails, switching the gate off changes behaviour and no A/B means anything."""
+        assert ok(px, LO, HI, is_long, 1.0, inside_only=True)
+
+    def test_the_default_is_unchanged_for_crypto(self):
+        """Crypto's price_in_entry_zone already keeps fills inside, so it keeps the strict form."""
+        assert not ok(190.71, LO, HI, True, 0.5)
+
+    def test_the_stock_call_site_opts_in(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1] / "bot" / "strategy.py").read_text()
+        i = src.index("zone_entry_edge_ok(")
+        assert "inside_only=True" in src[i:i + 400], "stock gate would again delete the chase path"

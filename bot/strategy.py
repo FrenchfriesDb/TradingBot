@@ -2082,7 +2082,8 @@ class DebbieLaSMC(Strategy):
                     max_atr_mult=TAP_MAX_CHASE_ATR)
                 if _ok and not indicators.zone_entry_edge_ok(
                         current_price, _zlo, _zhi,
-                        self.bias[symbol] == "BULLISH", ZONE_ENTRY_MAX_FRAC):
+                        self.bias[symbol] == "BULLISH", ZONE_ENTRY_MAX_FRAC,
+                        inside_only=True):      # chase fills above the zone belong to tap_chase_ok
                     _ok = False
                     _why = (f"price {current_price:.2f} is past the better "
                             f"{ZONE_ENTRY_MAX_FRAC:.0%} of {_zlo:.2f}-{_zhi:.2f} — "
