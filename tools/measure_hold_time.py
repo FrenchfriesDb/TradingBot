@@ -11,7 +11,7 @@ STALE exits in the live log. The model tracks reality closely enough to act on.
 COSTS ARE NOT MODELLED. Crypto runs ~0.25%%/side, which on a ~1.5%% stop is ~0.33R round
 trip — subtract that from every expectancy below before drawing conclusions.
 """
-import sys; sys.path.insert(0,"/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import ccxt, pandas as pd, statistics as st
 from bot.indicators import find_demand_zone
 

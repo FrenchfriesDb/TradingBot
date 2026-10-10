@@ -15,7 +15,7 @@ The 0.25%%/side rows assume the configured TAKER_FEE_RATE. Coinbase Advanced Tra
 tier is nearer 0.60%% taker / 0.40%% maker, so the realistic case is WORSE than the best
 row shown.
 """
-import sys; sys.path.insert(0,"/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import ccxt, pandas as pd, statistics as st
 from bot.indicators import find_demand_zone
 

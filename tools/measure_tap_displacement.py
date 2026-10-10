@@ -52,7 +52,7 @@ clears zero at 0%%, and ANY fee sinks it. The stock edge could not survive crypt
 taker costs — useful as the direct comparison against the crypto curve, which needs
 <=0.10%%/side before anything clears zero.
 """
-import sys; sys.path.insert(0,"/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import datetime as dt, os, pandas as pd, statistics as st
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest

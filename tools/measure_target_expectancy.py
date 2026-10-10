@@ -15,7 +15,7 @@ floor the filters have to beat, not as the bot's expectancy.
 Costs are modelled as a flat 0.1R, which is generous for commission-free stocks and far
 too kind for crypto, where 0.25%/side on a 1.5% stop is nearer 0.33R.
 """
-import sys; sys.path.insert(0, "/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import datetime as dt, pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest

@@ -24,7 +24,7 @@ import re
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, "/Users/usahealthlife/Desktop/TradingBot")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest

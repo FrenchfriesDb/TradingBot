@@ -9,7 +9,7 @@ cut at the session boundary the way the EOD flatten does.
 
 Set ZONE_SORT to pick the key; this runs both and prints them side by side.
 """
-import sys, os, importlib; sys.path.insert(0,"/Users/usahealthlife/Desktop/TradingBot")
+import sys, os, importlib; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import datetime as dt, pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest

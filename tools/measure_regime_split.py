@@ -11,7 +11,7 @@ threshold is something I chose after looking at the data, and that is how a find
 manufactured. The threshold is refitted on the first half of the period and applied blind
 to the second.
 """
-import sys; sys.path.insert(0, "/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import datetime as dt, pandas as pd, statistics as st
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest

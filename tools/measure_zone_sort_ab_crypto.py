@@ -11,7 +11,7 @@ strategy is GROSS-POSITIVE and FEE-NEGATIVE, which is a different disease from t
 bot (gross-negative, costs near zero) and needs a different fix: maker fills, wider stops,
 or a cheaper venue — not entry tuning.
 """
-import sys, os, importlib; sys.path.insert(0,"/Users/usahealthlife/Desktop/TradingBot")
+import sys, os, importlib; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import ccxt, pandas as pd
 
 SYMS = ["BTC/USD","ETH/USD","SOL/USD","DOGE/USD","XRP/USD","ADA/USD",

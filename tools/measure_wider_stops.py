@@ -9,7 +9,7 @@ never turns positive. A wider stop buys a cheaper trade and a worse one at the s
 Raw setup: no displacement gate, no c3 rule, no retest requirement, no AI. The live bot
 applies all of those and should select a better subset — this is the floor they must beat.
 """
-import sys; sys.path.insert(0,"/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import ccxt, pandas as pd, statistics as st
 from bot.indicators import find_demand_zone
 

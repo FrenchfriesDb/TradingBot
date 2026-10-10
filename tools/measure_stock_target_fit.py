@@ -14,7 +14,7 @@ RAW SETUP: no displacement gate, no candle-3 rule, no retest requirement, no AI,
 filter. The live bot applies all of those and should select a better subset — read this as
 the floor they have to beat.
 """
-import sys; sys.path.insert(0,"/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import datetime as dt, pandas as pd, statistics as st
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest

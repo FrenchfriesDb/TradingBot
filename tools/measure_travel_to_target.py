@@ -14,7 +14,7 @@ rather than for it.
     python3 tools/measure_travel_to_target.py
 """
 import re, sys, datetime as dt
-sys.path.insert(0, "/Users/usahealthlife/Desktop/TradingBot")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 LOG = "/Users/usahealthlife/Library/Logs/debbiela/binance_bot.log"
 HDR   = re.compile(r"^\s*(\d{4}-\d\d-\d\d \d\d:\d\d) UTC\s*$")

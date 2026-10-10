@@ -16,7 +16,7 @@ CAVEATS, because the headline gradient is partly explained by them:
     filled-then-stopped, which flatters all four styles equally.
   * Deeper entries miss more often (nofill rises 1 -> 6), so the edge costs frequency.
 """
-import sys; sys.path.insert(0, "/Users/usahealthlife/Desktop/TradingBot")
+import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import os
 import datetime as dt, pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
