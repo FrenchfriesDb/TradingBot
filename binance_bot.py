@@ -3157,7 +3157,13 @@ def catch_up_open_positions(paper, states, symbols, exchange, from_ms=None,
     from_ms: start of the unwatched window; None means "since the saved last_alive_ms",
     which is the startup case. Replaying a window that was in fact watched is harmless: it
     only acts on a genuine breach, and the position would have closed then anyway.
+
+    RETURNS the symbols it could NOT fully verify (network down, candles unavailable). It used
+    to return nothing, so a replay that failed because wifi was not back yet at wake was
+    indistinguishable from one that succeeded, and the caller marked the window as handled.
+    Seventeen of those were sitting in the live log. The startup caller ignores the value.
     """
+    failed = []
     for sym in symbols:
         st = states[sym]
         if st.state != "POSITION_OPEN" or not st.stop_loss or not st.take_profit:
@@ -3187,6 +3193,7 @@ def catch_up_open_positions(paper, states, symbols, exchange, from_ms=None,
                     _gap_hit = indicators.first_protective_breach(
                         _gap, st.stop_loss, st.take_profit, is_long, since_ms=_since)
             except Exception as _e:
+                failed.append(sym)      # degraded: fell back to the current price only
                 print(f"  ⚠️  {base}: could not replay the downtime ({type(_e).__name__}) "
                       f"— falling back to the current price only, which can MISS a stop "
                       f"that was hit and recovered from.", flush=True)
@@ -3238,7 +3245,72 @@ def catch_up_open_positions(paper, states, symbols, exchange, from_ms=None,
             else:
                 print(f"  ✅  {base} position intact  price=${_cur:,.4f}  SL=${st.stop_loss:,.4f}  TP=${st.take_profit:,.4f}", flush=True)
         except Exception as e:
+            failed.append(sym)
             print(f"  Catch-up check failed for {sym}: {e}", flush=True)
+    return failed
+
+
+class SleepGuard:
+    """Notice that the process was unwatched, and replay the window for open positions.
+
+    A class, not a closure inside run(), because the closure version had NEVER been executed
+    by a test and it showed: it called save_state(), a name that does not exist anywhere in
+    this file. All 28 live sleep catch-ups crashed at that line, and the handler's message said
+    the stops were "NOT verified" when the replay had in fact completed and only the save died.
+
+    It also marked a window as handled even when the replay FAILED. Seventeen replays failed in
+    the live log, because the network is routinely not back yet in the first seconds after wake,
+    and every one of those windows was silently written off. A failed replay now keeps the window
+    start and is retried on the next tick, up to MAX_RETRIES (about two minutes at 10s ticks),
+    and only then gives up LOUDLY.
+
+    replay(from_ms, gap_seconds) -> list of symbols it could not verify
+    save() -> persists state            any_open() -> True if there is a position to protect
+    """
+    MAX_RETRIES = 12
+
+    def __init__(self, gap_seconds, clock=time.time):
+        self.gap_seconds, self.clock = gap_seconds, clock
+        self.last_wall = clock()
+        self.attempts = 0
+
+    def rearm(self):
+        """The cycle's own work is done; the gap clock restarts here."""
+        self.last_wall, self.attempts = self.clock(), 0
+
+    def check(self, replay, save, any_open):
+        now = self.clock()
+        gap = now - self.last_wall
+        if gap <= self.gap_seconds:
+            self.last_wall = now
+            return "ok"
+        if not any_open():
+            self.last_wall, self.attempts = now, 0          # nothing to protect
+            return "idle"
+        print(f"\n  💤 {gap/60:.0f} minutes passed with the process unwatched "
+              f"(machine asleep or frozen) — replaying the missed 1m wicks "
+              f"for open positions…", flush=True)
+        try:
+            failed = list(replay(int(self.last_wall * 1000), gap))
+        except Exception as e:
+            failed = ["<replay raised>"]
+            print(f"  ⚠️ sleep replay raised {type(e).__name__}: {e}", flush=True)
+        if failed and self.attempts < self.MAX_RETRIES:
+            self.attempts += 1
+            print(f"  ⏳ could not verify {failed} yet (attempt {self.attempts}/{self.MAX_RETRIES}) — "
+                  f"keeping the window open and retrying next tick", flush=True)
+            return "retry"
+        if failed:
+            print(f"  🚨 GAVE UP verifying {failed} after {self.attempts} retries — their stops "
+                  f"were NOT checked for that window.", flush=True)
+        try:
+            save()
+        except Exception as e:
+            # The replay itself completed; only the persistence failed. Say exactly that.
+            print(f"  ⚠️ state save after the sleep replay failed ({type(e).__name__}: {e}); "
+                  f"the replay itself completed and the next cycle saves state.", flush=True)
+        self.last_wall, self.attempts = now, 0
+        return "gave_up" if failed else "replayed"
 
 
 def run():
@@ -3315,31 +3387,16 @@ def run():
     })
     prices = {}
     _cycle = 0
-    _last_wall = time.time()    # last wall-clock instant this process was provably running
+    _sleep_guard = SleepGuard(SLEEP_GAP_SECONDS)
 
     def _catch_up_if_machine_slept():
-        """Replay the wicks of a window the machine spent asleep.
-
-        Nothing runs while the lid is closed, so the process never sees the gap: it resumes
-        as if no time had passed. The startup catch-up covered a RESTART; this covers a
-        resume, using the same code."""
-        nonlocal _last_wall
-        _now = time.time()
-        _gap = _now - _last_wall
-        if _gap > SLEEP_GAP_SECONDS and any(abs(paper.get_position(x)) > 1e-9 for x in symbols):
-            print(f"\n  💤 {_gap/60:.0f} minutes passed with the process unwatched "
-                  f"(machine asleep or frozen) — replaying the missed 1m wicks "
-                  f"for open positions…", flush=True)
-            try:
-                catch_up_open_positions(
-                    paper, states, symbols, exchange, from_ms=int(_last_wall * 1000),
-                    why=f"machine was asleep ~{_gap/60:.0f}m",
-                    what=f"the machine was ASLEEP for ~{_gap/60:.0f}m")
-                save_state(states, paper)
-            except Exception as _e:
-                print(f"  ⚠️ sleep catch-up failed ({type(_e).__name__}: {_e}) — "
-                      f"open stops were NOT verified for that window.", flush=True)
-        _last_wall = _now
+        _sleep_guard.check(
+            replay=lambda from_ms, gap: catch_up_open_positions(
+                paper, states, symbols, exchange, from_ms=from_ms,
+                why=f"machine was asleep ~{gap/60:.0f}m",
+                what=f"the machine was ASLEEP for ~{gap/60:.0f}m"),
+            save=lambda: save_crypto_state(paper, states, symbols, prices, _daily_snap),
+            any_open=lambda: any(abs(paper.get_position(x)) > 1e-9 for x in symbols))
 
     while True:
         _catch_up_if_machine_slept()
@@ -3435,7 +3492,7 @@ def run():
         # ── Fast SL/TP watcher ─────────────────────────────────────────────────
         # Checks every 10 seconds so SL/TP fire within 10s of being hit,
         # not after the full 5-minute strategy sleep.
-        _last_wall = time.time()    # the cycle's own work is over; the gap clock restarts here
+        _sleep_guard.rearm()    # the cycle's own work is over; the gap clock restarts here
         deadline = time.time() + SLEEP_SECONDS
         while time.time() < deadline:
             time.sleep(10)
@@ -3476,7 +3533,7 @@ def run():
                                                       _fill_m, _qty_m, _pnl_m, st, exchange,
                                                       fees=_fee_m, exit_reason="MANUAL")
                             st.reset()
-                            save_state(states, paper)
+                            save_crypto_state(paper, states, symbols, prices, _daily_snap)
                         else:
                             print(f"  ✋ {_base_m}: manual close requested but no position "
                                   f"is open — request discarded.", flush=True)
